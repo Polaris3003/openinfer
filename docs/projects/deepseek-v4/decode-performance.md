@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current small-route mapping branch at about `27.61-27.83ms/token`, with prior clean sub-30 validation at `29.86-29.97ms/token`, earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, fused MoE mapping clear, small-route MoE mapping, and benchmark/counter instrumentation. Stable sub-`30ms/token` is achieved on the fixed bench; the active MoE goal is now stable sub-`25ms/token` by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Post-small-route experiments rejected so far: direct route-W13 regressed to `33.14-33.36ms/token`; fused expand+act_quant was bitwise and `2.5-3.2x` faster in microbench but repeated runtime TPOT landed at `27.20-28.71ms/token`; GPU-side valid-row skip in W2 SwiGLU+quant regressed to `31.22-31.34ms/token`. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
+This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current small-route mapping branch at about `27.61-27.83ms/token`, with prior clean sub-30 validation at `29.86-29.97ms/token`, earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, fused MoE mapping clear, small-route MoE mapping, and benchmark/counter instrumentation. Stable sub-`30ms/token` is achieved on the fixed bench; the active MoE goal is now stable sub-`25ms/token` by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Post-small-route experiments rejected so far: direct route-W13 regressed to `33.14-33.36ms/token`; fused expand+act_quant was bitwise and `2.5-3.2x` faster in microbench but repeated runtime TPOT landed at `27.20-28.71ms/token`; GPU-side valid-row skip in W2 SwiGLU+quant regressed to `31.22-31.34ms/token`; host-known per-expert row-tile upper bound kept exactness but landed at `28.46-28.74ms/token`. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
 
 The retained team lessons are more important than the discarded attempt logs: compare identical token traces, separate NCCL wait from transfer, treat capacity and logical length separately, keep MoE semantic zero on device, and prove allocation cleanup with application-visible CUDA API counters rather than nsys attribution alone.
 
@@ -553,6 +553,47 @@ This preserved the no-D2H rule and kept W2 grouped GEMM semantics unchanged. It 
 
 Drop decision: do not retain. Skipping empty rows inside a tiny regular kernel is not enough, and in this implementation it regressed sharply. Future `local_count` usage needs to remove a larger launch cluster or preserve a fully regular kernel shape; a branch inside W2 quant is the wrong granularity.
 
+### Rejected: shrink grouped GEMM row-tile launch by seq_len
+
+vLLM's CUTLASS path passes logical per-expert `problem_sizes`, while PegaInfer's TileLang grouped FP4 launch uses a host grid of:
+
+```text
+grid.x = output tiles
+grid.y = ceil(num_expanded / 32)
+grid.z = local_experts
+```
+
+For fixed MP8 decode, `num_expanded = global_seq_len * topk = 8 * 6 = 48`, but any one expert can receive at most one route per global token, so `expert_m <= global_seq_len = 8`. The attempted change added a `max_expert_rows` argument and launched grouped W13/W2 with:
+
+```text
+grid.y = ceil(max_expert_rows / 32)
+```
+
+The runtime passed `plan.routed.seq_len` as the upper bound. This is batch-general for top-k routing with unique experts per token; it is not a bs=1 or seq_len=1 special case.
+
+Standalone W13 microbench on the sparse decode-like shape was exact, but it showed the smaller row-tile bound does not move the important cost when `local_experts=32`:
+
+| Shape | Variant | W13 time |
+| --- | --- | ---: |
+| `rows=48, experts=32, max_expert_rows=8` | optimized row-tile bound | `0.878124ms` |
+| `rows=48, experts=32, max_expert_rows=48` | original row-tile bound | `0.882815ms` |
+| `rows=8, experts=1, max_expert_rows=8` | active-expert upper-bound shape | `0.063523ms` |
+| `rows=16, experts=2, max_expert_rows=8` | active-expert upper-bound shape | `0.063532ms` |
+| `rows=24, experts=3, max_expert_rows=8` | active-expert upper-bound shape | `0.124922ms` |
+
+Runtime validation on 5090:
+
+| Check | Result |
+| --- | --- |
+| local `cargo fmt --check` | passed |
+| local `git diff --check` | passed |
+| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| 5090 `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
+| fixed bench JSON | per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65` |
+
+Drop decision: do not retain. The exactness proof is useful, but shrinking only `grid.y` does not address the dominant grouped W13/W2 cost; the `local_experts=32` scheduling dimension still launches many expert slots. The next useful prototype must reduce or repack the expert dimension itself, or use a persistent/problem-size-aware grouped scheduler. A host-known row upper bound alone is not enough.
+
 ### Diagnostic: route sparsity at fixed token
 
 A temporary hard-coded diagnostic at `start_pos == 80` synchronized the rank stream and copied `expert_indptr` to host once per `(rank, layer)`. This was intentionally not retained because it performs D2H and stream sync in the decode path. The diagnostic ran with:
@@ -610,6 +651,7 @@ These are worth remembering because they looked plausible:
 | Route W13 directly from token activations | Exact-safe, hash-stable, but regressed to `33.14-33.36ms/token` | Removing BF16 expand and reducing W13 quant rows is not enough if the GEMM shape loses expert-major locality. |
 | Fuse expand with W13 activation quant | Bitwise microbench PASS and `2.5-3.2x` faster locally, but runtime repeated at `27.20-28.71ms/token` | Local microbench wins that remove only a tiny section can disappear in full decode; require full-runtime proof before retaining. |
 | Skip W2 SwiGLU+quant rows after GPU `local_count` | Exact-safe and hash-stable, but regressed to `31.22-31.34ms/token` | Adding a device-side count read and row predicate inside a tiny regular kernel is the wrong granularity. |
+| Shrink grouped GEMM row-tile bound to `seq_len` | Exact-safe and hash-stable, but regressed to `28.46-28.74ms/token` | Empty row tiles are not the dominant grouped FP4 cost; the expert scheduling dimension remains too coarse. |
 | Fuse final HC head plus RMSNorm | Exact-safe but regressed TPOT | Saving small launches can lose to worse reduction/kernel shape. |
 | Reuse deterministic window top-k across layers | Exact-safe, no stable long-bench win | Launch-count reduction alone is weak evidence. |
 | Fuse KV RoPE plus no-PE quant | Exact-safe, regressed short decode | Combining tiny kernels can hurt scheduling/occupancy. |
@@ -728,6 +770,8 @@ Local:
 - rejected expand+act_quant fixed bench logs `/tmp/dsv4_expand_act_quant_bench.log` and `/tmp/dsv4_expand_act_quant_bench_repeat.log`: per-iteration steady TPOT avg `28.080ms`, `28.143ms`, `27.198ms`, then `28.509ms`, `28.712ms`, `28.474ms`; all hash `6346f03343d75a65`
 - rejected W2 valid-row exact E2E log `/tmp/dsv4_valid_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - rejected W2 valid-row fixed bench log `/tmp/dsv4_valid_rows_bench.log`: aggregate steady TPOT avg `31.270ms`, per-iteration `31.220ms`, `31.342ms`, `31.248ms`; all hash `6346f03343d75a65`
+- rejected grouped GEMM row-tile upper-bound exact E2E log `/tmp/dsv4_max_expert_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected grouped GEMM row-tile upper-bound fixed bench log `/tmp/dsv4_max_expert_rows_bench.log`: per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65`
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
