@@ -159,8 +159,6 @@ unsafe extern "C" {
     pub fn cublas_init();
     pub fn cublas_destroy();
     pub fn cuda_set_device(device_ordinal: i32) -> i32;
-    pub fn cudaProfilerStart() -> i32;
-    pub fn cudaProfilerStop() -> i32;
 
     // Prefill QK norm + RoPE only (no KV cache write). For paged prefill path.
     pub fn prefill_qk_norm_rope_only_cuda(
@@ -255,6 +253,23 @@ unsafe extern "C" {
         scales: *const *const u8,
         expert_indptr: *const i32,
         out: *mut Half,
+        rows: i32,
+        in_dim: i32,
+        out_dim: i32,
+        local_experts: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_moe_fp4_grouped_linear_with_workspace_cuda(
+        x: *const Half,
+        weights: *const *const u8,
+        scales: *const *const u8,
+        expert_indptr: *const i32,
+        out: *mut Half,
+        act: *mut u8,
+        act_bytes: usize,
+        act_scale: *mut u8,
+        act_scale_bytes: usize,
         rows: i32,
         in_dim: i32,
         out_dim: i32,
@@ -704,6 +719,40 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn deepseek_hc_pre_from_mixes_cuda(
+        x: *const Half,
+        mixes: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_pre_norm_from_mixes_cuda(
+        x: *const Half,
+        mixes: *const f32,
+        hc_scale: *const f32,
+        hc_base: *const f32,
+        norm_weight: *const Half,
+        post: *mut f32,
+        comb: *mut f32,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        sinkhorn_iters: i32,
+        hc_eps: f32,
+        norm_eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn deepseek_hc_head_pre_cuda(
         mixes: *const f32,
         hc_scale: *const f32,
@@ -717,6 +766,18 @@ unsafe extern "C" {
 
     pub fn deepseek_hc_post_cuda(
         x: *const Half,
+        residual: *const Half,
+        post: *const f32,
+        comb: *const f32,
+        out: *mut Half,
+        seq_len: i32,
+        hc: i32,
+        dim: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn deepseek_hc_post_f32_branch_cuda(
+        x: *const f32,
         residual: *const Half,
         post: *const f32,
         comb: *const f32,

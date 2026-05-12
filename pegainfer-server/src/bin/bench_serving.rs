@@ -264,6 +264,13 @@ struct CountStats {
     samples: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GeneratedTokenTrace {
+    hash: String,
+    prefix: Vec<u32>,
+    len: usize,
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct RequestWorkload {
     prompt: PromptDescriptor,
@@ -280,8 +287,21 @@ struct RequestMetrics {
     steady_tpot_ms: Option<DurationStats>,
     e2e_ms: DurationStats,
     generated_tokens: CountStats,
+    #[serde(default)]
+    generated_token_traces: Vec<GeneratedTokenTrace>,
     request_tok_s: Option<f64>,
     decode_tok_s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RequestIterationTiming {
+    index: usize,
+    ttft_ms: f64,
+    first_decode_step_ms: Option<f64>,
+    steady_tpot_ms: Option<DurationStats>,
+    e2e_ms: f64,
+    generated_tokens: usize,
+    generated_token_trace: GeneratedTokenTrace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -306,6 +326,7 @@ struct RequestReport {
     run: RunInfo,
     workload: RequestWorkload,
     metrics: RequestMetrics,
+    iterations: Vec<RequestIterationTiming>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -416,6 +437,25 @@ fn aggregate_tok_s(tokens: usize, total: Duration) -> Option<f64> {
         None
     } else {
         Some(tokens as f64 / total.as_secs_f64())
+    }
+}
+
+fn generated_token_hash(tokens: &[u32]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for token in tokens {
+        for byte in token.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
+    format!("{hash:016x}")
+}
+
+fn generated_token_trace(tokens: &[u32]) -> GeneratedTokenTrace {
+    GeneratedTokenTrace {
+        hash: generated_token_hash(tokens),
+        prefix: tokens.iter().copied().take(16).collect(),
+        len: tokens.len(),
     }
 }
 
@@ -805,6 +845,7 @@ struct GenTimings {
     tbt: Vec<Duration>,
     total: Duration,
     emitted_tokens: usize,
+    generated_tokens: Vec<u32>,
 }
 
 trait BenchModel {
@@ -826,10 +867,12 @@ where
     let mut prev_at: Option<Instant> = None;
     let mut emitted_tokens = 0usize;
     let mut tbt = Vec::with_capacity(max_new_tokens.saturating_sub(1));
+    let mut generated_tokens = Vec::with_capacity(max_new_tokens);
 
-    generate(prompt_tokens, max_new_tokens, &mut |_tok| {
+    generate(prompt_tokens, max_new_tokens, &mut |tok| {
         let now = Instant::now();
         emitted_tokens += 1;
+        generated_tokens.push(tok);
         if first_at.is_none() {
             first_at = Some(now);
         } else if let Some(prev) = prev_at {
@@ -847,6 +890,7 @@ where
         tbt,
         total,
         emitted_tokens,
+        generated_tokens,
     }
 }
 
@@ -966,6 +1010,10 @@ fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
         .flat_map(|t| t.tbt.iter().skip(1).copied())
         .collect();
     let generated: Vec<usize> = timings.iter().map(|t| t.emitted_tokens).collect();
+    let generated_token_traces: Vec<GeneratedTokenTrace> = timings
+        .iter()
+        .map(|timing| generated_token_trace(&timing.generated_tokens))
+        .collect();
 
     let total_emitted: usize = timings.iter().map(|t| t.emitted_tokens).sum();
     let total_request_time: Duration = timings.iter().map(|t| t.total).sum();
@@ -981,9 +1029,29 @@ fn build_request_metrics(timings: &[GenTimings]) -> RequestMetrics {
         steady_tpot_ms: (!steady.is_empty()).then(|| summarize_durations(&steady)),
         e2e_ms: summarize_durations(&e2e),
         generated_tokens: summarize_counts(&generated),
+        generated_token_traces,
         request_tok_s: aggregate_tok_s(total_emitted, total_request_time),
         decode_tok_s: aggregate_tok_s(total_decode_steps, total_decode_time),
     }
+}
+
+fn build_request_iterations(timings: &[GenTimings]) -> Vec<RequestIterationTiming> {
+    timings
+        .iter()
+        .enumerate()
+        .map(|(index, timing)| {
+            let steady: Vec<Duration> = timing.tbt.iter().skip(1).copied().collect();
+            RequestIterationTiming {
+                index,
+                ttft_ms: dur_ms(timing.ttft),
+                first_decode_step_ms: timing.tbt.first().copied().map(dur_ms),
+                steady_tpot_ms: (!steady.is_empty()).then(|| summarize_durations(&steady)),
+                e2e_ms: dur_ms(timing.total),
+                generated_tokens: timing.emitted_tokens,
+                generated_token_trace: generated_token_trace(&timing.generated_tokens),
+            }
+        })
+        .collect()
 }
 
 fn run_info(cli: &Cli, command: &'static str, model_type: ModelType, load_ms: f64) -> RunInfo {
@@ -1030,6 +1098,7 @@ fn bench_request(
             seed: args.run.seed,
         },
         metrics: build_request_metrics(&timings),
+        iterations: build_request_iterations(&timings),
     })))
 }
 

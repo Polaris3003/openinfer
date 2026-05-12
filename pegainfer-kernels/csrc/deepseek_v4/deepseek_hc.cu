@@ -9,6 +9,10 @@ constexpr int kMaxHcScratchDevices = 16;
 struct DeepseekHcScratch {
   float* x_f32 = nullptr;
   size_t x_elems = 0;
+  float* logits_weight_f32 = nullptr;
+  size_t logits_weight_capacity = 0;
+  size_t logits_weight_valid_elems = 0;
+  const __nv_bfloat16* logits_weight_src = nullptr;
   cublasHandle_t handle = nullptr;
   std::mutex mutex;
 };
@@ -240,6 +244,315 @@ __global__ void deepseek_hc_pre_output_kernel(
   out[idx] = __float2bfloat16(sum);
 }
 
+__global__ void deepseek_hc_pre_from_mixes_kernel(
+    const __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ mixes,
+    const float *__restrict__ hc_scale,
+    const float *__restrict__ hc_base,
+    float *__restrict__ post,
+    float *__restrict__ comb,
+    __nv_bfloat16 *__restrict__ out,
+    int seq_len,
+    int dim,
+    int sinkhorn_iters,
+    float eps) {
+  constexpr int hc = 4;
+  constexpr int mix_hc = (2 + hc) * hc;
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+
+  __shared__ float pre_shared[hc];
+
+  if (threadIdx.x == 0) {
+    float comb_frag[hc * hc];
+    const float* mix = mixes + token * mix_hc;
+
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      pre_shared[j] = deepseek_sigmoid(mix[j] * hc_scale[0] + hc_base[j]) + eps;
+      post[token * hc + j] =
+          2.0f * deepseek_sigmoid(mix[j + hc] * hc_scale[1] + hc_base[j + hc]);
+    }
+
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        int offset = j * hc + k + hc * 2;
+        comb_frag[j * hc + k] = mix[offset] * hc_scale[2] + hc_base[offset];
+      }
+    }
+
+    float row_sum[hc];
+    float col_sum[hc];
+    float row_max[hc];
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      float max_value = comb_frag[j * hc];
+      #pragma unroll
+      for (int k = 1; k < hc; ++k) {
+        max_value = fmaxf(max_value, comb_frag[j * hc + k]);
+      }
+      row_max[j] = max_value;
+    }
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      float sum = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        float value = expf(comb_frag[j * hc + k] - row_max[j]);
+        comb_frag[j * hc + k] = value;
+        sum += value;
+      }
+      row_sum[j] = sum;
+    }
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        comb_frag[j * hc + k] = comb_frag[j * hc + k] / row_sum[j] + eps;
+      }
+    }
+
+    #pragma unroll
+    for (int k = 0; k < hc; ++k) {
+      float sum = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        sum += comb_frag[j * hc + k];
+      }
+      col_sum[k] = sum;
+    }
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        comb_frag[j * hc + k] = comb_frag[j * hc + k] / (col_sum[k] + eps);
+      }
+    }
+
+    for (int iter = 0; iter < sinkhorn_iters - 1; ++iter) {
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < hc; ++k) {
+          sum += comb_frag[j * hc + k];
+        }
+        row_sum[j] = sum;
+      }
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        #pragma unroll
+        for (int k = 0; k < hc; ++k) {
+          comb_frag[j * hc + k] = comb_frag[j * hc + k] / (row_sum[j] + eps);
+        }
+      }
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < hc; ++j) {
+          sum += comb_frag[j * hc + k];
+        }
+        col_sum[k] = sum;
+      }
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        #pragma unroll
+        for (int k = 0; k < hc; ++k) {
+          comb_frag[j * hc + k] = comb_frag[j * hc + k] / (col_sum[k] + eps);
+        }
+      }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        float value = comb_frag[j * hc + k];
+        comb[token * hc * hc + j * hc + k] = value;
+      }
+    }
+  }
+  __syncthreads();
+
+  for (int dim_idx = threadIdx.x; dim_idx < dim; dim_idx += blockDim.x) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int h = 0; h < hc; ++h) {
+      sum += pre_shared[h] * __bfloat162float(x[(token * hc + h) * dim + dim_idx]);
+    }
+    out[token * dim + dim_idx] = __float2bfloat16(sum);
+  }
+}
+
+__global__ void deepseek_hc_pre_norm_from_mixes_kernel(
+    const __nv_bfloat16 *__restrict__ x,
+    const float *__restrict__ mixes,
+    const float *__restrict__ hc_scale,
+    const float *__restrict__ hc_base,
+    const __nv_bfloat16 *__restrict__ norm_weight,
+    float *__restrict__ post,
+    float *__restrict__ comb,
+    __nv_bfloat16 *__restrict__ out,
+    int seq_len,
+    int dim,
+    int sinkhorn_iters,
+    float hc_eps,
+    float norm_eps) {
+  constexpr int hc = 4;
+  constexpr int mix_hc = (2 + hc) * hc;
+  int token = blockIdx.x;
+  if (token >= seq_len) return;
+
+  extern __shared__ float shared[];
+  float* pre_values = shared;
+  float* reduction = shared + dim;
+
+  __shared__ float pre_shared[hc];
+
+  if (threadIdx.x == 0) {
+    float comb_frag[hc * hc];
+    const float* mix = mixes + token * mix_hc;
+
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      pre_shared[j] = deepseek_sigmoid(mix[j] * hc_scale[0] + hc_base[j]) + hc_eps;
+      post[token * hc + j] =
+          2.0f * deepseek_sigmoid(mix[j + hc] * hc_scale[1] + hc_base[j + hc]);
+    }
+
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        int offset = j * hc + k + hc * 2;
+        comb_frag[j * hc + k] = mix[offset] * hc_scale[2] + hc_base[offset];
+      }
+    }
+
+    float row_sum[hc];
+    float col_sum[hc];
+    float row_max[hc];
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      float max_value = comb_frag[j * hc];
+      #pragma unroll
+      for (int k = 1; k < hc; ++k) {
+        max_value = fmaxf(max_value, comb_frag[j * hc + k]);
+      }
+      row_max[j] = max_value;
+    }
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      float sum = 0.0f;
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        float value = expf(comb_frag[j * hc + k] - row_max[j]);
+        comb_frag[j * hc + k] = value;
+        sum += value;
+      }
+      row_sum[j] = sum;
+    }
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        comb_frag[j * hc + k] = comb_frag[j * hc + k] / row_sum[j] + hc_eps;
+      }
+    }
+
+    #pragma unroll
+    for (int k = 0; k < hc; ++k) {
+      float sum = 0.0f;
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        sum += comb_frag[j * hc + k];
+      }
+      col_sum[k] = sum;
+    }
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        comb_frag[j * hc + k] = comb_frag[j * hc + k] / (col_sum[k] + hc_eps);
+      }
+    }
+
+    for (int iter = 0; iter < sinkhorn_iters - 1; ++iter) {
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < hc; ++k) {
+          sum += comb_frag[j * hc + k];
+        }
+        row_sum[j] = sum;
+      }
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        #pragma unroll
+        for (int k = 0; k < hc; ++k) {
+          comb_frag[j * hc + k] = comb_frag[j * hc + k] / (row_sum[j] + hc_eps);
+        }
+      }
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < hc; ++j) {
+          sum += comb_frag[j * hc + k];
+        }
+        col_sum[k] = sum;
+      }
+      #pragma unroll
+      for (int j = 0; j < hc; ++j) {
+        #pragma unroll
+        for (int k = 0; k < hc; ++k) {
+          comb_frag[j * hc + k] = comb_frag[j * hc + k] / (col_sum[k] + hc_eps);
+        }
+      }
+    }
+
+    #pragma unroll
+    for (int j = 0; j < hc; ++j) {
+      #pragma unroll
+      for (int k = 0; k < hc; ++k) {
+        comb[token * hc * hc + j * hc + k] = comb_frag[j * hc + k];
+      }
+    }
+  }
+  __syncthreads();
+
+  float sumsq = 0.0f;
+  for (int dim_idx = threadIdx.x; dim_idx < dim; dim_idx += blockDim.x) {
+    float sum = 0.0f;
+    #pragma unroll
+    for (int h = 0; h < hc; ++h) {
+      sum += pre_shared[h] * __bfloat162float(x[(token * hc + h) * dim + dim_idx]);
+    }
+    float rounded = round_to_bf16_float(sum);
+    pre_values[dim_idx] = rounded;
+    sumsq += rounded * rounded;
+  }
+
+  reduction[threadIdx.x] = sumsq;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  float inv_rms = rsqrtf(reduction[0] / static_cast<float>(dim) + norm_eps);
+  for (int dim_idx = threadIdx.x; dim_idx < dim; dim_idx += blockDim.x) {
+    float value = pre_values[dim_idx] * inv_rms * __bfloat162float(norm_weight[dim_idx]);
+    out[token * dim + dim_idx] = __float2bfloat16(value);
+  }
+}
+
 __global__ void deepseek_hc_head_pre_kernel(
     const float *__restrict__ mixes,
     const float *__restrict__ hc_scale,
@@ -295,6 +608,50 @@ __global__ void deepseek_hc_post_kernel(
   }
   float post_term =
       __fmul_rn(post[token * hc + h_out], __bfloat162float(x[token * dim + dim_idx]));
+  float sum = __fadd_rn(post_term, residual_sum);
+  out[idx] = __float2bfloat16(sum);
+}
+
+__global__ void deepseek_hc_post_f32_branch_kernel(
+    const float *__restrict__ x,
+    const __nv_bfloat16 *__restrict__ residual,
+    const float *__restrict__ post,
+    const float *__restrict__ comb,
+    __nv_bfloat16 *__restrict__ out,
+    int seq_len,
+    int hc,
+    int dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = seq_len * hc * dim;
+  if (idx >= total) return;
+  int dim_idx = idx % dim;
+  int h_out = (idx / dim) % hc;
+  int token = idx / (hc * dim);
+  float residual_sum = 0.0f;
+  if (hc == 4) {
+    float term0 = __fmul_rn(
+        comb[(token * hc + 0) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 0) * dim + dim_idx]));
+    float term1 = __fmul_rn(
+        comb[(token * hc + 1) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 1) * dim + dim_idx]));
+    float term2 = __fmul_rn(
+        comb[(token * hc + 2) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 2) * dim + dim_idx]));
+    float term3 = __fmul_rn(
+        comb[(token * hc + 3) * hc + h_out],
+        __bfloat162float(residual[(token * hc + 3) * dim + dim_idx]));
+    residual_sum = __fadd_rn(__fadd_rn(__fadd_rn(term0, term1), term2), term3);
+  } else {
+    for (int h_in = 0; h_in < hc; ++h_in) {
+      float term = __fmul_rn(
+          comb[(token * hc + h_in) * hc + h_out],
+          __bfloat162float(residual[(token * hc + h_in) * dim + dim_idx]));
+      residual_sum = __fadd_rn(residual_sum, term);
+    }
+  }
+  float branch = __bfloat162float(__float2bfloat16(x[token * dim + dim_idx]));
+  float post_term = __fmul_rn(post[token * hc + h_out], branch);
   float sum = __fadd_rn(post_term, residual_sum);
   out[idx] = __float2bfloat16(sum);
 }
@@ -481,6 +838,56 @@ cudaError_t deepseek_hc_pre_output_cuda(
   return cudaGetLastError();
 }
 
+cudaError_t deepseek_hc_pre_from_mixes_cuda(
+    const __nv_bfloat16 *x,
+    const float *mixes,
+    const float *hc_scale,
+    const float *hc_base,
+    float *post,
+    float *comb,
+    __nv_bfloat16 *out,
+    int seq_len,
+    int hc,
+    int dim,
+    int sinkhorn_iters,
+    float eps,
+    cudaStream_t stream) {
+  if (hc != 4 || sinkhorn_iters != 20 || fabsf(eps - 1.0e-6f) > 1.0e-12f) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  deepseek_hc_pre_from_mixes_kernel<<<seq_len, threads, 0, stream>>>(
+      x, mixes, hc_scale, hc_base, post, comb, out, seq_len, dim, sinkhorn_iters, eps);
+  return cudaGetLastError();
+}
+
+cudaError_t deepseek_hc_pre_norm_from_mixes_cuda(
+    const __nv_bfloat16 *x,
+    const float *mixes,
+    const float *hc_scale,
+    const float *hc_base,
+    const __nv_bfloat16 *norm_weight,
+    float *post,
+    float *comb,
+    __nv_bfloat16 *out,
+    int seq_len,
+    int hc,
+    int dim,
+    int sinkhorn_iters,
+    float hc_eps,
+    float norm_eps,
+    cudaStream_t stream) {
+  if (hc != 4 || sinkhorn_iters != 20 || fabsf(hc_eps - 1.0e-6f) > 1.0e-12f) {
+    return cudaErrorInvalidValue;
+  }
+  constexpr int threads = 256;
+  size_t shared_bytes = (static_cast<size_t>(dim) + threads) * sizeof(float);
+  deepseek_hc_pre_norm_from_mixes_kernel<<<seq_len, threads, shared_bytes, stream>>>(
+      x, mixes, hc_scale, hc_base, norm_weight, post, comb, out, seq_len, dim,
+      sinkhorn_iters, hc_eps, norm_eps);
+  return cudaGetLastError();
+}
+
 cudaError_t deepseek_hc_head_pre_cuda(
     const float *mixes,
     const float *hc_scale,
@@ -516,6 +923,24 @@ cudaError_t deepseek_hc_post_cuda(
   return cudaGetLastError();
 }
 
+cudaError_t deepseek_hc_post_f32_branch_cuda(
+    const float *x,
+    const __nv_bfloat16 *residual,
+    const float *post,
+    const float *comb,
+    __nv_bfloat16 *out,
+    int seq_len,
+    int hc,
+    int dim,
+    cudaStream_t stream) {
+  constexpr int threads = 256;
+  int total = seq_len * hc * dim;
+  int blocks = (total + threads - 1) / threads;
+  deepseek_hc_post_f32_branch_kernel<<<blocks, threads, 0, stream>>>(
+      x, residual, post, comb, out, seq_len, hc, dim);
+  return cudaGetLastError();
+}
+
 cudaError_t deepseek_last_token_bf16_logits_cuda(
     const __nv_bfloat16 *x,
     const __nv_bfloat16 *weight,
@@ -525,76 +950,62 @@ cudaError_t deepseek_last_token_bf16_logits_cuda(
     int vocab_size,
     cudaStream_t stream) {
   constexpr int threads = 256;
-  float *x_f32 = nullptr;
-  float *weight_f32 = nullptr;
-  cudaError_t cuda_status = cudaMalloc(&x_f32, sizeof(float) * dim);
-  if (cuda_status != cudaSuccess) return cuda_status;
-  cuda_status = cudaMalloc(&weight_f32, sizeof(float) * vocab_size * dim);
-  if (cuda_status != cudaSuccess) {
-    cudaFree(x_f32);
-    return cuda_status;
+  if (seq_len <= 0 || dim <= 0 || vocab_size <= 0) {
+    return cudaErrorInvalidValue;
   }
+  DeepseekHcScratch* scratch_ptr = nullptr;
+  cudaError_t cuda_status = deepseek_hc_scratch_for_device(&scratch_ptr);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  DeepseekHcScratch& scratch = *scratch_ptr;
+  std::lock_guard<std::mutex> lock(scratch.mutex);
 
   const __nv_bfloat16 *last_x = x + (seq_len - 1) * dim;
+  cuda_status = deepseek_ensure_hc_f32_scratch(
+      &scratch.x_f32, &scratch.x_elems, static_cast<size_t>(dim));
+  if (cuda_status != cudaSuccess) return cuda_status;
   int x_blocks = (dim + threads - 1) / threads;
-  deepseek_hc_bf16_to_f32_kernel<<<x_blocks, threads, 0, stream>>>(last_x, x_f32, dim);
+  deepseek_hc_bf16_to_f32_kernel<<<x_blocks, threads, 0, stream>>>(
+      last_x, scratch.x_f32, dim);
   cuda_status = cudaGetLastError();
-  if (cuda_status != cudaSuccess) {
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cuda_status;
-  }
-  int weight_total = vocab_size * dim;
-  int weight_blocks = (weight_total + threads - 1) / threads;
-  deepseek_hc_bf16_to_f32_kernel<<<weight_blocks, threads, 0, stream>>>(
-      weight, weight_f32, weight_total);
-  cuda_status = cudaGetLastError();
-  if (cuda_status != cudaSuccess) {
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cuda_status;
+  if (cuda_status != cudaSuccess) return cuda_status;
+
+  size_t weight_total = static_cast<size_t>(vocab_size) * dim;
+  bool need_weight_convert =
+      scratch.logits_weight_src != weight ||
+      scratch.logits_weight_valid_elems != weight_total;
+  if (need_weight_convert) {
+    cuda_status = deepseek_ensure_hc_f32_scratch(
+        &scratch.logits_weight_f32, &scratch.logits_weight_capacity, weight_total);
+    if (cuda_status != cudaSuccess) return cuda_status;
+    int weight_blocks = (static_cast<int>(weight_total) + threads - 1) / threads;
+    deepseek_hc_bf16_to_f32_kernel<<<weight_blocks, threads, 0, stream>>>(
+        weight, scratch.logits_weight_f32, static_cast<int>(weight_total));
+    cuda_status = cudaGetLastError();
+    if (cuda_status != cudaSuccess) return cuda_status;
+    scratch.logits_weight_src = weight;
+    scratch.logits_weight_valid_elems = weight_total;
   }
 
-  cublasHandle_t handle = nullptr;
-  cublasStatus_t status = cublasCreate(&handle);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cudaErrorUnknown;
-  }
-  status = cublasSetMathMode(handle, CUBLAS_PEDANTIC_MATH);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    cublasDestroy(handle);
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cudaErrorUnknown;
-  }
-  status = cublasSetStream(handle, stream);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    cublasDestroy(handle);
-    cudaFree(weight_f32);
-    cudaFree(x_f32);
-    return cudaErrorUnknown;
-  }
+  cuda_status = deepseek_ensure_hc_cublas_handle(scratch);
+  if (cuda_status != cudaSuccess) return cuda_status;
+  cublasStatus_t status = cublasSetStream(scratch.handle, stream);
+  if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
 
   const float alpha = 1.0f;
   const float beta = 0.0f;
   status = cublasSgemv(
-      handle,
+      scratch.handle,
       CUBLAS_OP_T,
       dim,
       vocab_size,
       &alpha,
-      weight_f32,
+      scratch.logits_weight_f32,
       dim,
-      x_f32,
+      scratch.x_f32,
       1,
       &beta,
       out,
       1);
-  cublasDestroy(handle);
-  cudaFree(weight_f32);
-  cudaFree(x_f32);
   if (status != CUBLAS_STATUS_SUCCESS) return cudaErrorUnknown;
   return cudaSuccess;
 }
