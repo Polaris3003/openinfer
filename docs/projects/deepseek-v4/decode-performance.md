@@ -667,6 +667,38 @@ W13 outputs are bitwise compared against the existing two-GEMM baseline. In acti
 
 Interpretation: the current TileLang grouped W13/W2 early-return path already makes empty expert slots nearly free for this shape. The performance jumps are tied to how many active expert tiles fit into waves, not to the existence of 32 pointer slots by itself. A useful next prototype must change the actual active GEMM scheduling or fuse across the W13/W2 boundary; compacting pointer arrays alone should not be moved into runtime.
 
+### Microbench: W13 accumulator to SwiGLU quant upper bound
+
+The aggressive path from the goal is:
+
+```text
+W13 GEMM accumulator -> SwiGLU -> W2 quant
+```
+
+The standalone `swiglu_quant_bench.cu` now includes an upper-bound mode for that epilogue idea. It compares:
+
+```text
+materialized:
+  FP32 accumulator proxy -> BF16 gate/up materialization
+  fused SwiGLU+quant reads BF16 gate/up
+
+direct:
+  FP32 accumulator proxy -> BF16 semantic rounding in registers
+  fused SwiGLU+quant writes only W2 FP8 activation/scales
+```
+
+The direct path is bitwise compared against the materialized path. This does not implement the real W13 tensor-core epilogue, but it answers the first gating question: how much can the gate/up materialization boundary contribute by itself?
+
+5090 results:
+
+| Rows | Materialized accumulator + quant | Direct accumulator quant | Speedup | Absolute delta |
+| ---: | ---: | ---: | ---: | ---: |
+| `48` | `0.004577ms` | `0.002322ms` | `1.971x` | `0.002255ms` |
+| `96` | `0.004669ms` | `0.004080ms` | `1.144x` | `0.000589ms` |
+| `192` | `0.006144ms` | `0.004096ms` | `1.500x` | `0.002048ms` |
+
+Interpretation: the direct epilogue idea is exact-feasible at the scalar/quant semantics level, but the isolated absolute savings are too small to justify runtime integration by itself. A real implementation would need to fuse into the TileLang W13 tensor-core epilogue and avoid the existing W13 gate/up global writes without worsening W13 scheduling. Treat this as a prerequisite proof, not a runtime green light.
+
 Evidence required for each adoption step:
 
 - vLLM/SGLang source location and whether we copied the decomposition, the kernel shape, or only the validation idea.
@@ -686,6 +718,7 @@ These are worth remembering because they looked plausible:
 | Skip W2 SwiGLU+quant rows after GPU `local_count` | Exact-safe and hash-stable, but regressed to `31.22-31.34ms/token` | Adding a device-side count read and row predicate inside a tiny regular kernel is the wrong granularity. |
 | Shrink grouped GEMM row-tile bound to `seq_len` | Exact-safe and hash-stable, but regressed to `28.46-28.74ms/token` | Empty row tiles are not the dominant grouped FP4 cost; the expert scheduling dimension remains too coarse. |
 | Compact active expert pointer arrays | Bitwise microbench PASS, but compact W13/W2 was only `0.999-1.009x` versus capacity W13/W2 | Empty expert slots are already cheap in TileLang grouped GEMM; runtime active-list work needs a different scheduler, not pointer-array compaction alone. |
+| Direct W13-accumulator SwiGLU quant epilogue | Bitwise microbench PASS and local epilogue speedup up to `1.97x`, but absolute 5090 delta only `0.0006-0.0023ms` | Scalar epilogue feasibility is proven; runtime work needs true W13 tensor-core epilogue fusion, not a standalone quant kernel swap. |
 | Fuse final HC head plus RMSNorm | Exact-safe but regressed TPOT | Saving small launches can lose to worse reduction/kernel shape. |
 | Reuse deterministic window top-k across layers | Exact-safe, no stable long-bench win | Launch-count reduction alone is weak evidence. |
 | Fuse KV RoPE plus no-PE quant | Exact-safe, regressed short decode | Combining tiny kernels can hurt scheduling/occupancy. |
@@ -807,6 +840,7 @@ Local:
 - rejected grouped GEMM row-tile upper-bound exact E2E log `/tmp/dsv4_max_expert_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - rejected grouped GEMM row-tile upper-bound fixed bench log `/tmp/dsv4_max_expert_rows_bench.log`: per-iteration steady TPOT avg `28.504ms`, `28.460ms`, `28.735ms`; all hash `6346f03343d75a65`
 - active-expert W13/W2 compact-pointer microbench on 5090: `/tmp/w13_grouped_fp4_bench --experts 32 --active-experts {1,3,6} --rows-per-active 8`; bitwise PASS, W13 compact speedup `0.999x`, `1.009x`, `1.000x`, W2 compact speedup `1.000x`, `1.000x`, `1.000x`
+- accumulator-direct SwiGLU quant upper-bound microbench on 5090: `/tmp/swiglu_quant_bench --rows {48,96,192}`; bitwise PASS, materialized/direct deltas `0.002255ms`, `0.000589ms`, `0.002048ms`
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 

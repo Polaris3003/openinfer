@@ -212,6 +212,72 @@ __global__ void swiglu_clamp_act_quant_k2048_kernel(
   }
 }
 
+__global__ void materialize_accumulators_to_bf16_kernel(
+    const float* __restrict__ gate_acc,
+    const float* __restrict__ up_acc,
+    __nv_bfloat16* __restrict__ gate,
+    __nv_bfloat16* __restrict__ up,
+    int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    gate[idx] = __float2bfloat16(gate_acc[idx]);
+    up[idx] = __float2bfloat16(up_acc[idx]);
+  }
+}
+
+__global__ void accumulator_swiglu_act_quant_k2048_kernel(
+    const float* __restrict__ gate_acc,
+    const float* __restrict__ up_acc,
+    unsigned char* __restrict__ out,
+    unsigned char* __restrict__ scales,
+    int rows,
+    float limit) {
+  const int row_block = static_cast<int>(blockIdx.x);
+  const int group = static_cast<int>(blockIdx.y);
+  const int warp = static_cast<int>(threadIdx.x) / kWarpSize;
+  const int lane = static_cast<int>(threadIdx.x) % kWarpSize;
+  const int row = row_block * kRowsPerBlock + warp;
+
+  float activated[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float amax = 0.0f;
+  if (row < rows) {
+    #pragma unroll
+    for (int item = 0; item < 4; ++item) {
+      const int col = lane + item * kWarpSize;
+      const int idx = row * kInterDim + group * kGroupSize + col;
+      float gate_value = round_to_bf16_float(gate_acc[idx]);
+      float up_value = round_to_bf16_float(up_acc[idx]);
+      if (limit > 0.0f) {
+        gate_value = fminf(gate_value, limit);
+        up_value = fminf(fmaxf(up_value, -limit), limit);
+      }
+      const float silu_gate = gate_value / (1.0f + expf(-gate_value));
+      activated[item] = round_to_bf16_float(silu_gate * up_value);
+      amax = fmaxf(amax, fabsf(activated[item]));
+    }
+  }
+
+  #pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    amax = fmaxf(amax, __shfl_down_sync(0xffffffff, amax, offset));
+  }
+  const float rounded_amax = fmaxf(__shfl_sync(0xffffffff, amax, 0), 1.0e-4f);
+  const unsigned char scale_e8m0 = float_to_e8m0(rounded_amax / 448.0f);
+  const float scale = e8m0_to_float(scale_e8m0);
+
+  if (row < rows) {
+    if (lane == 0) {
+      scales[row * kScaleCols + group] = scale_e8m0;
+    }
+    #pragma unroll
+    for (int item = 0; item < 4; ++item) {
+      const int col = lane + item * kWarpSize;
+      const float q = fminf(fmaxf(activated[item] / scale, -448.0f), 448.0f);
+      out[row * kInterDim + group * kGroupSize + col] = float_to_fp8_e4m3(q);
+    }
+  }
+}
+
 void swiglu_clamp_act_quant_k2048(
     const __nv_bfloat16* gate,
     const __nv_bfloat16* up,
@@ -223,6 +289,32 @@ void swiglu_clamp_act_quant_k2048(
   dim3 grid((rows + kRowsPerBlock - 1) / kRowsPerBlock, kScaleCols, 1);
   swiglu_clamp_act_quant_k2048_kernel<<<grid, kGroupSize, 0, stream>>>(
       gate, up, out, scales, rows, limit);
+}
+
+void materialize_accumulators_to_bf16(
+    const float* gate_acc,
+    const float* up_acc,
+    __nv_bfloat16* gate,
+    __nv_bfloat16* up,
+    int n,
+    cudaStream_t stream) {
+  const int threads = 256;
+  const int blocks = (n + threads - 1) / threads;
+  materialize_accumulators_to_bf16_kernel<<<blocks, threads, 0, stream>>>(
+      gate_acc, up_acc, gate, up, n);
+}
+
+void accumulator_swiglu_act_quant_k2048(
+    const float* gate_acc,
+    const float* up_acc,
+    unsigned char* out,
+    unsigned char* scales,
+    int rows,
+    float limit,
+    cudaStream_t stream) {
+  dim3 grid((rows + kRowsPerBlock - 1) / kRowsPerBlock, kScaleCols, 1);
+  accumulator_swiglu_act_quant_k2048_kernel<<<grid, kGroupSize, 0, stream>>>(
+      gate_acc, up_acc, out, scales, rows, limit);
 }
 
 }  // namespace
@@ -254,11 +346,28 @@ int main(int argc, char** argv) {
   unsigned char* ref_scale = nullptr;
   unsigned char* fused_q = nullptr;
   unsigned char* fused_scale = nullptr;
+  float* gate_acc = nullptr;
+  float* up_acc = nullptr;
+  unsigned char* accum_q = nullptr;
+  unsigned char* accum_scale = nullptr;
   CUDA_CHECK(cudaMalloc(&activated, elems * sizeof(__nv_bfloat16)));
   CUDA_CHECK(cudaMalloc(&ref_q, elems));
   CUDA_CHECK(cudaMalloc(&ref_scale, scale_elems));
   CUDA_CHECK(cudaMalloc(&fused_q, elems));
   CUDA_CHECK(cudaMalloc(&fused_scale, scale_elems));
+  CUDA_CHECK(cudaMalloc(&gate_acc, elems * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&up_acc, elems * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&accum_q, elems));
+  CUDA_CHECK(cudaMalloc(&accum_scale, scale_elems));
+
+  std::vector<float> gate_acc_host(elems);
+  std::vector<float> up_acc_host(elems);
+  for (size_t i = 0; i < elems; ++i) {
+    gate_acc_host[i] = __bfloat162float(gate_host[i]);
+    up_acc_host[i] = __bfloat162float(up_host[i]);
+  }
+  CUDA_CHECK(cudaMemcpy(gate_acc, gate_acc_host.data(), elems * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(up_acc, up_acc_host.data(), elems * sizeof(float), cudaMemcpyHostToDevice));
 
   auto run_baseline = [&]() {
     CUDA_CHECK(deepseek_swiglu_clamp_cuda(
@@ -270,22 +379,43 @@ int main(int argc, char** argv) {
     swiglu_clamp_act_quant_k2048(gate, up, fused_q, fused_scale, args.rows, args.limit, stream);
     CUDA_CHECK(cudaGetLastError());
   };
+  auto run_accumulator_upper_bound = [&]() {
+    accumulator_swiglu_act_quant_k2048(
+        gate_acc, up_acc, accum_q, accum_scale, args.rows, args.limit, stream);
+    CUDA_CHECK(cudaGetLastError());
+  };
+  auto run_materialized_accumulator = [&]() {
+    materialize_accumulators_to_bf16(
+        gate_acc, up_acc, gate, up, static_cast<int>(elems), stream);
+    CUDA_CHECK(cudaGetLastError());
+    swiglu_clamp_act_quant_k2048(gate, up, fused_q, fused_scale, args.rows, args.limit, stream);
+    CUDA_CHECK(cudaGetLastError());
+  };
 
   run_baseline();
   run_fused();
+  run_accumulator_upper_bound();
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   std::vector<unsigned char> ref_q_host(elems);
   std::vector<unsigned char> ref_scale_host(scale_elems);
   std::vector<unsigned char> fused_q_host(elems);
   std::vector<unsigned char> fused_scale_host(scale_elems);
+  std::vector<unsigned char> accum_q_host(elems);
+  std::vector<unsigned char> accum_scale_host(scale_elems);
   CUDA_CHECK(cudaMemcpy(ref_q_host.data(), ref_q, elems, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(ref_scale_host.data(), ref_scale, scale_elems, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(fused_q_host.data(), fused_q, elems, cudaMemcpyDeviceToHost));
   CUDA_CHECK(cudaMemcpy(fused_scale_host.data(), fused_scale, scale_elems, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(accum_q_host.data(), accum_q, elems, cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(accum_scale_host.data(), accum_scale, scale_elems, cudaMemcpyDeviceToHost));
 
-  const int q_mismatches = compare_u8(ref_q_host, fused_q_host, "fp8");
-  const int scale_mismatches = compare_u8(ref_scale_host, fused_scale_host, "scale");
+  const int q_mismatches =
+      compare_u8(ref_q_host, fused_q_host, "fp8") +
+      compare_u8(ref_q_host, accum_q_host, "accum_fp8");
+  const int scale_mismatches =
+      compare_u8(ref_scale_host, fused_scale_host, "scale") +
+      compare_u8(ref_scale_host, accum_scale_host, "accum_scale");
   if (q_mismatches || scale_mismatches) {
     std::fprintf(stderr, "FUZZ FAIL q_mismatches=%d scale_mismatches=%d\n",
                  q_mismatches, scale_mismatches);
@@ -295,17 +425,27 @@ int main(int argc, char** argv) {
   for (int i = 0; i < args.warmup; ++i) {
     run_baseline();
     run_fused();
+    run_accumulator_upper_bound();
+    run_materialized_accumulator();
   }
   CUDA_CHECK(cudaStreamSynchronize(stream));
 
   float baseline_ms = time_ms(stream, args.iters, run_baseline);
   float fused_ms = time_ms(stream, args.iters, run_fused);
+  float materialized_accumulator_ms = time_ms(stream, args.iters, run_materialized_accumulator);
+  float accumulator_upper_bound_ms = time_ms(stream, args.iters, run_accumulator_upper_bound);
 
   std::printf("SwiGLU+act_quant fuzz: PASS rows=%d seed=%d limit=%.3f\n",
               args.rows, args.seed, args.limit);
   std::printf("baseline_swiglu_plus_act_quant_ms=%.6f\n", baseline_ms);
   std::printf("fused_swiglu_act_quant_ms=%.6f\n", fused_ms);
   std::printf("speedup=%.3fx\n", baseline_ms / fused_ms);
+  std::printf("materialized_accumulator_to_gate_up_plus_quant_ms=%.6f\n",
+              materialized_accumulator_ms);
+  std::printf("accumulator_direct_swiglu_quant_upper_bound_ms=%.6f\n",
+              accumulator_upper_bound_ms);
+  std::printf("accumulator_direct_speedup=%.3fx\n",
+              materialized_accumulator_ms / accumulator_upper_bound_ms);
 
   CUDA_CHECK(cudaStreamDestroy(stream));
   return 0;
