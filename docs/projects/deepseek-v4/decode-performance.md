@@ -440,6 +440,19 @@ Trace summary across the 5 traced requests (`2` warmup + `3` measured), aggregat
 
 Interpretation: the current shared/routed MoE path is not the largest source of rank skew in this trace. MoE is still a large absolute cost, but its rank range is only about `0.6ms`; the larger variance comes from attention local and attention collective+HC-post windows. The next optimization pass should not blindly keep fusing MoE kernels before explaining attention-local variability.
 
+A narrower per-layer trace at the same hard-coded `start_pos == 80` logged `43 layers * 8 ranks * 5 requests = 1720` rows in `/tmp/dsv4_layer_trace_bench.log`. The fixed bench stayed on the same token trace (`6346f03343d75a65`) and measured around `30.84ms/token`, but this run included per-layer stream synchronizations and is attribution-only.
+
+| Stage | Avg per layer | Approx 43-layer sum | p95 per layer | Max per layer |
+| --- | ---: | ---: | ---: | ---: |
+| HC attention pre-norm | `0.052ms` | `2.22ms` | `0.067ms` | `0.105ms` |
+| Attention local | `0.399ms` | `17.16ms` | `0.489ms` | `0.724ms` |
+| Attention all-reduce + HC post | `0.088ms` | `3.80ms` | `0.218ms` | `0.483ms` |
+| HC FFN pre-norm | `0.052ms` | `2.24ms` | `0.061ms` | `0.077ms` |
+| MoE, including AG/RS + shared expert | `0.354ms` | `15.23ms` | `0.390ms` | `0.428ms` |
+| FFN HC post | `0.012ms` | `0.50ms` | `0.021ms` | `0.040ms` |
+
+The largest single layer/request cross-rank ranges were `0.448ms` in layer `1` attention collective, `0.375ms` in layer `19` attention local, and `0.363ms` in layer `19` attention collective. There was no repeated multi-millisecond rank outlier in this per-layer view. That changes the next bet: stable sub-`30ms/token` is less likely to come from only rank-affinity or one MoE scalar cleanup, and more likely from reducing the largest absolute sections, namely attention local (`~17ms`) and MoE (`~15ms`), while keeping launch count and synchronization windows low.
+
 ### NCCL wall is wait-inclusive
 
 Nsight Systems NCCL kernel wall time includes rank-arrival waiting. Treat NCCL rows as synchronization-window evidence unless rank-arrival skew and post-arrival tail have been separated. The rank-affinity work was selected because corrected f32 all-reduce grouping showed attention hidden all-reduce dominated by arrival skew, not post-arrival NCCL tail.
