@@ -5,7 +5,7 @@
 
 ## TL;DR
 
-This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current small-route mapping branch at about `27.61-27.83ms/token`, with prior clean sub-30 validation at `29.86-29.97ms/token`, earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, fused MoE mapping clear, small-route MoE mapping, and benchmark/counter instrumentation. The active MoE goal is stable sub-`30ms/token` decode first, then sub-`25ms/token`, by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
+This document consolidates the DeepSeek V4 decode work that moved fixed long decode from the `~108-113ms/token` band to the current small-route mapping branch at about `27.61-27.83ms/token`, with prior clean sub-30 validation at `29.86-29.97ms/token`, earlier shared-expert fused repeats at `28.16-32.22ms/token`, routed W13+SwiGLU-quant validation at `31.18-33.42ms/token`, W13-only validation at `31.99-34.22ms/token`, and shared-quant-only validation at `33.33-34.29ms/token`. The retained changes are grouped MoE pointer caching, rank-worker placement, removal of hot temporary zero-fill, rank-owned decode scratch, caller-owned grouped FP4 workspace, shared W1/W3 activation quantization, W13 grouped FP4 runtime launch, routed fused SwiGLU+W2 activation quantization, shared expert fused W1/W3 quant, shared fused SwiGLU+W2 quant, shared dense FP8 W13, fused MoE mapping clear, small-route MoE mapping, and benchmark/counter instrumentation. Stable sub-`30ms/token` is achieved on the fixed bench; the active MoE goal is now stable sub-`25ms/token` by mirroring mature vLLM/SGLang decode MoE decomposition and only then exploring deeper fusion without bs=1 specialization. Post-small-route experiments rejected so far: direct route-W13 regressed to `33.14-33.36ms/token`; fused expand+act_quant was bitwise and `2.5-3.2x` faster in microbench but repeated runtime TPOT landed at `27.20-28.71ms/token`; GPU-side valid-row skip in W2 SwiGLU+quant regressed to `31.22-31.34ms/token`. Exact E2E remains `20/20`, and the fixed bench token hash remains `6346f03343d75a65`.
 
 The retained team lessons are more important than the discarded attempt logs: compare identical token traces, separate NCCL wait from transfer, treat capacity and logical length separately, keep MoE semantic zero on device, and prove allocation cleanup with application-visible CUDA API counters rather than nsys attribution alone.
 
@@ -453,6 +453,146 @@ For MP8 decode, `route_elems = global_batch * topk`; with the fixed single-reque
 
 Keep decision: retain. This is a real structural win: the same route semantics move from four launches to one launch in decode-sized routed batches, and repeated fixed benches stay in the `27.6-27.8ms/token` band.
 
+### Rejected: route W13 directly from token activations
+
+After small-route mapping, the next tempting idea was to skip `expand_moe_fused_input_into` for W13:
+
+```text
+Before:
+expand global_hidden -> expanded_input BF16 rows
+act_quant(expanded_input)
+expert-major W13 grouped FP4 GEMM
+
+Attempt:
+act_quant(global_hidden)
+route-row W13 grouped FP4 GEMM -> compact gate/up rows
+```
+
+This was exact-safe but not performance-safe. The route W13 kernel launched one TileLang W13 tile set per route element, used `route_indices` and `token_topk_to_pos` to pick the local expert and compact output row, and kept W2/reduce unchanged. That removes one BF16 expand launch and quantizes only token rows instead of route rows, but it also destroys the existing expert-major grouped-GEMM shape. For decode-sized routes, the kernel becomes many small route-row GEMM tiles instead of contiguous expert ranges, so tensor-core work is scheduled less favorably than the retained W13 path.
+
+5090 validation:
+
+| Check | Result |
+| --- | --- |
+| local `cargo fmt --check` | passed |
+| local `git diff --check` | passed |
+| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| 5090 release build for `bench_serving` and `deepseek_v4_e2e` | passed |
+| release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
+| fixed bench JSON | aggregate steady TPOT avg `33.217ms`, p50 `33.003ms`, p95 `34.584ms`, decode throughput `30.115 tok/s` |
+| fixed bench iterations | `33.162ms`, `33.355ms`, `33.135ms`, all hash `6346f03343d75a65` |
+
+Drop decision: do not retain. Correctness and token trace are not enough here; the implementation regresses from the current small-route mapping band of `27.61-27.83ms/token` to `33.14-33.36ms/token`. The reusable lesson is that reducing route-row materialization can lose if it breaks expert-major GEMM locality. Future work should preserve grouped expert ranges or build a real grouped scheduler that consumes per-expert problem sizes, rather than launching one-row route tiles.
+
+### Rejected: fuse expand with W13 activation quant
+
+The next experiment kept the expert-major W13 grouped GEMM shape and only fused the W13 input preparation:
+
+```text
+Before:
+expand global_hidden -> expanded_input BF16 rows
+TileLang act_quant_k4096(expanded_input) -> FP8 activation + E8M0 scales
+expert-major W13 grouped FP4 GEMM
+
+Attempt:
+expand+act_quant_k4096(global_hidden, pos_to_token) -> FP8 activation + E8M0 scales
+expert-major W13 grouped FP4 GEMM
+```
+
+This is the safer version of the previous idea because it preserves expert-major compact rows for W13. A temporary C++ microbench compared the baseline `deepseek_moe_expand_to_fused_cuda + deepseek_tilelang_act_quant_k4096` against a fused CUDA kernel using the same BF16, E8M0, and FP8 E4M3 conversion order as the existing exact-safe fused SwiGLU+quant kernel.
+
+5090 microbench results:
+
+| Tokens | Rows | Fuzz | Baseline expand+act_quant | Fused expand+act_quant | Speedup |
+| ---: | ---: | --- | ---: | ---: | ---: |
+| `8` | `48` | PASS | `0.008197ms` | `0.002575ms` | `3.183x` |
+| `16` | `96` | PASS | `0.008199ms` | `0.002642ms` | `3.103x` |
+| `32` | `192` | PASS | `0.010240ms` | `0.004074ms` | `2.514x` |
+
+Runtime validation:
+
+| Check | Result |
+| --- | --- |
+| local `cargo fmt --check` | passed |
+| local `git diff --check` | passed |
+| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| 5090 release build for `bench_serving` and `deepseek_v4_e2e` | passed |
+| release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
+| fixed bench run 1 | aggregate steady TPOT avg `27.807ms`; iterations `28.080ms`, `28.143ms`, `27.198ms`; all hash `6346f03343d75a65` |
+| fixed bench run 2 | aggregate steady TPOT avg `28.565ms`; iterations `28.509ms`, `28.712ms`, `28.474ms`; all hash `6346f03343d75a65` |
+
+Drop decision: do not retain in runtime. The operator microbench is real, but this is too small relative to the full decode step, and repeated fixed benches do not beat the retained small-route mapping band of `27.61-27.83ms/token`. The reusable lesson is methodological: only integrate this kind of local fusion when a profile proves the fused section is still visible at full-runtime scale, or when it is part of a larger fusion that removes a full synchronization/launch cluster.
+
+### Rejected: skip W2 SwiGLU+quant rows after local_count
+
+The route mapping kernel already computes `expert_indptr[local_experts] = local_count` on GPU. The attempted W2 change passed `expert_indptr + local_experts` into `deepseek_swiglu_clamp_act_quant_k2048_kernel` and skipped rows `>= local_count`:
+
+```text
+Before:
+fused SwiGLU+quant over rows = route_capacity
+W2 grouped FP4 GEMM skips empty rows via expert_indptr
+
+Attempt:
+fused SwiGLU+quant reads GPU local_count and only computes compact prefix rows
+W2 grouped FP4 GEMM unchanged
+```
+
+This preserved the no-D2H rule and kept W2 grouped GEMM semantics unchanged. It was still not a win. The likely reason is that the original row-block quant kernel is very regular and small; adding a device-side count read plus row predicate did not reduce a visible full-runtime section and may have made the kernel shape less friendly.
+
+5090 validation:
+
+| Check | Result |
+| --- | --- |
+| local `cargo fmt --check` | passed |
+| local `git diff --check` | passed |
+| local `cargo check --release -p pegainfer-deepseek-v4 --features deepseek-v4` | passed |
+| 5090 release build for `bench_serving` and `deepseek_v4_e2e` | passed |
+| release `deepseek_v4_e2e` | `All 20 DeepSeek V4 exact cases passed` |
+| fixed bench JSON | aggregate steady TPOT avg `31.270ms`, p50 `30.660ms`, p95 `33.575ms` |
+| fixed bench iterations | `31.220ms`, `31.342ms`, `31.248ms`, all hash `6346f03343d75a65` |
+
+Drop decision: do not retain. Skipping empty rows inside a tiny regular kernel is not enough, and in this implementation it regressed sharply. Future `local_count` usage needs to remove a larger launch cluster or preserve a fully regular kernel shape; a branch inside W2 quant is the wrong granularity.
+
+### Diagnostic: route sparsity at fixed token
+
+A temporary hard-coded diagnostic at `start_pos == 80` synchronized the rank stream and copied `expert_indptr` to host once per `(rank, layer)`. This was intentionally not retained because it performs D2H and stream sync in the decode path. The diagnostic ran with:
+
+```bash
+target/release/bench_serving \
+  --model-path /data/DeepSeek-V4-Flash \
+  --format json \
+  request \
+  --prompt-len 1 \
+  --output-len 96 \
+  --warmup 1 \
+  --iters 1 \
+  --seed 42
+```
+
+Route stats from `/tmp/dsv4_moe_route_stats.log` covered `43 layers * 8 ranks = 344` rows:
+
+| Metric | Value |
+| --- | ---: |
+| route capacity per rank/layer | `48` |
+| `local_count` min / avg / p50 / p95 / max | `0 / 6.0 / 8 / 16 / 40` |
+| nonempty local experts min / avg / p50 / p95 / max | `0 / 0.75 / 1 / 2 / 5` |
+| max rows per local expert min / avg / p50 / p95 / max | `0 / 4.35 / 8 / 8 / 8` |
+
+Per-rank averages were also sparse: rank-local `local_count` ranged from `4.19` to `7.81` rows on average, and average nonempty experts ranged from `0.53` to `0.98` out of `32` local experts.
+
+Interpretation: the fixed decode route is extremely sparse at the rank-local expert level. Most rank/layer pairs have zero or one active local expert, and nonempty experts usually have exactly eight rows because the gathered MP8 token batch follows the same token trace across ranks. This confirms that empty expert/empty CTA work is real. It also explains the failed valid-row experiment: skipping rows inside W2 quant is too small and too late. A useful next MoE scheduler must reduce or reshape expert-level grouped GEMM work while preserving expert-major locality; route-row W13 and in-kernel row predicates are the wrong granularity.
+
+The existing W13 grouped FP4 microbench gives an upper-bound sanity check for this direction:
+
+| Shape | W13 one GEMM | Notes |
+| --- | ---: | --- |
+| `rows=48, experts=32` | `0.399417ms` | Capacity-like shape with many expert slots. The bench distribution is not as sparse as the real route, so treat as a pessimistic capacity proxy. |
+| `rows=8, experts=1` | `0.061476ms` | Typical one-active-expert rank/layer shape from the route diagnostic. |
+| `rows=16, experts=2` | `0.061866ms` | Approx p95 active-expert count. |
+| `rows=24, experts=3` | `0.061477ms` | Upper tail seen in several layers. |
+
+Interpretation: the next plausible MoE win is not another scalar/row predicate inside the existing capacity launch. The useful prototype should make grouped W13/W2 see active expert problem sizes, ideally using compact active pointer/indptr metadata, while keeping W13 expert-major. The hard production constraint remains host launch sizing: a GPU-only active list cannot directly shrink grid dimensions without D2H, CUDA dynamic parallelism, or a fixed small upper-bound launch. The microbench says the direction is worth prototyping; it does not yet solve the runtime launch-sizing problem.
+
 Evidence required for each adoption step:
 
 - vLLM/SGLang source location and whether we copied the decomposition, the kernel shape, or only the validation idea.
@@ -467,6 +607,9 @@ These are worth remembering because they looked plausible:
 
 | Attempt | Result | Lesson |
 | --- | --- | --- |
+| Route W13 directly from token activations | Exact-safe, hash-stable, but regressed to `33.14-33.36ms/token` | Removing BF16 expand and reducing W13 quant rows is not enough if the GEMM shape loses expert-major locality. |
+| Fuse expand with W13 activation quant | Bitwise microbench PASS and `2.5-3.2x` faster locally, but runtime repeated at `27.20-28.71ms/token` | Local microbench wins that remove only a tiny section can disappear in full decode; require full-runtime proof before retaining. |
+| Skip W2 SwiGLU+quant rows after GPU `local_count` | Exact-safe and hash-stable, but regressed to `31.22-31.34ms/token` | Adding a device-side count read and row predicate inside a tiny regular kernel is the wrong granularity. |
 | Fuse final HC head plus RMSNorm | Exact-safe but regressed TPOT | Saving small launches can lose to worse reduction/kernel shape. |
 | Reuse deterministic window top-k across layers | Exact-safe, no stable long-bench win | Launch-count reduction alone is weak evidence. |
 | Fuse KV RoPE plus no-PE quant | Exact-safe, regressed short decode | Combining tiny kernels can hurt scheduling/occupancy. |
@@ -579,6 +722,12 @@ Local:
 - small-route exact E2E log `/tmp/dsv4_small_mapping_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
 - small-route fixed bench logs `/tmp/dsv4_small_mapping_bench.log` and `/tmp/dsv4_small_mapping_bench_repeat.log`: per-iteration steady TPOT avg `27.608ms`, `27.662ms`, `27.826ms`, then `27.698ms`, `27.693ms`, `27.644ms`; all hash `6346f03343d75a65`
 - small-route short nsys log `/tmp/dsv4_small_mapping_short_profile.txt`: `deepseek_moe_local_mapping_small_kernel` is the decode-sized route mapping path
+- rejected route-W13 exact E2E log `/tmp/dsv4_route_w13_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected route-W13 fixed bench log `/tmp/dsv4_route_w13_bench.log`: aggregate steady TPOT avg `33.217ms`, per-iteration `33.162ms`, `33.355ms`, `33.135ms`; all hash `6346f03343d75a65`
+- rejected expand+act_quant exact E2E log `/tmp/dsv4_expand_act_quant_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected expand+act_quant fixed bench logs `/tmp/dsv4_expand_act_quant_bench.log` and `/tmp/dsv4_expand_act_quant_bench_repeat.log`: per-iteration steady TPOT avg `28.080ms`, `28.143ms`, `27.198ms`, then `28.509ms`, `28.712ms`, `28.474ms`; all hash `6346f03343d75a65`
+- rejected W2 valid-row exact E2E log `/tmp/dsv4_valid_rows_e2e.log`: `All 20 DeepSeek V4 exact cases passed`
+- rejected W2 valid-row fixed bench log `/tmp/dsv4_valid_rows_bench.log`: aggregate steady TPOT avg `31.270ms`, per-iteration `31.220ms`, `31.342ms`, `31.248ms`; all hash `6346f03343d75a65`
 - `gcc -shared -fPIC -O2 -Wall -Wextra -o /tmp/cuda_api_counter.so tools/cuda_api_counter.c -ldl`
 - `nm -D /tmp/cuda_api_counter.so` confirmed base and `_ptsz` wrappers
 
