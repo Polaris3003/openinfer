@@ -282,7 +282,9 @@ async fn run_request_stream(
                     return;
                 }
             }
-            TokenEvent::PromptTokens { .. } => {}
+            TokenEvent::PromptTokens { .. } => {
+                // Prompt logprobs are intentionally deferred for this bridge.
+            }
             TokenEvent::Finished { finish_reason, .. } => {
                 let _ = send_terminal_output(
                     &output_tx,
@@ -438,15 +440,19 @@ fn engine_output(
 fn to_wire_logprobs(token_id: u32, logprob: Option<TokenLogprob>) -> Option<MaybeWireLogprobs> {
     let lp = logprob?;
     let mut entries = Vec::with_capacity(1 + lp.top_logprobs.len());
-    // The sampled/selected token. pegainfer-core does not track its actual vocab
-    // rank, so we record rank=1 (correct for greedy sampling and a reasonable
-    // default for sampling).
+    // pegainfer-core does not currently expose the sampled token's vocab rank.
+    // rank: 1 is correct for greedy sampling, where the sampled token is top-1,
+    // and is a lossy placeholder for non-greedy sampling.
+    // See discussion on PR #96.
     entries.push(WireTokenLogprob {
         token_id,
         logprob: lp.logprob,
         rank: 1,
     });
     for (index, (alt_id, alt_logprob)) in lp.top_logprobs.into_iter().enumerate() {
+        if alt_id == token_id {
+            continue;
+        }
         entries.push(WireTokenLogprob {
             token_id: alt_id,
             logprob: alt_logprob,
@@ -574,13 +580,36 @@ mod tests {
         };
         assert_eq!(direct.positions.len(), 1);
         let entries = &direct.positions[0].entries;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].token_id, 7);
+        assert_eq!(entries[0].logprob, -0.5);
+        assert_eq!(entries[0].rank, 1);
+        assert_eq!(entries[1].token_id, 42);
+        assert_eq!(entries[1].logprob, -1.5);
+        assert_eq!(entries[1].rank, 2);
+    }
+
+    #[test]
+    fn to_wire_logprobs_keeps_distinct_top_k_alternatives() {
+        let lp = TokenLogprob {
+            logprob: -0.5,
+            top_logprobs: vec![(8, -1.0), (9, -1.5)],
+        };
+        let wire = to_wire_logprobs(7, Some(lp)).expect("logprob payload");
+        let direct = match wire {
+            MaybeWireLogprobs::Direct(d) => d,
+            MaybeWireLogprobs::Wire(_) => panic!("expected Direct logprobs"),
+        };
+        assert_eq!(direct.positions.len(), 1);
+        let entries = &direct.positions[0].entries;
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].token_id, 7);
         assert_eq!(entries[0].logprob, -0.5);
         assert_eq!(entries[0].rank, 1);
-        assert_eq!(entries[1].token_id, 7);
+        assert_eq!(entries[1].token_id, 8);
+        assert_eq!(entries[1].logprob, -1.0);
         assert_eq!(entries[1].rank, 1);
-        assert_eq!(entries[2].token_id, 42);
+        assert_eq!(entries[2].token_id, 9);
         assert_eq!(entries[2].logprob, -1.5);
         assert_eq!(entries[2].rank, 2);
     }
