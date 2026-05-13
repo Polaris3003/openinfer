@@ -18,6 +18,43 @@ pub struct DirectGeneration {
     pub finish_reason: FinishReason,
 }
 
+pub struct DeepSeekV4RequestState {
+    prompt_len: usize,
+    max_new_tokens: usize,
+    ignore_eos: bool,
+    generated: Vec<u32>,
+    next_logits: Option<Vec<f32>>,
+    finish_reason: Option<FinishReason>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DirectDecodeStep {
+    pub token: Option<u32>,
+    pub finish_reason: Option<FinishReason>,
+}
+
+impl DeepSeekV4RequestState {
+    pub fn prompt_len(&self) -> usize {
+        self.prompt_len
+    }
+
+    pub fn generated(&self) -> &[u32] {
+        &self.generated
+    }
+
+    pub fn completion_tokens(&self) -> usize {
+        self.generated.len()
+    }
+
+    pub fn finish_reason(&self) -> Option<FinishReason> {
+        self.finish_reason
+    }
+
+    pub fn is_finished(&self) -> bool {
+        self.finish_reason.is_some()
+    }
+}
+
 pub struct DeepSeekV4DirectGenerator {
     config: &'static Config,
     runtime: FullDirectRuntime,
@@ -41,6 +78,124 @@ impl DeepSeekV4DirectGenerator {
         self.config.eos_token_id
     }
 
+    pub fn start_greedy_request(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+    ) -> Result<DeepSeekV4RequestState> {
+        if prompt_tokens.is_empty() {
+            bail!("DeepSeek V4 request produced an empty prompt");
+        }
+        if max_new_tokens == 0 {
+            return Ok(DeepSeekV4RequestState {
+                prompt_len: prompt_tokens.len(),
+                max_new_tokens,
+                ignore_eos,
+                generated: Vec::new(),
+                next_logits: None,
+                finish_reason: Some(FinishReason::Length),
+            });
+        }
+
+        ensure_direct_decode_caches(
+            &mut self.runtime,
+            self.config,
+            prompt_tokens.len() + max_new_tokens,
+        )?;
+
+        let next_logits = run_prefill_logits_and_seed_decode_cache(
+            &mut self.runtime,
+            self.config,
+            prompt_tokens,
+        )?;
+
+        Ok(DeepSeekV4RequestState {
+            prompt_len: prompt_tokens.len(),
+            max_new_tokens,
+            ignore_eos,
+            generated: Vec::with_capacity(max_new_tokens),
+            next_logits: Some(next_logits),
+            finish_reason: None,
+        })
+    }
+
+    pub fn sample_greedy_step(&self, state: &DeepSeekV4RequestState) -> Result<DirectDecodeStep> {
+        if let Some(finish_reason) = state.finish_reason {
+            return Ok(DirectDecodeStep {
+                token: None,
+                finish_reason: Some(finish_reason),
+            });
+        }
+
+        let next_logits = state
+            .next_logits
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 request state missing next logits"))?;
+        let token = argmax_f32(&next_logits) as u32;
+        if !state.ignore_eos && token as usize == self.config.eos_token_id {
+            return Ok(DirectDecodeStep {
+                token: None,
+                finish_reason: Some(FinishReason::Stop),
+            });
+        }
+
+        let finish_reason =
+            (state.generated.len() + 1 == state.max_new_tokens).then_some(FinishReason::Length);
+        Ok(DirectDecodeStep {
+            token: Some(token),
+            finish_reason,
+        })
+    }
+
+    pub fn advance_greedy_step(
+        &mut self,
+        state: &mut DeepSeekV4RequestState,
+        step: DirectDecodeStep,
+    ) -> Result<()> {
+        if state.is_finished() {
+            return Ok(());
+        }
+
+        if let Some(finish_reason) = step.finish_reason
+            && step.token.is_none()
+        {
+            state.next_logits = None;
+            state.finish_reason = Some(finish_reason);
+            return Ok(());
+        }
+
+        let Some(token) = step.token else {
+            bail!("DeepSeek V4 decode step without token or finish reason");
+        };
+        state
+            .next_logits
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("DeepSeek V4 request state missing consumed logits"))?;
+        state.generated.push(token);
+        if let Some(finish_reason) = step.finish_reason {
+            state.finish_reason = Some(finish_reason);
+            return Ok(());
+        }
+        let start_pos = state.prompt_len + state.generated.len() - 1;
+        state.next_logits = Some(run_direct_decode_logits(
+            &mut self.runtime,
+            token,
+            start_pos,
+        )?);
+
+        Ok(())
+    }
+
+    pub fn decode_greedy_step(
+        &mut self,
+        state: &mut DeepSeekV4RequestState,
+    ) -> Result<DirectDecodeStep> {
+        let step = self.sample_greedy_step(state)?;
+        self.advance_greedy_step(state, step)?;
+        Ok(step)
+    }
+
     pub fn generate_greedy<F>(
         &mut self,
         prompt_tokens: &[u32],
@@ -51,49 +206,19 @@ impl DeepSeekV4DirectGenerator {
     where
         F: FnMut(u32) -> Result<()>,
     {
-        if prompt_tokens.is_empty() {
-            bail!("DeepSeek V4 request produced an empty prompt");
-        }
-        if max_new_tokens == 0 {
-            return Ok(DirectGeneration {
-                generated: Vec::new(),
-                finish_reason: FinishReason::Length,
-            });
-        }
-
-        ensure_direct_decode_caches(
-            &mut self.runtime,
-            self.config,
-            prompt_tokens.len() + max_new_tokens,
-        )?;
-
-        let mut next_logits = run_prefill_logits_and_seed_decode_cache(
-            &mut self.runtime,
-            self.config,
-            prompt_tokens,
-        )?;
-        let mut generated = Vec::with_capacity(max_new_tokens);
-
-        for step in 0..max_new_tokens {
-            let token = argmax_f32(&next_logits) as u32;
-            if !ignore_eos && token as usize == self.config.eos_token_id {
-                return Ok(DirectGeneration {
-                    generated,
-                    finish_reason: FinishReason::Stop,
-                });
+        let mut state = self.start_greedy_request(prompt_tokens, max_new_tokens, ignore_eos)?;
+        while !state.is_finished() {
+            let step = self.sample_greedy_step(&state)?;
+            if let Some(token) = step.token {
+                on_token(token)?;
             }
-            on_token(token)?;
-            generated.push(token);
-            if step + 1 == max_new_tokens {
-                break;
-            }
-            next_logits =
-                run_direct_decode_logits(&mut self.runtime, token, prompt_tokens.len() + step)?;
+            self.advance_greedy_step(&mut state, step)?;
         }
-
         Ok(DirectGeneration {
-            generated,
-            finish_reason: FinishReason::Length,
+            generated: state.generated,
+            finish_reason: state
+                .finish_reason
+                .expect("DeepSeek V4 request state must finish after greedy generation"),
         })
     }
 }

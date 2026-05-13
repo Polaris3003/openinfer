@@ -6,7 +6,10 @@ mod runtime;
 mod weights;
 
 pub use config::{Config, RopeScaling, TensorParallelConfig};
-pub use direct::{DeepSeekV4DirectGenerator, DirectGeneration, start_engine};
+pub use direct::{
+    DeepSeekV4DirectGenerator, DeepSeekV4RequestState, DirectDecodeStep, DirectGeneration,
+    start_engine,
+};
 pub use model::{
     AttentionWeightNames, AttentionWeights, BlockWeightNames, BlockWeights, CompressorWeightNames,
     CompressorWeights, DeepSeekRankModel, ExpertWeightNames, ExpertWeights, FfnWeightNames,
