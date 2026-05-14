@@ -699,9 +699,12 @@ fn attention_decode_compressed_overlap_rank_local_collective_bf16_hidden_batch_w
             state_offset,
             false,
         )? {
-            let dst = config.sliding_window
-                + batch_meta.slot_ids_host[row] * compressed_slots
-                + batch_meta.start_pos_host[row] / 4;
+            let dst = decode_cache_compressed_row(
+                config.sliding_window,
+                compressed_slots,
+                batch_meta.slot_ids_host[row],
+                batch_meta.start_pos_host[row] / 4,
+            );
             copy_bf16_rows_to_cache(ctx, &compressed_kv, &mut cache.kv, 0, dst, 1)?;
         }
         if let Some(indexer_compressed_kv) = compressor_overlap_decode_bf16_hidden_with_dim_at(

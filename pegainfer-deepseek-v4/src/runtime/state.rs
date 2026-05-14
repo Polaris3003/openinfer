@@ -94,6 +94,15 @@ pub(crate) struct DecodeBatchMeta<'a> {
     pub(crate) slot_ids_host: &'a [usize],
 }
 
+pub(crate) fn decode_cache_compressed_row(
+    sliding_window: usize,
+    compressed_slots: usize,
+    slot_id: usize,
+    compressed_row: usize,
+) -> usize {
+    slot_id * (sliding_window + compressed_slots) + sliding_window + compressed_row
+}
+
 pub(crate) struct HcPostScratch {
     pub(crate) attention_reduce_temp: CudaSlice<f32>,
     pub(crate) attention_out: HcHiddenStates,
@@ -1013,5 +1022,25 @@ impl F32Logits {
         let host = ctx.stream.clone_dtoh(&self.data)?;
         ctx.sync()?;
         Ok(host)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_cache_compressed_row;
+
+    #[test]
+    fn compressed_rows_follow_per_slot_window_then_compressed_layout() {
+        let sliding_window = 128;
+        let compressed_slots = 32;
+
+        assert_eq!(
+            decode_cache_compressed_row(sliding_window, compressed_slots, 0, 3),
+            131
+        );
+        assert_eq!(
+            decode_cache_compressed_row(sliding_window, compressed_slots, 1, 3),
+            291
+        );
     }
 }

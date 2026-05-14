@@ -1066,13 +1066,10 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
             info!("DeepSeek V4 scheduler ready");
             while let Some(req) = submit_rx.blocking_recv() {
                 let mut wave = vec![req];
-                while wave.len() < 2 {
-                    match submit_rx.try_recv() {
-                        Ok(req) => wave.push(req),
-                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-                    }
-                }
+                // HTTP serving keeps admission fail-closed to one request per
+                // scheduler turn until multi-step batch decode is deterministic
+                // across request pairings. The runtime batch primitive remains
+                // available behind direct tests and future wiring.
                 if wave.len() == 1 {
                     handle_request(
                         &mut generator,

@@ -1273,9 +1273,12 @@ pub(crate) fn attention_decode_compressed_nonoverlap_rank_local_bf16_hidden_batc
             compressor_state,
             state_offset,
         )? {
-            let dst = config.sliding_window
-                + batch_meta.slot_ids_host[row] * compressed_slots
-                + batch_meta.start_pos_host[row] / ratio;
+            let dst = decode_cache_compressed_row(
+                config.sliding_window,
+                compressed_slots,
+                batch_meta.slot_ids_host[row],
+                batch_meta.start_pos_host[row] / ratio,
+            );
             copy_bf16_rows_to_cache(ctx, &compressed_kv, &mut cache.kv, 0, dst, 1)?;
         }
     }
