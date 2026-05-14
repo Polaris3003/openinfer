@@ -13,6 +13,7 @@ import concurrent.futures
 import hashlib
 import http.client
 import json
+import re
 import socket
 import statistics
 import time
@@ -31,13 +32,17 @@ DEFAULT_PROMPT_WORDS = (
 @dataclass
 class RequestResult:
     index: int
+    request_id: str
     ok: bool
     status: int | None
     error: str | None
     timed_out: bool
     start_s: float
+    start_wall_s: float
     first_token_s: float | None
+    first_token_wall_s: float | None
     end_s: float
+    end_wall_s: float
     latency_ms: float
     ttft_ms: float | None
     tpot_ms: float | None
@@ -46,6 +51,7 @@ class RequestResult:
     output_chars: int
     output_hash: str
     text_prefix: str
+    server_trace: dict[str, Any] | None = None
 
 
 def percentile(sorted_values: list[float], pct: float) -> float:
@@ -76,6 +82,31 @@ def summarize(values: list[float]) -> dict[str, float | int | None]:
     }
 
 
+def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
+    fields = [
+        "frontend_to_queue_ms",
+        "admission_queue_ms",
+        "prefill_ms",
+        "first_decode_ms",
+        "stream_flush_ms",
+    ]
+    phase_summary: dict[str, Any] = {}
+    for field in fields:
+        values = [
+            float(result.server_trace[field])
+            for result in measured
+            if result.server_trace is not None and isinstance(result.server_trace.get(field), (int, float))
+        ]
+        phase_summary[field] = summarize(values)
+    traced = [result for result in measured if result.server_trace is not None]
+    return {
+        "source": "server log lines matching `pegainfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
+        "traced_requests": len(traced),
+        "missing_traces": [result.request_id for result in measured if result.server_trace is None],
+        "phases_ms": phase_summary,
+    }
+
+
 def make_prompt(index: int, prompt_words: int) -> str:
     words = [
         DEFAULT_PROMPT_WORDS[(index + offset) % len(DEFAULT_PROMPT_WORDS)]
@@ -97,6 +128,7 @@ def parse_sse_text(payload: dict[str, Any]) -> str:
 
 def request_once(
     index: int,
+    request_id: str,
     url: urllib.parse.ParseResult,
     model: str,
     prompt: str,
@@ -106,7 +138,9 @@ def request_once(
     ignore_eos: bool,
 ) -> RequestResult:
     start = time.perf_counter()
+    start_wall = time.time()
     first_token: float | None = None
+    first_token_wall: float | None = None
     last_token: float | None = None
     inter_token_ms: list[float] = []
     chunks: list[str] = []
@@ -124,6 +158,7 @@ def request_once(
             "temperature": temperature,
             "stream": True,
             "ignore_eos": ignore_eos,
+            "request_id": request_id,
         }
         conn.request(
             "POST",
@@ -154,6 +189,7 @@ def request_once(
             now = time.perf_counter()
             if first_token is None:
                 first_token = now
+                first_token_wall = time.time()
             if last_token is not None:
                 inter_token_ms.append((now - last_token) * 1000.0)
             last_token = now
@@ -162,6 +198,7 @@ def request_once(
         if max_tokens > 0 and not chunks:
             raise RuntimeError("stream completed without streamed text chunks")
         end = time.perf_counter()
+        end_wall = time.time()
         text = "".join(chunks)
         output_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
         latency_ms = (end - start) * 1000.0
@@ -171,13 +208,17 @@ def request_once(
             tpot_ms = (last_token - first_token) * 1000.0 / (len(chunks) - 1)
         return RequestResult(
             index=index,
+            request_id=request_id,
             ok=True,
             status=status,
             error=None,
             timed_out=False,
             start_s=start,
+            start_wall_s=start_wall,
             first_token_s=first_token,
+            first_token_wall_s=first_token_wall,
             end_s=end,
+            end_wall_s=end_wall,
             latency_ms=latency_ms,
             ttft_ms=ttft_ms,
             tpot_ms=tpot_ms,
@@ -189,29 +230,36 @@ def request_once(
         )
     except (TimeoutError, socket.timeout) as exc:
         end = time.perf_counter()
-        return failed_result(index, status, start, end, str(exc), timed_out=True)
+        return failed_result(index, request_id, status, start, start_wall, end, str(exc), timed_out=True)
     except Exception as exc:  # noqa: BLE001 - benchmark reports the error string.
         end = time.perf_counter()
-        return failed_result(index, status, start, end, str(exc), timed_out=False)
+        return failed_result(index, request_id, status, start, start_wall, end, str(exc), timed_out=False)
 
 
 def failed_result(
     index: int,
+    request_id: str,
     status: int | None,
     start: float,
+    start_wall: float,
     end: float,
     error: str,
     timed_out: bool,
 ) -> RequestResult:
+    end_wall = time.time()
     return RequestResult(
         index=index,
+        request_id=request_id,
         ok=False,
         status=status,
         error=error,
         timed_out=timed_out,
         start_s=start,
+        start_wall_s=start_wall,
         first_token_s=None,
+        first_token_wall_s=None,
         end_s=end,
+        end_wall_s=end_wall,
         latency_ms=(end - start) * 1000.0,
         ttft_ms=None,
         tpot_ms=None,
@@ -223,6 +271,72 @@ def failed_result(
     )
 
 
+TRACE_RE = re.compile(r"pegainfer_http_trace\s+(\{.*\})")
+
+
+def load_server_traces(path: Path | None) -> dict[str, dict[str, Any]]:
+    if path is None or not path.exists():
+        return {}
+    traces: dict[str, dict[str, Any]] = {}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = TRACE_RE.search(line)
+        if not match:
+            continue
+        try:
+            trace = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        request_id = trace.get("request_id")
+        if isinstance(request_id, str):
+            traces[request_id] = trace
+    return traces
+
+
+def attach_server_traces(results: list[RequestResult], traces: dict[str, dict[str, Any]]) -> None:
+    for result in results:
+        trace = find_server_trace(result.request_id, result.start_wall_s, traces)
+        if trace is None:
+            continue
+        result.server_trace = trace
+        if result.ok and result.first_token_wall_s is not None:
+            emit_at = trace.get("first_token_emit_unix_s")
+            if isinstance(emit_at, (int, float)):
+                trace["stream_flush_ms"] = max(0.0, (result.first_token_wall_s - float(emit_at)) * 1000.0)
+            queued_at = trace.get("queued_at_unix_s")
+            if isinstance(queued_at, (int, float)):
+                trace["frontend_to_queue_ms"] = max(0.0, (float(queued_at) - result.start_wall_s) * 1000.0)
+            scheduled_at = trace.get("scheduled_at_unix_s")
+            if isinstance(queued_at, (int, float)) and isinstance(scheduled_at, (int, float)):
+                trace["admission_queue_ms"] = max(0.0, (float(scheduled_at) - float(queued_at)) * 1000.0)
+
+
+def find_server_trace(
+    request_id: str,
+    start_wall_s: float,
+    traces: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    prefix = f"cmpl-{request_id}-"
+    matches = [
+        trace
+        for trace_id, trace in traces.items()
+        if trace_id == request_id or trace_id == f"cmpl-{request_id}" or trace_id.startswith(prefix)
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        timed_matches = [
+            trace
+            for trace in matches
+            if isinstance(trace.get("queued_at_unix_s"), (int, float))
+        ]
+        if timed_matches:
+            return min(
+                timed_matches,
+                key=lambda trace: abs(float(trace["queued_at_unix_s"]) - start_wall_s),
+            )
+    return None
+
+
 def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestResult], float]:
     url = urllib.parse.urlparse(args.base_url)
     if url.scheme not in {"http", "https"} or not url.hostname:
@@ -230,6 +344,7 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
 
     offset = args.warmup if measured else 0
     count = args.num_requests if measured else args.warmup
+    label = "measured" if measured else "warmup"
     prompts = [make_prompt(offset + idx, args.prompt_words) for idx in range(count)]
     started = time.perf_counter()
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as pool:
@@ -237,6 +352,7 @@ def run_batch(args: argparse.Namespace, measured: bool) -> tuple[list[RequestRes
             pool.submit(
                 request_once,
                 idx,
+                f"pegainfer-bench-{label}-{offset + idx}",
                 url,
                 args.model,
                 prompt,
@@ -305,6 +421,7 @@ def build_report(args: argparse.Namespace, measured: list[RequestResult], wall_s
             "tpot": summarize(tpots),
             "itl": summarize(itls),
         },
+        "server_trace": summarize_trace_ms(measured),
         "requests": [asdict(result) for result in measured],
     }
 
@@ -321,6 +438,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--ignore-eos", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--server-log",
+        type=Path,
+        help="Optional pegainfer server log containing pegainfer_http_trace lines for TTFT phase attribution.",
+    )
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
@@ -335,6 +457,7 @@ def main() -> None:
             raise SystemExit(f"warmup failed: {failed[0].error}")
 
     measured, wall_s = run_batch(args, measured=True)
+    attach_server_traces(measured, load_server_traces(args.server_log))
     report = build_report(args, measured, wall_s)
     rendered = json.dumps(report, indent=2, sort_keys=True)
     if args.out:

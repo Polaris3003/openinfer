@@ -31,6 +31,10 @@ struct Args {
     /// Tensor-parallel world size for Qwen3
     #[arg(long, default_value_t = 1)]
     tp_size: usize,
+
+    /// Emit synchronized DeepSeek V4 prefill phase timing records.
+    #[arg(long, default_value_t = false)]
+    deepseek_prefill_profile: bool,
 }
 
 #[tokio::main]
@@ -63,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
                 &args.model_path,
                 EngineLoadOptions {
                     enable_cuda_graph: false,
+                    enable_prefill_profile: args.deepseek_prefill_profile,
                     device_ordinals: (0..8).collect(),
                     seed: 42,
                 },
@@ -83,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
                 &args.model_path,
                 EngineLoadOptions {
                     enable_cuda_graph: args.cuda_graph,
+                    enable_prefill_profile: false,
                     device_ordinals,
                     seed: 42,
                 },
@@ -98,6 +104,7 @@ async fn main() -> anyhow::Result<()> {
                 &args.model_path,
                 EngineLoadOptions {
                     enable_cuda_graph: args.cuda_graph,
+                    enable_prefill_profile: false,
                     device_ordinals: vec![args.device_ordinal],
                     seed: 42,
                 },

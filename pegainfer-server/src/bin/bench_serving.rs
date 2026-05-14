@@ -910,6 +910,8 @@ impl BenchModel for SchedulerBenchModel {
             let (token_tx, mut token_rx) = mpsc::unbounded_channel();
             self.handle
                 .submit(SchedulerRequest {
+                    request_id: None,
+                    queued_at_unix_s: None,
                     prompt_tokens: toks.to_vec(),
                     params: SamplingParams {
                         temperature: sampling.temperature,
@@ -932,6 +934,7 @@ impl BenchModel for SchedulerBenchModel {
                         }
                     }
                     Some(TokenEvent::PromptTokens { .. }) => {}
+                    Some(TokenEvent::Scheduled { .. }) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     Some(TokenEvent::Error { message, .. }) => {
                         anyhow::bail!("scheduler request failed: {message}");
@@ -1687,6 +1690,7 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: false,
+                    enable_prefill_profile: false,
                     device_ordinals: (0..8).collect(),
                     seed: command_seed(&cli),
                 },
@@ -1701,6 +1705,7 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
+                    enable_prefill_profile: false,
                     device_ordinals: vec![0],
                     seed: command_seed(&cli),
                 },
@@ -1715,6 +1720,7 @@ fn main() -> Result<()> {
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
+                    enable_prefill_profile: false,
                     device_ordinals: vec![0],
                     seed: command_seed(&cli),
                 },

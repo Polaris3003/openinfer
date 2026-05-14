@@ -1,4 +1,11 @@
-use std::{error::Error, fmt, path::Path, sync::mpsc as std_mpsc, thread};
+use std::{
+    error::Error,
+    fmt,
+    path::Path,
+    sync::mpsc as std_mpsc,
+    thread,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Context, Result, bail, ensure};
 use log::{info, warn};
@@ -264,6 +271,13 @@ pub struct DeepSeekV4DirectGenerator {
 
 impl DeepSeekV4DirectGenerator {
     pub fn from_model_dir(model_path: &Path) -> Result<Self> {
+        Self::from_model_dir_with_prefill_profile(model_path, false)
+    }
+
+    pub fn from_model_dir_with_prefill_profile(
+        model_path: &Path,
+        enable_prefill_profile: bool,
+    ) -> Result<Self> {
         let config = Box::leak(Box::new(Config::from_model_dir(model_path).with_context(
             || {
                 format!(
@@ -272,7 +286,7 @@ impl DeepSeekV4DirectGenerator {
                 )
             },
         )?));
-        let runtime = load_full_direct_runtime(model_path, config)?;
+        let runtime = load_full_direct_runtime(model_path, config, enable_prefill_profile)?;
         Ok(Self {
             config,
             runtime,
@@ -1053,7 +1067,10 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
     thread::Builder::new()
         .name("deepseek-v4-scheduler".into())
         .spawn(move || {
-            let mut generator = match DeepSeekV4DirectGenerator::from_model_dir(&model_path) {
+            let mut generator = match DeepSeekV4DirectGenerator::from_model_dir_with_prefill_profile(
+                &model_path,
+                options.enable_prefill_profile,
+            ) {
                 Ok(generator) => {
                     let _ = init_tx.send(Ok(()));
                     generator
@@ -1091,6 +1108,17 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
 
 fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateRequest) {
     let prompt_len = req.prompt_tokens.len();
+    let request_id = req
+        .request_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_secs_f64);
+    let scheduled_at_unix_s = unix_secs_f64();
+    let _ = req.token_tx.send(TokenEvent::Scheduled {
+        queued_at_unix_s,
+        scheduled_at_unix_s,
+        prompt_tokens: prompt_len,
+    });
     if req.echo {
         let _ = req.token_tx.send(TokenEvent::PromptTokens {
             ids: req.prompt_tokens.clone(),
@@ -1117,29 +1145,13 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
         return;
     }
 
-    let token_tx = req.token_tx.clone();
-    let result = generator.generate_greedy(
+    let prefill_start = Instant::now();
+    let mut state = match generator.start_greedy_request(
         &req.prompt_tokens,
         req.max_tokens,
         req.params.ignore_eos,
-        |token| {
-            token_tx
-                .send(TokenEvent::Token {
-                    id: token,
-                    logprob: None,
-                })
-                .map_err(|_| anyhow::anyhow!("request receiver dropped"))?;
-            Ok(())
-        },
-    );
-    match result {
-        Ok(generation) => {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: generation.finish_reason,
-                prompt_tokens: prompt_len,
-                completion_tokens: generation.generated.len(),
-            });
-        }
+    ) {
+        Ok(state) => state,
         Err(err) => {
             if let Some(kv_err) = err.downcast_ref::<DirectKvCacheReservationError>() {
                 reject_request(
@@ -1160,8 +1172,91 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
                 prompt_tokens: prompt_len,
                 completion_tokens: 0,
             });
+            return;
+        }
+    };
+    let prefill_done_unix_s = unix_secs_f64();
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    let mut first_token_emit_unix_s = None;
+    let mut first_decode_ms = None;
+
+    while !state.is_finished() {
+        let step = match generator.sample_greedy_step(&state) {
+            Ok(step) => step,
+            Err(err) => {
+                if let Err(release_err) = generator.release_greedy_request(&mut state) {
+                    warn!(
+                        "failed to release DeepSeek V4 KV cache after sample error: {release_err:#}"
+                    );
+                }
+                let message = format!("DeepSeek V4 direct request failed: {err:#}");
+                warn!("{message}");
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message,
+                    prompt_tokens: prompt_len,
+                    completion_tokens: state.generated().len(),
+                });
+                return;
+            }
+        };
+        if let Some(token) = step.token() {
+            if first_token_emit_unix_s.is_none() {
+                first_token_emit_unix_s = Some(unix_secs_f64());
+            }
+            if req
+                .token_tx
+                .send(TokenEvent::Token {
+                    id: token,
+                    logprob: None,
+                })
+                .is_err()
+            {
+                if let Err(release_err) = generator.release_greedy_request(&mut state) {
+                    warn!(
+                        "failed to release DeepSeek V4 KV cache after receiver drop: {release_err:#}"
+                    );
+                }
+                return;
+            }
+        }
+
+        let decode_start = Instant::now();
+        if let Err(err) = generator.advance_greedy_step(&mut state, &step) {
+            let message = format!("DeepSeek V4 direct request failed: {err:#}");
+            warn!("{message}");
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message,
+                prompt_tokens: prompt_len,
+                completion_tokens: state.generated().len(),
+            });
+            return;
+        }
+        if first_decode_ms.is_none() && step.token().is_some() && step.finish_reason().is_none() {
+            first_decode_ms = Some(decode_start.elapsed().as_secs_f64() * 1000.0);
         }
     }
+
+    info!(
+        "pegainfer_http_trace {}",
+        serde_json::json!({
+            "request_id": request_id,
+            "queued_at_unix_s": queued_at_unix_s,
+            "scheduled_at_unix_s": scheduled_at_unix_s,
+            "prefill_done_unix_s": prefill_done_unix_s,
+            "first_token_emit_unix_s": first_token_emit_unix_s,
+            "prefill_ms": prefill_ms,
+            "first_decode_ms": first_decode_ms,
+            "prompt_tokens": prompt_len,
+            "completion_tokens": state.generated().len(),
+        })
+    );
+    let _ = req.token_tx.send(TokenEvent::Finished {
+        finish_reason: state
+            .finish_reason()
+            .expect("DeepSeek V4 request state must finish after greedy generation"),
+        prompt_tokens: prompt_len,
+        completion_tokens: state.generated().len(),
+    });
 }
 
 struct PendingDirectRequest {
@@ -1445,6 +1540,13 @@ fn send_request_error(
         prompt_tokens: prompt_len,
         completion_tokens,
     });
+}
+
+fn unix_secs_f64() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs_f64()
 }
 
 fn argmax_f32(values: &[f32]) -> usize {

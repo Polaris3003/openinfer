@@ -62,6 +62,8 @@ fn generate_tokens(
 
     handle
         .submit(GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
             prompt_tokens,
             params: SamplingParams::default(),
             max_tokens,
@@ -76,6 +78,7 @@ fn generate_tokens(
         match token_rx.blocking_recv() {
             Some(TokenEvent::Token { id, .. }) => tokens.push(id),
             Some(TokenEvent::PromptTokens { .. }) => {}
+            Some(TokenEvent::Scheduled { .. }) => {}
             Some(TokenEvent::Finished { finish_reason, .. }) => {
                 return (tokens, finish_reason);
             }
@@ -159,6 +162,8 @@ fn test_e2e_qwen35_scheduler() {
             let (token_tx, token_rx) = mpsc::unbounded_channel();
             handle
                 .submit(GenerateRequest {
+                    request_id: None,
+                    queued_at_unix_s: None,
                     prompt_tokens,
                     params: SamplingParams::default(),
                     max_tokens: case.max_new_tokens,
@@ -177,6 +182,7 @@ fn test_e2e_qwen35_scheduler() {
                 match rx.blocking_recv() {
                     Some(TokenEvent::Token { id, .. }) => tokens.push(id),
                     Some(TokenEvent::PromptTokens { .. }) => {}
+                    Some(TokenEvent::Scheduled { .. }) => {}
                     Some(TokenEvent::Finished { .. }) => break,
                     Some(TokenEvent::Error { message, .. }) => {
                         panic!("generation failed: {message}")
@@ -201,6 +207,8 @@ fn test_e2e_qwen35_scheduler() {
         drop(rx);
         handle
             .submit(GenerateRequest {
+                request_id: None,
+                queued_at_unix_s: None,
                 prompt_tokens,
                 params: SamplingParams::default(),
                 max_tokens: 10,

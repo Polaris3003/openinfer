@@ -10,10 +10,10 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::protocol::handshake::EngineCoreReadyResponse;
 use vllm_engine_core_client::protocol::{
-    EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, EngineCoreRequest,
-    EngineCoreRequestType, EngineCoreSamplingParams, Logprobs, MaybeWireLogprobs, PositionLogprobs,
-    StopReason, TokenLogprob as WireTokenLogprob, UtilityOutput, UtilityResultEnvelope,
-    encode_msgpack,
+    EngineCoreEvent, EngineCoreEventType, EngineCoreFinishReason, EngineCoreOutput,
+    EngineCoreOutputs, EngineCoreRequest, EngineCoreRequestType, EngineCoreSamplingParams,
+    Logprobs, MaybeWireLogprobs, PositionLogprobs, StopReason, TokenLogprob as WireTokenLogprob,
+    UtilityOutput, UtilityResultEnvelope, encode_msgpack, stats::PrefillStats,
 };
 use vllm_engine_core_client::{EngineId, TransportMode};
 use vllm_server::{
@@ -194,6 +194,8 @@ impl LocalEngineBridge {
         let (token_tx, token_rx) = mpsc::unbounded_channel();
         self.handle
             .submit(GenerateRequest {
+                request_id: Some(request_id.clone()),
+                queued_at_unix_s: Some(request.arrival_time),
                 prompt_tokens,
                 params: convert_sampling(&sampling_params),
                 max_tokens: sampling_params.max_tokens as usize,
@@ -275,10 +277,44 @@ async fn run_request_stream(
     mut token_rx: mpsc::UnboundedReceiver<TokenEvent>,
     output_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
 ) {
+    let mut first_token_events = None;
+    let mut first_token_prefill_stats = None;
     while let Some(event) = token_rx.recv().await {
         match event {
+            TokenEvent::Scheduled {
+                queued_at_unix_s,
+                scheduled_at_unix_s,
+                prompt_tokens,
+            } => {
+                first_token_events = Some(vec![
+                    EngineCoreEvent {
+                        r#type: EngineCoreEventType::Queued,
+                        timestamp: queued_at_unix_s,
+                    },
+                    EngineCoreEvent {
+                        r#type: EngineCoreEventType::Scheduled,
+                        timestamp: scheduled_at_unix_s,
+                    },
+                ]);
+                first_token_prefill_stats = Some(PrefillStats {
+                    num_prompt_tokens: prompt_tokens as u32,
+                    num_computed_tokens: prompt_tokens as u32,
+                    num_cached_tokens: 0,
+                    num_local_cached_tokens: 0,
+                    num_external_cached_tokens: 0,
+                });
+            }
             TokenEvent::Token { id, logprob } => {
-                if send_token_output(&output_tx, &request_id, id, logprob).is_err() {
+                if send_token_output(
+                    &output_tx,
+                    &request_id,
+                    id,
+                    logprob,
+                    first_token_events.take(),
+                    first_token_prefill_stats.take(),
+                )
+                .is_err()
+                {
                     return;
                 }
             }
@@ -334,6 +370,8 @@ fn send_token_output(
     request_id: &str,
     token_id: u32,
     logprob: Option<TokenLogprob>,
+    events: Option<Vec<EngineCoreEvent>>,
+    prefill_stats: Option<PrefillStats>,
 ) -> Result<()> {
     send_outputs(
         output_tx,
@@ -345,6 +383,8 @@ fn send_token_output(
                 to_wire_logprobs(token_id, logprob),
                 None,
                 None,
+                events,
+                prefill_stats,
             )],
             timestamp: now_secs_f64(),
             ..Default::default()
@@ -368,6 +408,8 @@ fn send_terminal_output(
                 None,
                 Some(finish_reason),
                 stop_reason,
+                None,
+                None,
             )],
             finished_requests: Some(BTreeSet::from([request_id])),
             timestamp: now_secs_f64(),
@@ -419,6 +461,8 @@ fn engine_output(
     new_logprobs: Option<MaybeWireLogprobs>,
     finish_reason: Option<EngineCoreFinishReason>,
     stop_reason: Option<StopReason>,
+    events: Option<Vec<EngineCoreEvent>>,
+    prefill_stats: Option<PrefillStats>,
 ) -> EngineCoreOutput {
     EngineCoreOutput {
         request_id,
@@ -428,10 +472,10 @@ fn engine_output(
         pooling_output: None,
         finish_reason,
         stop_reason,
-        events: None,
+        events,
         kv_transfer_params: None,
         trace_headers: None,
-        prefill_stats: None,
+        prefill_stats,
         routed_experts: None,
         num_nans_in_logits: 0,
     }

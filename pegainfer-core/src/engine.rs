@@ -7,6 +7,7 @@ use crate::sampler::SamplingParams;
 #[derive(Clone, Debug)]
 pub struct EngineLoadOptions {
     pub enable_cuda_graph: bool,
+    pub enable_prefill_profile: bool,
     pub device_ordinals: Vec<usize>,
     pub seed: u64,
 }
@@ -15,6 +16,7 @@ impl Default for EngineLoadOptions {
     fn default() -> Self {
         Self {
             enable_cuda_graph: true,
+            enable_prefill_profile: false,
             device_ordinals: vec![0],
             seed: 42,
         }
@@ -43,6 +45,8 @@ pub enum FinishReason {
 }
 
 pub struct GenerateRequest {
+    pub request_id: Option<String>,
+    pub queued_at_unix_s: Option<f64>,
     pub prompt_tokens: Vec<u32>,
     pub params: SamplingParams,
     pub max_tokens: usize,
@@ -52,6 +56,11 @@ pub struct GenerateRequest {
 }
 
 pub enum TokenEvent {
+    Scheduled {
+        queued_at_unix_s: f64,
+        scheduled_at_unix_s: f64,
+        prompt_tokens: usize,
+    },
     Token {
         id: u32,
         logprob: Option<TokenLogprob>,

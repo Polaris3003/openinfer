@@ -57,6 +57,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         enable_cuda_graph,
         device_ordinals,
         seed,
+        ..
     } = options;
     let model_path = model_path
         .to_str()

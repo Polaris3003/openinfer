@@ -74,6 +74,7 @@ pub fn start_engine_with_capacity(
         enable_cuda_graph,
         device_ordinals,
         seed,
+        ..
     } = options;
     let device_ordinal = match device_ordinals.as_slice() {
         [] => 0,

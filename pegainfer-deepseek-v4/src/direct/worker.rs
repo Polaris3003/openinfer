@@ -1,8 +1,9 @@
-use std::{path::Path, thread};
+use std::{path::Path, thread, time::Instant};
 
 use anyhow::{Context, Result, ensure};
 use crossbeam_channel as channel;
 use cudarc::driver::{CudaSlice, DevicePtrMut, DeviceRepr, result as cuda_result};
+use log::info;
 
 use crate::{
     Config, DeepSeekRopeCache, F32Logits, LayerDecodeCache, RankGpuContext, RankWeightView,
@@ -35,6 +36,7 @@ pub(super) struct DirectBatchDecodeEntry {
 
 pub(super) struct FullDirectRuntime {
     workers: Vec<RankWorker>,
+    prefill_profile: bool,
 }
 
 enum RankCommand {
@@ -51,6 +53,7 @@ enum RankCommand {
     },
     Prefill {
         prompt_tokens: Vec<u32>,
+        profile: bool,
         resp: channel::Sender<Result<RankResult>>,
     },
     Decode {
@@ -331,6 +334,7 @@ impl RankWorker {
                                 }
                                 RankCommand::Prefill {
                                     prompt_tokens,
+                                    profile,
                                     resp,
                                 } => {
                                     let result = run_prefill_on_rank_lane(
@@ -343,6 +347,7 @@ impl RankWorker {
                                         config,
                                         &prompt_tokens,
                                         &mut caches,
+                                        profile,
                                     )
                                     .map(|logits| (rank, logits));
                                     let _ = resp.send(result);
@@ -515,11 +520,16 @@ impl RankWorker {
             .map_err(|_| anyhow::anyhow!("DeepSeek rank worker dropped ResetCacheSlot response"))?
     }
 
-    fn prefill(&self, prompt_tokens: Vec<u32>) -> Result<channel::Receiver<Result<RankResult>>> {
+    fn prefill(
+        &self,
+        prompt_tokens: Vec<u32>,
+        profile: bool,
+    ) -> Result<channel::Receiver<Result<RankResult>>> {
         let (resp_tx, resp_rx) = channel::bounded(1);
         self.tx
             .send(RankCommand::Prefill {
                 prompt_tokens,
+                profile,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("DeepSeek rank worker channel closed on Prefill"))?;
@@ -553,6 +563,7 @@ fn bind_rank_thread(ctx: &RankGpuContext) -> Result<()> {
 pub(super) fn load_full_direct_runtime(
     model_path: &Path,
     config: &'static Config,
+    prefill_profile: bool,
 ) -> Result<FullDirectRuntime> {
     let mut contexts = Vec::with_capacity(8);
     for rank in 0..8 {
@@ -597,7 +608,10 @@ pub(super) fn load_full_direct_runtime(
     {
         workers.push(RankWorker::spawn(rank, ctx, view, comm, moe_comm, config)?);
     }
-    Ok(FullDirectRuntime { workers })
+    Ok(FullDirectRuntime {
+        workers,
+        prefill_profile,
+    })
 }
 
 fn allocate_rank_decode_caches(
@@ -1320,6 +1334,7 @@ fn run_prefill_on_rank_lane(
     config: &Config,
     prompt_tokens: &[u32],
     caches: &mut [LayerDecodeCache],
+    profile: bool,
 ) -> Result<Option<Vec<f32>>> {
     ensure!(
         !prompt_tokens.is_empty(),
@@ -1340,18 +1355,68 @@ fn run_prefill_on_rank_lane(
 
     ctx.set_current()?;
     let seq_len = prompt_tokens.len();
+    let mut profile_phases = Vec::new();
+
+    let phase_start = Instant::now();
     let token_ids = ctx
         .stream
         .clone_htod(prompt_tokens)
         .with_context(|| format!("copy prompt tokens to rank {rank}"))?;
+    record_prefill_profile_phase(
+        ctx,
+        profile,
+        rank,
+        &mut profile_phases,
+        "token_h2d",
+        None,
+        None,
+        phase_start,
+    )?;
+
+    let phase_start = Instant::now();
     let mut hidden = embedding_rank_local(ctx, config, weights, &token_ids, seq_len)
         .with_context(|| format!("embedding rank {rank}"))?;
+    record_prefill_profile_phase(
+        ctx,
+        profile,
+        rank,
+        &mut profile_phases,
+        "embedding",
+        None,
+        None,
+        phase_start,
+    )?;
+
+    let phase_start = Instant::now();
     all_reduce_hidden_in_place(&mut hidden, comm)
         .with_context(|| format!("embedding all_reduce rank {rank}"))?;
+    record_prefill_profile_phase(
+        ctx,
+        profile,
+        rank,
+        &mut profile_phases,
+        "embedding_all_reduce",
+        None,
+        None,
+        phase_start,
+    )?;
+
+    let phase_start = Instant::now();
     let mut hc = hc_expand_bf16_hidden(ctx, &hidden, config.hc_mult)
         .with_context(|| format!("hc_expand rank {rank}"))?;
+    record_prefill_profile_phase(
+        ctx,
+        profile,
+        rank,
+        &mut profile_phases,
+        "hc_expand",
+        None,
+        None,
+        phase_start,
+    )?;
 
     for layer in 0..config.n_layers {
+        let phase_start = Instant::now();
         hc = block_prefill_rank_lane_bf16_hidden_with_decode_cache(
             ctx,
             weights,
@@ -1366,12 +1431,79 @@ fn run_prefill_on_rank_lane(
             &mut caches[layer],
         )
         .with_context(|| format!("prefill layer {layer} rank {rank}"))?;
+        record_prefill_profile_phase(
+            ctx,
+            profile,
+            rank,
+            &mut profile_phases,
+            "block_prefill",
+            Some(layer),
+            Some(config.compress_ratios[layer]),
+            phase_start,
+        )?;
     }
 
+    let phase_start = Instant::now();
     let local_logits = final_logits_rank_local_bf16_hidden(ctx, config, weights, &hc)
         .with_context(|| format!("prefill final logits rank {rank}"))?;
-    gather_logits_for_sampling(rank, ctx, comm, weights, &local_logits)
-        .with_context(|| format!("prefill final logits all_gather rank {rank}"))
+    record_prefill_profile_phase(
+        ctx,
+        profile,
+        rank,
+        &mut profile_phases,
+        "final_logits",
+        None,
+        None,
+        phase_start,
+    )?;
+
+    let phase_start = Instant::now();
+    let logits = gather_logits_for_sampling(rank, ctx, comm, weights, &local_logits)
+        .with_context(|| format!("prefill final logits all_gather rank {rank}"))?;
+    record_prefill_profile_phase(
+        ctx,
+        profile,
+        rank,
+        &mut profile_phases,
+        "final_logits_all_gather",
+        None,
+        None,
+        phase_start,
+    )?;
+    if profile && rank == 0 {
+        info!(
+            "pegainfer_prefill_profile {}",
+            serde_json::json!({
+                "rank": rank,
+                "prompt_tokens": seq_len,
+                "phases": profile_phases,
+            })
+        );
+    }
+    Ok(logits)
+}
+
+fn record_prefill_profile_phase(
+    ctx: &RankGpuContext,
+    profile: bool,
+    rank: usize,
+    phases: &mut Vec<serde_json::Value>,
+    name: &str,
+    layer: Option<usize>,
+    compress_ratio: Option<usize>,
+    started_at: Instant,
+) -> Result<()> {
+    if !profile || rank != 0 {
+        return Ok(());
+    }
+    ctx.sync()?;
+    phases.push(serde_json::json!({
+        "name": name,
+        "layer": layer,
+        "compress_ratio": compress_ratio,
+        "ms": started_at.elapsed().as_secs_f64() * 1000.0,
+    }));
+    Ok(())
 }
 
 fn final_batch_logits_rank_local_bf16_hidden(
@@ -1590,7 +1722,7 @@ pub(super) fn run_prefill_logits_and_seed_decode_cache(
         .enumerate()
         .map(|(rank, worker)| {
             worker
-                .prefill(prompt_tokens.to_vec())
+                .prefill(prompt_tokens.to_vec(), runtime.prefill_profile)
                 .with_context(|| format!("dispatch prefill rank {rank}"))
         })
         .collect::<Result<Vec<_>>>()?;
