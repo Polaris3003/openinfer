@@ -200,6 +200,8 @@ __global__ void deepseek_indexer_topk_prefill_kernel(
 
   extern __shared__ float scratch[];
   float *select_scores = scratch;
+  float *thread_scores = select_scores + compressed_len;
+  int *thread_indices = reinterpret_cast<int *>(thread_scores + blockDim.x);
   int valid = (token + 1) / ratio;
   for (int idx = threadIdx.x; idx < compressed_len; idx += blockDim.x) {
     select_scores[idx] =
@@ -207,23 +209,46 @@ __global__ void deepseek_indexer_topk_prefill_kernel(
   }
   __syncthreads();
 
-  if (threadIdx.x == 0) {
-    for (int route = 0; route < topk; ++route) {
-      int best_idx = -1;
-      float best_score = -3.4028234663852886e38f;
-      for (int candidate = 0; candidate < compressed_len; ++candidate) {
-        float score = select_scores[candidate];
-        if (score > best_score) {
-          best_score = score;
-          best_idx = candidate;
+  for (int route = 0; route < topk; ++route) {
+    int best_idx = -1;
+    float best_score = -3.4028234663852886e38f;
+    for (int candidate = threadIdx.x; candidate < compressed_len; candidate += blockDim.x) {
+      float score = select_scores[candidate];
+      if (score > best_score) {
+        best_score = score;
+        best_idx = candidate;
+      }
+    }
+    thread_scores[threadIdx.x] = best_score;
+    thread_indices[threadIdx.x] = best_idx;
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (threadIdx.x < stride) {
+        float other_score = thread_scores[threadIdx.x + stride];
+        int other_idx = thread_indices[threadIdx.x + stride];
+        float current_score = thread_scores[threadIdx.x];
+        int current_idx = thread_indices[threadIdx.x];
+        if (other_score > current_score ||
+            (other_score == current_score && other_idx >= 0 &&
+             (current_idx < 0 || other_idx < current_idx))) {
+          thread_scores[threadIdx.x] = other_score;
+          thread_indices[threadIdx.x] = other_idx;
         }
       }
+      __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+      int best_idx = thread_indices[0];
+      float best_score = thread_scores[0];
       topk_idxs[token * topk + route] =
           best_idx >= 0 && best_score > -3.0e38f ? best_idx + offset : -1;
       if (best_idx >= 0) {
         select_scores[best_idx] = -3.4028234663852886e38f;
       }
     }
+    __syncthreads();
   }
 }
 
@@ -625,7 +650,7 @@ cudaError_t deepseek_indexer_topk_prefill_cuda(
     int offset,
     cudaStream_t stream) {
   constexpr int threads = 256;
-  size_t shared_bytes = compressed_len * sizeof(float);
+  size_t shared_bytes = (compressed_len + threads) * sizeof(float) + threads * sizeof(int);
   deepseek_indexer_topk_prefill_kernel<<<seq_len, threads, shared_bytes, stream>>>(
       scores, topk_idxs, seq_len, compressed_len, topk, ratio, offset);
   return cudaGetLastError();

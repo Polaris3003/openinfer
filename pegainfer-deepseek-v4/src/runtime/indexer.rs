@@ -126,14 +126,12 @@ pub fn indexer_scores_prefill_bf16_hidden(
         let (scores_ptr, _scores_guard) = scores.device_ptr_mut(&ctx.stream);
         let score_scale =
             1.0f32 / (config.index_head_dim as f32).sqrt() / (config.index_n_heads as f32).sqrt();
-        #[cfg(feature = "deepseek-v4-cutedsl-indexer-score")]
         ensure!(
             local_heads == 8 && config.index_head_dim == 128,
             "CuTeDSL indexer score runtime expects local_heads=8 and head_dim=128, got local_heads={} head_dim={}",
             local_heads,
             config.index_head_dim
         );
-        #[cfg(feature = "deepseek-v4-cutedsl-indexer-score")]
         let result = unsafe {
             ffi::deepseek_cutedsl_indexer_scores_exact_bf16_cuda(
                 q_ptr as *const ffi::Half,
@@ -141,21 +139,6 @@ pub fn indexer_scores_prefill_bf16_hidden(
                 weights_ptr as *const ffi::Half,
                 scores_ptr as *mut f32,
                 input.seq_len as i32,
-                compressed_len as i32,
-                score_scale,
-                ctx.stream.cu_stream(),
-            )
-        };
-        #[cfg(not(feature = "deepseek-v4-cutedsl-indexer-score"))]
-        let result = unsafe {
-            ffi::deepseek_indexer_scores_prefill_cuda(
-                q_ptr as *const ffi::Half,
-                kv_ptr as *const ffi::Half,
-                weights_ptr as *const ffi::Half,
-                scores_ptr as *mut f32,
-                input.seq_len as i32,
-                local_heads as i32,
-                config.index_head_dim as i32,
                 compressed_len as i32,
                 score_scale,
                 ctx.stream.cu_stream(),

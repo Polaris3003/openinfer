@@ -242,8 +242,8 @@ number. The serving-number evidence remains the non-profile HTTP sweep above.
 ### P3 CuTeDSL Indexer-Score Runtime Observation
 
 After the CuTeDSL exact indexer-score path passed diagnostic equivalence, the
-next observation compares the default serial score path against the explicit
-experimental runtime feature:
+next observation compared the default serial score path against the temporary
+CuTeDSL score runtime feature:
 
 - default serial: `--features deepseek-v4`;
 - experimental: `--features deepseek-v4-cutedsl-indexer-score`.
@@ -307,12 +307,15 @@ feature, the dominant captured prefill families are overlap compressor and
 indexer top-k, while indexed attention is comparatively small in this 10k
 profile.
 
+Task #28 later folds the exact CuTeDSL score path into the default
+`deepseek-v4` feature and removes the public experimental feature after the
+default-path hash/profile gates stay clean.
+
 ### P4 Indexer Top-K Attribution And Equivalence Gate
 
 The next indexer-side gate focuses only on the prefill top-k step under the
-explicit `deepseek-v4-cutedsl-indexer-score` runtime feature. It does not touch
-the default `deepseek-v4` feature, overlap compressor, cache reuse, scheduler,
-or HTTP behavior.
+CuTeDSL score runtime. It does not touch overlap compressor, cache reuse,
+scheduler, or HTTP behavior.
 
 The current code path is:
 
@@ -352,7 +355,7 @@ The equivalence gate is a GPU test against the current selector semantics:
 
 ```bash
 cargo test --release -p pegainfer-kernels \
-  --features deepseek-v4-cutedsl-indexer-score \
+  --features deepseek-v4 \
   --test deepseek_indexer_topk -- --ignored --nocapture
 ```
 
@@ -369,13 +372,60 @@ case uses monotonic scores so the expected top-k sequence is fully derivable
 while still exercising the real 10k launch shape, valid-position mask, top-k
 width, and offset behavior.
 
-Hash evidence remains the P3 gate because this PR does not change production
-runtime code: direct 10k generated-token hash `39a863e299d2b187`, 10k HTTP
-output hash `eea187c414579fd7`, and c1/c2/c4/c8 repeated HTTP hash
-`22706877075acde0` under the explicit feature.
+Hash evidence remains the P3 gate because this PR does not change runtime code:
+direct 10k generated-token hash `39a863e299d2b187`, 10k HTTP output hash
+`eea187c414579fd7`, and c1/c2/c4/c8 repeated HTTP hash `22706877075acde0`.
 
 This gate decides where a future top-k kernel rewrite or launch adjustment
 starts. It is not itself a serving throughput claim.
+
+### P5 Indexer Top-K Rewrite And Feature Convergence
+
+The next implementation keeps the exact CuTeDSL indexer score path as the
+default `deepseek-v4` prefill score path instead of keeping a long-lived
+experimental feature. The diagnostic feature remains test-only, and the public
+`deepseek-v4-cutedsl-indexer-score` feature is removed.
+
+The top-k change is scoped to `deepseek_indexer_topk_prefill_cuda`: each token
+still launches one block, but candidate scoring is now split across block
+threads and reduced per selected route. The selector preserves the existing
+strict `>` semantics by keeping the lower candidate index when scores tie.
+Score, overlap compressor, cache reuse, scheduler, HTTP behavior, and decode
+top-k are unchanged.
+
+The ignored GPU gate now covers three cases:
+
+- odd compressed length: `seq_len=257`, `compressed_len=129`, `topk=32`,
+  `ratio=4`, `offset=777`;
+- 10k profile shape: `seq_len=10580`, `compressed_len=2645`, `topk=32`,
+  `ratio=4`, `offset=10580`;
+- tie-heavy rows: `seq_len=17`, `compressed_len=33`, `topk=12`, `ratio=4`,
+  `offset=4096`, with equal score groups verifying that candidate order is
+  preserved.
+
+Validation at this PR head:
+
+| Gate | Result |
+| --- | --- |
+| default `deepseek-v4` server/bench build | passed; CuTeDSL score artifacts generated in the default feature |
+| top-k ignored GPU gate | 3 passed / 0 failed |
+| direct decode hash | `6346f03343d75a65` across 3 measured iterations |
+| 10k direct generated-token hash | `39a863e299d2b187` |
+| HTTP c1/c2/c4/c8 repeated hash | failed `0`, timeout `0`, per-request hashes stable; combined hash `22706877075acde0` |
+
+The 10k `nsys` observation after the rewrite:
+
+| Kernel family | P3 CuTeDSL score total ms / calls | P5 default total ms / calls | Observation |
+| --- | ---: | ---: | --- |
+| overlap compressor | `20789.04 / 504` | `20785.88 / 504` | unchanged |
+| indexer score | `1815.79 / 168` | `1815.95 / 168` | unchanged; now default path |
+| indexer top-k | `12975.70 / 168` | `1196.05 / 168` | top-k bucket drops after the threaded selector rewrite |
+| indexed attention | `731.38 / 344` | `731.40 / 344` | unchanged |
+| NCCL all-reduce | `7590.09 / 864` | `7379.37 / 856` | same order; capture differs in launch count |
+
+Direct `bench_serving` under `nsys` for the 10k prompt reports TTFT
+`6542.36ms` and generated-token hash `39a863e299d2b187`. These are attribution
+observations for this workload, not production throughput claims.
 
 ## Boundary
 

@@ -51,10 +51,6 @@ deepseek-v4-cutedsl-diagnostic = [
     "deepseek-v4",
     "pegainfer-deepseek-v4/deepseek-v4-cutedsl-diagnostic",
 ]
-deepseek-v4-cutedsl-indexer-score = [
-    "deepseek-v4",
-    "pegainfer-deepseek-v4/deepseek-v4-cutedsl-indexer-score",
-]
 
 [dev-dependencies]
 criterion = { workspace = true }

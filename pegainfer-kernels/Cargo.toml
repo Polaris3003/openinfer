@@ -15,7 +15,6 @@ cc = { workspace = true }
 default = []
 deepseek-v4 = []
 deepseek-v4-cutedsl-diagnostic = ["deepseek-v4"]
-deepseek-v4-cutedsl-indexer-score = ["deepseek-v4"]
 
 [lints]
 workspace = true

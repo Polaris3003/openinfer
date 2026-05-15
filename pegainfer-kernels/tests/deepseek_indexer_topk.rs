@@ -223,3 +223,40 @@ fn indexer_topk_prefill_matches_reference_10k_profile_shape() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+#[ignore = "requires CUDA GPU; locks strict greater-than tie ordering"]
+fn indexer_topk_prefill_matches_reference_tie_heavy_rows() -> Result<()> {
+    let seq_len = 17;
+    let compressed_len = 33;
+    let topk = 12;
+    let ratio = 4;
+    let offset = 4096;
+    let mut scores = vec![0.0f32; seq_len * compressed_len];
+    for token in 0..seq_len {
+        for compressed in 0..compressed_len {
+            scores[token * compressed_len + compressed] = match compressed % 5 {
+                0 | 1 => 10.0,
+                2 => 7.0,
+                3 => 3.0,
+                _ => 1.0,
+            };
+        }
+    }
+
+    let got = run_topk_prefill(&scores, seq_len, compressed_len, topk, ratio, offset)?;
+    let expected = reference_topk(&scores, seq_len, compressed_len, topk, ratio, offset);
+    assert_eq!(got, expected);
+    let token = 16;
+    assert_eq!(
+        &got[token * topk..token * topk + 4],
+        &[
+            offset as i32,
+            offset as i32 + 1,
+            offset as i32 + 2,
+            offset as i32 + 3
+        ],
+        "strict `>` tie behavior must keep ascending candidate order"
+    );
+    Ok(())
+}

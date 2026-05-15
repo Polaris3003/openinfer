@@ -483,10 +483,7 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    #[cfg(any(
-        feature = "deepseek-v4-cutedsl-diagnostic",
-        feature = "deepseek-v4-cutedsl-indexer-score"
-    ))]
+    #[cfg(feature = "deepseek-v4")]
     pub fn deepseek_cutedsl_indexer_scores_exact_bf16_cuda(
         q: *const Half,
         kv: *const Half,
