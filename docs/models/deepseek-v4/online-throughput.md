@@ -4,7 +4,7 @@ Last touched: 2026-05-18
 
 TL;DR: latest main has a clean default `deepseek-v4` quality gate on the 8x5090
 validation run, but online throughput is still service-time limited. HTTP c1-c8
-fixed-shape load stays around 11.4 req/s with stable hashes because the path is
+fixed-shape load stays around 1.3 req/s with stable hashes because the path is
 still a single-request scheduler turn; mixed online load reports separate input
 and output token rates. Decode has partial bs>1 primitives, prefill does not have
 a native multi-request stack, and DSV4 does not use CUDA Graph yet.
@@ -13,8 +13,8 @@ a native multi-request stack, and DSV4 does not use CUDA Graph yet.
 
 | Field | Value |
 | --- | --- |
-| Task | task #43 |
-| Code | latest main `e4896043` plus benchmark-script reporting changes |
+| Task | task #43, updated by task #47/#48 for HTTP error detection and short-prompt prefill |
+| Code | latest main `019de7f` plus task #48 overlap-compressor short-prompt fix |
 | Model | `DeepSeek-V4-Flash` |
 | Feature path | default `deepseek-v4`; no EP/PPLX |
 | Hardware class | internal 8x RTX 5090 validation host |
@@ -36,6 +36,11 @@ trace lines are unavailable, prompt tokens fall back to `prompt_words`, and
 `ignore_eos=true` output tokens fall back to requested `max_tokens` instead of
 stream chunk count.
 
+Task #47 also makes the harness fail a request when the SSE stream reports
+`error` / `finish_reason=error`, the server log reports a matched stream error,
+or a traced request has `completion_tokens=0` while output tokens were requested.
+The older task #43 HTTP table undercounted these server-side generation errors.
+
 ## Direct Baseline
 
 | Workload | TTFT / E2E | TPOT | Hash | Notes |
@@ -51,10 +56,10 @@ Workload: streaming `/v1/completions`, warmup `2`, requests `8`, prompt words
 
 | Concurrency | Correctness | QPS avg | TTFT avg | TPOT avg | Combined hash |
 | ---: | --- | ---: | ---: | ---: | --- |
-| 1 | failed `0`, timeout `0`, per-request hashes stable | `11.28` | `34.4ms` | `28.86ms` | `4ba75d576badca64` |
-| 2 | failed `0`, timeout `0`, per-request hashes stable | `11.45` | `47.1ms` | `28.22ms` | `4ba75d576badca64` |
-| 4 | failed `0`, timeout `0`, per-request hashes stable | `11.46` | `66.7ms` | `28.21ms` | `4ba75d576badca64` |
-| 8 | failed `0`, timeout `0`, per-request hashes stable | `11.45` | `108.1ms` | `28.22ms` | `4ba75d576badca64` |
+| 1 | failed `0`, timeout `0`, per-request hashes stable | `1.33` | `275.67ms` | `31.81ms` | `4c7d24746f19ff5b` |
+| 2 | failed `0`, timeout `0`, per-request hashes stable | `1.32` | `954.91ms` | `31.94ms` | `4c7d24746f19ff5b` |
+| 4 | failed `0`, timeout `0`, per-request hashes stable | `1.34` | `2049.55ms` | `31.33ms` | `4c7d24746f19ff5b` |
+| 8 | failed `0`, timeout `0`, per-request hashes stable | `1.34` | `3337.98ms` | `31.70ms` | `4c7d24746f19ff5b` |
 
 Interpretation: QPS and TPOT barely move from c2 to c8 because the current HTTP
 scheduler admits one request turn at a time. Concurrency mostly changes queue

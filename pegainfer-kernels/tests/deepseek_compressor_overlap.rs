@@ -259,7 +259,6 @@ fn assert_close(name: &str, got: &[f32], expected: &[f32], max_abs_limit: f32) -
 // reference uses; the 3x bf16-noise FlashAttention-style envelope is well
 // inside what the downstream RMSNorm BF16 store quantises away anyway.
 fn check_case(name: &str, seq_len: usize, hidden_dim: usize, head_dim: usize) -> Result<()> {
-    ensure!(seq_len % 4 == 0, "seq_len must be ratio4 aligned");
     let eps = 1.0e-6;
     let case = make_case(seq_len, hidden_dim, head_dim);
     let (expected_weighted, expected_out) = reference_overlap(&case, eps);
@@ -286,6 +285,7 @@ fn overlap_prefill_matches_reference_small_main_and_indexer_shapes() -> Result<(
 #[test]
 #[ignore = "requires CUDA GPU; covers odd/boundary compressed and head shapes"]
 fn overlap_prefill_matches_reference_odd_boundary_shape() -> Result<()> {
+    check_case("short-http", 21, 64, 32)?;
     check_case("odd-boundary", 68, 40, 33)
 }
 

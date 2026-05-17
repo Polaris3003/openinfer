@@ -821,7 +821,7 @@ cudaError_t deepseek_compressor_overlap_prefill_cuda(
       norm == nullptr || weighted == nullptr || out == nullptr) {
     return cudaErrorInvalidValue;
   }
-  if (seq_len < 4 || (seq_len & 3) != 0 || hidden_dim <= 0 || head_dim <= 0) {
+  if (seq_len < 4 || hidden_dim <= 0 || head_dim <= 0) {
     return cudaErrorInvalidValue;
   }
   const int compressed_len = seq_len / 4;
