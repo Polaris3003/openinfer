@@ -102,11 +102,23 @@ def summarize_trace_ms(measured: list[RequestResult]) -> dict[str, Any]:
         ]
         phase_summary[field] = summarize(values)
     traced = [result for result in measured if result.server_trace is not None]
+    active_set_sizes = [
+        int(result.server_trace["active_set_size"])
+        for result in traced
+        if isinstance(result.server_trace.get("active_set_size"), int)
+    ]
+    decode_batch_sizes = [
+        int(result.server_trace["decode_batch_size_max"])
+        for result in traced
+        if isinstance(result.server_trace.get("decode_batch_size_max"), int)
+    ]
     return {
         "source": "server log lines matching `pegainfer_http_trace`; frontend_to_queue includes HTTP ingress, tokenization, and vLLM submit before engine queue",
         "traced_requests": len(traced),
         "missing_traces": [result.request_id for result in measured if result.server_trace is None],
         "phases_ms": phase_summary,
+        "active_set_size_max": max(active_set_sizes) if active_set_sizes else None,
+        "decode_batch_size_max": max(decode_batch_sizes) if decode_batch_sizes else None,
     }
 
 

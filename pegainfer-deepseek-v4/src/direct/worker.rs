@@ -25,7 +25,7 @@ use crate::{
 
 type RankResult = (usize, Option<Vec<f32>>);
 type RankBatchResult = (usize, Option<Vec<Vec<f32>>>);
-const DIRECT_BATCH_DECODE_CAPACITY: usize = 2;
+pub(super) const DIRECT_BATCH_DECODE_CAPACITY: usize = 2;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct DirectBatchDecodeEntry {

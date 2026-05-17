@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::mpsc as std_mpsc,
     thread,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -12,17 +12,19 @@ use log::{info, warn};
 use pegainfer_core::engine::{
     EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent,
 };
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TryRecvError};
 
 #[cfg(test)]
 use super::worker::reset_direct_decode_cache_slot_for_test;
 use super::worker::{
-    DirectBatchDecodeEntry, FullDirectRuntime, clone_direct_decode_cache_slot,
-    ensure_direct_decode_batch_caches, ensure_direct_decode_caches, load_full_direct_runtime,
-    run_direct_decode_batch_logits, run_direct_decode_logits,
+    DIRECT_BATCH_DECODE_CAPACITY, DirectBatchDecodeEntry, FullDirectRuntime,
+    clone_direct_decode_cache_slot, ensure_direct_decode_batch_caches, ensure_direct_decode_caches,
+    load_full_direct_runtime, run_direct_decode_batch_logits, run_direct_decode_logits,
     run_prefill_logits_and_seed_decode_cache,
 };
 use crate::Config;
+
+const DIRECT_HTTP_BATCH_ADMISSION_WAIT: Duration = Duration::from_millis(2);
 
 pub struct DirectGeneration {
     pub generated: Vec<u32>,
@@ -1119,11 +1121,7 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
             let _ = init_tx.send(Ok(()));
             info!("DeepSeek V4 scheduler ready");
             while let Some(req) = submit_rx.blocking_recv() {
-                let mut wave = vec![req];
-                // HTTP serving keeps admission fail-closed to one request per
-                // scheduler turn until multi-step batch decode is deterministic
-                // across request pairings. The runtime batch primitive remains
-                // available behind direct tests and future wiring.
+                let mut wave = collect_request_wave(&mut submit_rx, req);
                 if wave.len() == 1 {
                     handle_request(
                         &mut generator,
@@ -1141,6 +1139,27 @@ pub fn start_engine(model_path: &Path, options: EngineLoadOptions) -> Result<Eng
         .recv()
         .map_err(|err| anyhow::anyhow!("DeepSeek V4 engine init channel closed: {err}"))??;
     Ok(EngineHandle::new(submit_tx))
+}
+
+fn collect_request_wave(
+    submit_rx: &mut mpsc::UnboundedReceiver<GenerateRequest>,
+    first: GenerateRequest,
+) -> Vec<GenerateRequest> {
+    let mut wave = vec![first];
+    let deadline = Instant::now() + DIRECT_HTTP_BATCH_ADMISSION_WAIT;
+    while wave.len() < DIRECT_BATCH_DECODE_CAPACITY {
+        match submit_rx.try_recv() {
+            Ok(req) => wave.push(req),
+            Err(TryRecvError::Empty) => {
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_micros(100));
+            }
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    wave
 }
 
 fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateRequest) {
@@ -1283,6 +1302,9 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
             "first_decode_ms": first_decode_ms,
             "prompt_tokens": prompt_len,
             "completion_tokens": state.generated().len(),
+            "active_set_size": 1,
+            "decode_batch_size_max": 1,
+            "batch_decode_steps": 0,
         })
     );
     let _ = req.token_tx.send(TokenEvent::Finished {
@@ -1296,12 +1318,25 @@ fn handle_request(generator: &mut DeepSeekV4DirectGenerator, req: GenerateReques
 
 struct PendingDirectRequest {
     req: GenerateRequest,
+    request_id: String,
+    queued_at_unix_s: f64,
+    scheduled_at_unix_s: f64,
     prompt_len: usize,
     slot_id: usize,
 }
 
 struct ActiveDirectRequest {
     req: GenerateRequest,
+    request_id: String,
+    queued_at_unix_s: f64,
+    scheduled_at_unix_s: f64,
+    prefill_done_unix_s: f64,
+    prefill_ms: f64,
+    first_token_emit_unix_s: Option<f64>,
+    first_decode_ms: Option<f64>,
+    initial_active_set_size: usize,
+    max_decode_batch_size: usize,
+    batch_decode_steps: usize,
     prompt_len: usize,
     state: DeepSeekV4RequestState,
 }
@@ -1310,6 +1345,13 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
     let mut pending = Vec::new();
     for req in requests {
         let prompt_len = req.prompt_tokens.len();
+        let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_secs_f64);
+        let scheduled_at_unix_s = unix_secs_f64();
+        let _ = req.token_tx.send(TokenEvent::Scheduled {
+            queued_at_unix_s,
+            scheduled_at_unix_s,
+            prompt_tokens: prompt_len,
+        });
         if req.echo {
             let _ = req.token_tx.send(TokenEvent::PromptTokens {
                 ids: req.prompt_tokens.clone(),
@@ -1344,8 +1386,15 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
             continue;
         }
         let slot_id = pending.len();
+        let request_id = req
+            .request_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         pending.push(PendingDirectRequest {
             req,
+            request_id,
+            queued_at_unix_s,
+            scheduled_at_unix_s,
             prompt_len,
             slot_id,
         });
@@ -1358,7 +1407,8 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
         .iter()
         .map(|pending| pending.prompt_len + pending.req.max_tokens)
         .max()
-        .expect("pending direct request set must not be empty");
+        .expect("pending direct request set must not be empty")
+        .max(generator.config.sliding_window);
     if let Err(err) = generator.prepare_active_set_slots(max_seq_len, pending.len()) {
         for pending in pending {
             send_request_error(
@@ -1373,17 +1423,32 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
 
     let mut active = Vec::with_capacity(pending.len());
     for pending in pending.into_iter().rev() {
+        let prefill_start = Instant::now();
         match generator.start_greedy_request_in_slot(
             &pending.req.prompt_tokens,
             pending.req.max_tokens,
             pending.req.params.ignore_eos,
             pending.slot_id,
         ) {
-            Ok(state) => active.push(ActiveDirectRequest {
-                req: pending.req,
-                prompt_len: pending.prompt_len,
-                state,
-            }),
+            Ok(state) => {
+                let prefill_done_unix_s = unix_secs_f64();
+                let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+                active.push(ActiveDirectRequest {
+                    req: pending.req,
+                    request_id: pending.request_id,
+                    queued_at_unix_s: pending.queued_at_unix_s,
+                    scheduled_at_unix_s: pending.scheduled_at_unix_s,
+                    prefill_done_unix_s,
+                    prefill_ms,
+                    first_token_emit_unix_s: None,
+                    first_decode_ms: None,
+                    initial_active_set_size: 0,
+                    max_decode_batch_size: 0,
+                    batch_decode_steps: 0,
+                    prompt_len: pending.prompt_len,
+                    state,
+                });
+            }
             Err(err) => {
                 send_request_error(
                     &pending.req,
@@ -1410,6 +1475,10 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
             }
         }
     }
+    let initial_active_set_size = active.len();
+    for active_req in &mut active {
+        active_req.initial_active_set_size = initial_active_set_size;
+    }
 
     while !active.is_empty() {
         let mut steps = Vec::with_capacity(active.len());
@@ -1417,8 +1486,11 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
         for (idx, active_req) in active.iter_mut().enumerate() {
             match generator.sample_greedy_step(&active_req.state) {
                 Ok(step) => {
-                    if let Some(token) = step.token()
-                        && active_req
+                    if let Some(token) = step.token() {
+                        if active_req.first_token_emit_unix_s.is_none() {
+                            active_req.first_token_emit_unix_s = Some(unix_secs_f64());
+                        }
+                        if active_req
                             .req
                             .token_tx
                             .send(TokenEvent::Token {
@@ -1426,17 +1498,18 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
                                 logprob: None,
                             })
                             .is_err()
-                    {
-                        if let Err(release_err) =
-                            generator.release_greedy_request(&mut active_req.state)
                         {
-                            warn!(
-                                "failed to release DeepSeek V4 KV cache after receiver drop: {release_err:#}"
-                            );
+                            if let Err(release_err) =
+                                generator.release_greedy_request(&mut active_req.state)
+                            {
+                                warn!(
+                                    "failed to release DeepSeek V4 KV cache after receiver drop: {release_err:#}"
+                                );
+                            }
+                            dropped.push(idx);
+                            steps.push(None);
+                            continue;
                         }
-                        dropped.push(idx);
-                        steps.push(None);
-                        continue;
                     }
                     steps.push(Some(step));
                 }
@@ -1467,12 +1540,21 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
             break;
         }
 
+        let decode_batch_size = steps
+            .iter()
+            .filter(|step| {
+                step.as_ref()
+                    .is_some_and(|step| step.token().is_some() && step.finish_reason().is_none())
+            })
+            .count();
         let mut pairs = active
             .iter_mut()
             .zip(steps.into_iter())
             .filter_map(|(active_req, step)| step.map(|step| (&mut active_req.state, step)))
             .collect::<Vec<_>>();
+        let decode_start = Instant::now();
         let batch_result = generator.decode_greedy_batch_step_from_steps(&mut pairs);
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
         drop(pairs);
         if let Err(err) = batch_result {
             for active_req in &mut active {
@@ -1491,10 +1573,19 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
             active.clear();
             break;
         }
+        if decode_batch_size > 0 {
+            for active_req in &mut active {
+                active_req.max_decode_batch_size =
+                    active_req.max_decode_batch_size.max(decode_batch_size);
+                active_req.batch_decode_steps += 1;
+                active_req.first_decode_ms.get_or_insert(decode_ms);
+            }
+        }
 
         let mut finished = Vec::new();
         for (idx, active_req) in active.iter().enumerate() {
             if let Some(finish_reason) = active_req.state.finish_reason() {
+                log_http_trace_for_active_request(active_req);
                 let _ = active_req.req.token_tx.send(TokenEvent::Finished {
                     finish_reason,
                     prompt_tokens: active_req.prompt_len,
@@ -1507,6 +1598,26 @@ fn handle_request_wave(generator: &mut DeepSeekV4DirectGenerator, requests: Vec<
             active.swap_remove(idx);
         }
     }
+}
+
+fn log_http_trace_for_active_request(active_req: &ActiveDirectRequest) {
+    info!(
+        "pegainfer_http_trace {}",
+        serde_json::json!({
+            "request_id": active_req.request_id,
+            "queued_at_unix_s": active_req.queued_at_unix_s,
+            "scheduled_at_unix_s": active_req.scheduled_at_unix_s,
+            "prefill_done_unix_s": active_req.prefill_done_unix_s,
+            "first_token_emit_unix_s": active_req.first_token_emit_unix_s,
+            "prefill_ms": active_req.prefill_ms,
+            "first_decode_ms": active_req.first_decode_ms,
+            "prompt_tokens": active_req.prompt_len,
+            "completion_tokens": active_req.state.generated().len(),
+            "active_set_size": active_req.initial_active_set_size,
+            "decode_batch_size_max": active_req.max_decode_batch_size,
+            "batch_decode_steps": active_req.batch_decode_steps,
+        })
+    );
 }
 
 fn ensure_step_matches_state(

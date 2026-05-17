@@ -65,6 +65,29 @@ Interpretation: QPS and TPOT barely move from c2 to c8 because the current HTTP
 scheduler admits one request turn at a time. Concurrency mostly changes queue
 shape and TTFT tail, not true active-set throughput.
 
+## HTTP Active-Set Gate
+
+Task #45 restores the existing `DIRECT_BATCH_DECODE_CAPACITY=2` active-set path
+after the task #47/#48 baseline fixes. This gate is a serving-path comparison,
+not a CUDA Graph enablement.
+
+Workload: streaming `/v1/completions`, warmup `0`, requests `8`, prompt words
+`16`, max tokens `16`, `ignore_eos=true`.
+
+| Concurrency | Correctness | Active-set trace | QPS | TTFT avg | TPOT avg | Combined hash |
+| ---: | --- | --- | ---: | ---: | ---: | --- |
+| 1 | failed `0`, timeout `0` | active set `1`, decode batch `1` | `1.35` | `278.05ms` | `31.00ms` | `4c7d24746f19ff5b` |
+| 2 | failed `0`, timeout `0` | active set `2`, decode batch `2` | `1.97` | `460.56ms` | `36.80ms` | `3c7a6939ee07b4e5` |
+| 4 | failed `0`, timeout `0` | active set `2`, decode batch `2` | `1.99` | `1208.86ms` | `36.67ms` | `3c7a6939ee07b4e5` |
+| 8 | failed `0`, timeout `0` | active set `2`, decode batch `2` | `1.98` | `1972.79ms` | `36.67ms` | `5100f393ca65314e` |
+
+Interpretation: active-set serving reaches the batch decode path and improves
+fixed-shape output throughput by roughly half versus the single-turn baseline,
+but TPOT worsens because current batch decode work is not yet as efficient as
+the single-row path. c2/c4/c8 output hashes differ from the single-turn baseline;
+this needs second-review quality acceptance before treating the active-set path
+as the default serving behavior.
+
 ## HTTP Mixed Online Workload
 
 Workload: streaming `/v1/completions`, warmup `2`, requests `12`, concurrency
