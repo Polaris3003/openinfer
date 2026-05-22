@@ -106,6 +106,13 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
     match result.stats.ep_backend.as_str() {
         "host-staged" => {
             ensure!(
+                result.stats.host_dispatch_calls > 0
+                    && result.stats.host_combine_calls == result.stats.host_dispatch_calls
+                    && result.stats.host_dispatch_elements > 0
+                    && result.stats.host_combine_elements == result.stats.host_dispatch_elements,
+                "host-staged EP gate did not record dispatch/combine counts"
+            );
+            ensure!(
                 result.stats.host_dispatch_remote_routes > 0,
                 "host-staged EP gate did not exercise any remote routed expert"
             );
@@ -189,6 +196,10 @@ fn run_rust_generation(model_path_label: &str, model_path: &Path) -> Result<()> 
         "output_text_sha256": output_text_sha256,
         "token_sha256_algorithm": "sha256 over generated token ids encoded as little-endian u32",
         "text_sha256_algorithm": "sha256 over UTF-8 generated text bytes",
+        "host_dispatch_calls": result.stats.host_dispatch_calls,
+        "host_dispatch_elements": result.stats.host_dispatch_elements,
+        "host_combine_calls": result.stats.host_combine_calls,
+        "host_combine_elements": result.stats.host_combine_elements,
         "host_dispatch_local_routes": result.stats.host_dispatch_local_routes,
         "host_dispatch_remote_routes": result.stats.host_dispatch_remote_routes,
         "nccl_dispatch_local_routes": result.stats.nccl_dispatch_local_routes,

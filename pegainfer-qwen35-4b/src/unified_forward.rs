@@ -110,14 +110,26 @@ impl Qwen35Model {
 mod tests {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
+    use std::path::Path;
 
     use super::*;
     use pegainfer_core::kv_pool::KvState;
 
     const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3.5-4B");
 
-    fn get_model_path() -> String {
-        std::env::var("PEGAINFER_TEST_MODEL_PATH").unwrap_or_else(|_| MODEL_PATH.to_string())
+    fn get_model_path_or_skip() -> Option<String> {
+        match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
+            Ok(path) => Some(path),
+            Err(_) if Path::new(MODEL_PATH).join("config.json").exists() => {
+                Some(MODEL_PATH.to_string())
+            }
+            Err(_) => {
+                eprintln!(
+                    "skipping Qwen3.5 unified forward model test because {MODEL_PATH}/config.json is missing; set PEGAINFER_TEST_MODEL_PATH to run it"
+                );
+                None
+            }
+        }
     }
 
     /// Sample a token from a DeviceVec logits using greedy (argmax).
@@ -154,7 +166,9 @@ mod tests {
     /// Verify that unified_step decode output matches batch_decode_graph standalone.
     #[test]
     fn unified_step_decode_matches_graph_decode() {
-        let model_path = get_model_path();
+        let Some(model_path) = get_model_path_or_skip() else {
+            return;
+        };
         let model = Qwen35Model::from_safetensors_with_options(&model_path, true).unwrap();
 
         let prompt_a: Vec<u32> = vec![9707];

@@ -33,3 +33,8 @@ workspace = true
 name = "e2e_ep2"
 path = "tests/e2e_ep2.rs"
 required-features = ["deepseek-v2-lite"]
+
+[[bin]]
+name = "dsv2_lite_ep2_decode_attribution"
+path = "src/bin/dsv2_lite_ep2_decode_attribution.rs"
+required-features = ["deepseek-v2-lite"]

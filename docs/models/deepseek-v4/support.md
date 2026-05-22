@@ -224,7 +224,7 @@ DeepSeek V4 is a workspace member, but its DeepSeek-specific bins, integration t
 Verified:
 
 - `PEGAINFER_NVCC_JOBS=8 cargo check --release --workspace` passed with DeepSeek TileLang disabled in `pegainfer-kernels`.
-- `PEGAINFER_NVCC_JOBS=8 cargo test --release --workspace --lib` reached existing Qwen3 lib tests and failed because the default local `models/Qwen3-4B` path is absent; it did not trigger DeepSeek TileLang generation.
+- `cargo test --release --workspace --lib` passed with DeepSeek TileLang disabled in `pegainfer-kernels`. Qwen model-loading lib tests now skip only when `PEGAINFER_TEST_MODEL_PATH` is unset and the default local model directory is absent; explicitly provided model paths still run normally and fail normally if invalid.
 
 ## Known Follow-ups
 

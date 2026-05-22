@@ -1,3 +1,4 @@
+mod attribution;
 mod config;
 mod device;
 mod engine;
@@ -13,6 +14,7 @@ use std::path::Path;
 use anyhow::Result;
 use pegainfer_engine::engine::{EngineHandle, EngineLoadOptions};
 
+pub use attribution::{CallSiteRollup, DecodeAttributionProfile, SectionRollup, SectionSample};
 pub use config::Config;
 use config::SUPPORTED_HIDDEN_SIZE;
 use ep::SUPPORTED_ROUTED_EXPERTS;

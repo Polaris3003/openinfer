@@ -1,6 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use anyhow::{Context, Result, bail, ensure};
@@ -14,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Config,
+    attribution::DecodeAttributionProfile,
     device::activate,
     ep::ExpertParallelConfig,
     host_ops::{
@@ -42,6 +44,10 @@ pub struct GenerationStats {
     pub ep_size: usize,
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
+    pub host_dispatch_calls: usize,
+    pub host_dispatch_elements: usize,
+    pub host_combine_calls: usize,
+    pub host_combine_elements: usize,
     pub host_dispatch_local_routes: usize,
     pub host_dispatch_remote_routes: usize,
     pub nccl_dispatch_local_routes: usize,
@@ -145,6 +151,14 @@ impl GenerationStats {
         }
     }
 
+    fn record_host_staged_moe(&mut self, hidden_dim: usize, route_count: usize) {
+        let elements = hidden_dim * route_count;
+        self.host_dispatch_calls += 1;
+        self.host_combine_calls += 1;
+        self.host_dispatch_elements += elements;
+        self.host_combine_elements += elements;
+    }
+
     fn record_nccl_moe_collectives(&mut self, hidden_dim: usize, seq_len: usize) {
         let elements = hidden_dim * seq_len;
         self.nccl_dense_exchange_calls += 1;
@@ -201,8 +215,36 @@ impl DeepSeekV2LiteEp2Generator {
         max_new_tokens: usize,
         ignore_eos: bool,
     ) -> Result<GenerationResult> {
+        let mut attribution = DecodeAttributionProfile::disabled();
+        self.generate_greedy_inner(prompt_tokens, max_new_tokens, ignore_eos, &mut attribution)
+    }
+
+    pub fn generate_greedy_with_attribution(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+    ) -> Result<(GenerationResult, DecodeAttributionProfile)> {
+        let mut attribution = DecodeAttributionProfile::enabled();
+        let result = self.generate_greedy_inner(
+            prompt_tokens,
+            max_new_tokens,
+            ignore_eos,
+            &mut attribution,
+        )?;
+        Ok((result, attribution))
+    }
+
+    fn generate_greedy_inner(
+        &mut self,
+        prompt_tokens: &[u32],
+        max_new_tokens: usize,
+        ignore_eos: bool,
+        attribution: &mut DecodeAttributionProfile,
+    ) -> Result<GenerationResult> {
         ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
         ensure!(max_new_tokens > 0, "max_new_tokens must be positive");
+        let generation_start = Instant::now();
         let requested_context = prompt_tokens.len() + max_new_tokens;
         let supported_context = self.config.supported_plain_rope_context();
         ensure!(
@@ -223,7 +265,10 @@ impl DeepSeekV2LiteEp2Generator {
 
         let mut cache = DecodeCache::new(&self.config);
         let mut generated = Vec::with_capacity(max_new_tokens);
-        let mut next = self.prefill_next_token(prompt_tokens, &mut cache, &mut stats)?;
+        let prefill_start = Instant::now();
+        let mut next =
+            self.prefill_next_token(prompt_tokens, &mut cache, &mut stats, attribution)?;
+        attribution.set_prefill_next_token(prefill_start.elapsed());
         let mut finish_reason = FinishReason::Length;
 
         for step in 0..max_new_tokens {
@@ -237,11 +282,22 @@ impl DeepSeekV2LiteEp2Generator {
                 break;
             }
             let position = prompt_tokens.len() + generated.len() - 1;
-            next = self.decode_next_token(next, position, &mut cache, &mut stats)?;
+            let token_index = generated.len();
+            let decode_start = Instant::now();
+            next = self.decode_next_token(
+                next,
+                position,
+                &mut cache,
+                &mut stats,
+                attribution,
+                token_index,
+            )?;
+            attribution.push_decode_token(decode_start.elapsed());
         }
 
         stats.generated_tokens = generated.len();
         stats.output_token_sha256 = token_sha256(&generated);
+        attribution.set_total_generation(generation_start.elapsed());
         Ok(GenerationResult {
             tokens: generated,
             finish_reason,
@@ -254,10 +310,25 @@ impl DeepSeekV2LiteEp2Generator {
         prompt_tokens: &[u32],
         cache: &mut DecodeCache,
         stats: &mut GenerationStats,
+        attribution: &mut DecodeAttributionProfile,
     ) -> Result<u32> {
-        let mut hidden = self.embed_tokens(prompt_tokens)?;
-        hidden = self.forward_layers(hidden, 0, cache, stats)?;
-        self.sample_last_token(&hidden)
+        let mut hidden = attribution.record_result(
+            "prefill",
+            "embedding",
+            || "prefill.embedding",
+            None,
+            None,
+            || self.embed_tokens(prompt_tokens),
+        )?;
+        hidden = self.forward_layers(hidden, 0, cache, stats, attribution, "prefill", Some(0))?;
+        attribution.record_result(
+            "prefill",
+            "sample_last_token",
+            || "prefill.sample_last_token",
+            None,
+            Some(0),
+            || self.sample_last_token(&hidden),
+        )
     }
 
     fn decode_next_token(
@@ -266,10 +337,34 @@ impl DeepSeekV2LiteEp2Generator {
         position: usize,
         cache: &mut DecodeCache,
         stats: &mut GenerationStats,
+        attribution: &mut DecodeAttributionProfile,
+        token_index: usize,
     ) -> Result<u32> {
-        let mut hidden = self.embed_tokens(&[token])?;
-        hidden = self.forward_layers(hidden, position, cache, stats)?;
-        self.sample_last_token(&hidden)
+        let mut hidden = attribution.record_result(
+            "decode",
+            "embedding",
+            || "decode.embedding",
+            None,
+            Some(token_index),
+            || self.embed_tokens(&[token]),
+        )?;
+        hidden = self.forward_layers(
+            hidden,
+            position,
+            cache,
+            stats,
+            attribution,
+            "decode",
+            Some(token_index),
+        )?;
+        attribution.record_result(
+            "decode",
+            "sample_last_token",
+            || "decode.sample_last_token",
+            None,
+            Some(token_index),
+            || self.sample_last_token(&hidden),
+        )
     }
 
     fn embed_tokens(&self, token_ids: &[u32]) -> Result<HiddenStates> {
@@ -292,6 +387,9 @@ impl DeepSeekV2LiteEp2Generator {
         start_pos: usize,
         cache: &mut DecodeCache,
         stats: &mut GenerationStats,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
     ) -> Result<HiddenStates> {
         ensure!(
             cache.layers.len() == self.rank0.layers.len(),
@@ -305,6 +403,9 @@ impl DeepSeekV2LiteEp2Generator {
                     start_pos,
                     &mut cache.layers[layer_idx],
                     stats,
+                    attribution,
+                    phase,
+                    token_index,
                 )
                 .with_context(|| format!("DeepSeek-V2-Lite layer {layer_idx}"))?;
         }
@@ -318,33 +419,96 @@ impl DeepSeekV2LiteEp2Generator {
         start_pos: usize,
         cache: &mut LayerCache,
         stats: &mut GenerationStats,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
     ) -> Result<HiddenStates> {
         activate(&self.rank0.ctx)?;
 
         let layer = &self.rank0.layers[layer_idx];
-        let normed = self.rms_norm_hidden(hidden, &layer.input_layernorm_host)?;
+        let normed = attribution.record_result(
+            phase,
+            "host_rms_norm",
+            || format!("layer.{layer_idx}.input_rms_norm"),
+            Some(layer_idx),
+            token_index,
+            || self.rms_norm_hidden(hidden, &layer.input_layernorm_host),
+        )?;
 
-        let attn = self.attention_forward(&normed, &layer.attention, start_pos, cache)?;
+        let attn = attribution.record_result(
+            phase,
+            "attention_host_path",
+            || format!("layer.{layer_idx}.attention_host_path"),
+            Some(layer_idx),
+            token_index,
+            || self.attention_forward(&normed, &layer.attention, start_pos, cache),
+        )?;
         activate(&self.rank0.ctx)?;
-        let attn_projected = ops::gemm(&self.rank0.ctx, &layer.attention.o_proj, &attn)?;
-        let after_attn = ops::add_batch(&self.rank0.ctx, hidden, &attn_projected)?;
+        let attn_projected = attribution.record_result(
+            phase,
+            "gpu_o_proj_enqueue",
+            || format!("layer.{layer_idx}.attention_o_proj"),
+            Some(layer_idx),
+            token_index,
+            || ops::gemm(&self.rank0.ctx, &layer.attention.o_proj, &attn),
+        )?;
+        let after_attn = attribution.record_result(
+            phase,
+            "gpu_residual_add_enqueue",
+            || format!("layer.{layer_idx}.attention_residual_add"),
+            Some(layer_idx),
+            token_index,
+            || ops::add_batch(&self.rank0.ctx, hidden, &attn_projected),
+        )?;
 
-        let ffn_norm = self.rms_norm_hidden(&after_attn, &layer.post_attention_layernorm_host)?;
+        let ffn_norm = attribution.record_result(
+            phase,
+            "host_rms_norm",
+            || format!("layer.{layer_idx}.post_attention_rms_norm"),
+            Some(layer_idx),
+            token_index,
+            || self.rms_norm_hidden(&after_attn, &layer.post_attention_layernorm_host),
+        )?;
 
         let (ffn_out, local_routes, remote_routes) = match &layer.mlp {
-            MlpWeights::Dense(dense) => {
-                (dense_mlp_forward(&self.rank0.ctx, dense, &ffn_norm)?, 0, 0)
-            }
+            MlpWeights::Dense(dense) => (
+                attribution.record_result(
+                    phase,
+                    "dense_mlp_enqueue",
+                    || format!("layer.{layer_idx}.dense_mlp"),
+                    Some(layer_idx),
+                    token_index,
+                    || dense_mlp_forward(&self.rank0.ctx, dense, &ffn_norm),
+                )?,
+                0,
+                0,
+            ),
             MlpWeights::Moe(moe) => {
-                let out = self.moe_forward(layer_idx, &ffn_norm, moe)?;
-                if self.backend.kind() == EpBackendKind::Nccl {
-                    stats.record_nccl_moe_collectives(ffn_norm.hidden_dim, ffn_norm.seq_len);
+                let (ffn_out, local_routes, remote_routes) =
+                    self.moe_forward(layer_idx, &ffn_norm, moe, attribution, phase, token_index)?;
+                match self.backend.kind() {
+                    EpBackendKind::HostStaged => {
+                        stats.record_host_staged_moe(
+                            ffn_norm.hidden_dim,
+                            local_routes + remote_routes,
+                        );
+                    }
+                    EpBackendKind::Nccl => {
+                        stats.record_nccl_moe_collectives(ffn_norm.hidden_dim, ffn_norm.seq_len);
+                    }
                 }
-                out
+                (ffn_out, local_routes, remote_routes)
             }
         };
         stats.record_routes(self.backend.kind(), local_routes, remote_routes);
-        ops::add_batch(&self.rank0.ctx, &after_attn, &ffn_out)
+        attribution.record_result(
+            phase,
+            "gpu_residual_add_enqueue",
+            || format!("layer.{layer_idx}.ffn_residual_add"),
+            Some(layer_idx),
+            token_index,
+            || ops::add_batch(&self.rank0.ctx, &after_attn, &ffn_out),
+        )
     }
 
     fn attention_forward(
@@ -413,10 +577,17 @@ impl DeepSeekV2LiteEp2Generator {
         layer_idx: usize,
         input: &HiddenStates,
         moe: &MoeMlp,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
     ) -> Result<(HiddenStates, usize, usize)> {
         match &self.backend {
-            EpBackendRuntime::HostStaged => self.moe_forward_host_staged(layer_idx, input, moe),
-            EpBackendRuntime::Nccl(nccl) => self.moe_forward_nccl(nccl, layer_idx, input, moe),
+            EpBackendRuntime::HostStaged => {
+                self.moe_forward_host_staged(layer_idx, input, moe, attribution, phase, token_index)
+            }
+            EpBackendRuntime::Nccl(nccl) => {
+                self.moe_forward_nccl(nccl, layer_idx, input, moe, attribution, phase, token_index)
+            }
         }
     }
 
@@ -425,13 +596,33 @@ impl DeepSeekV2LiteEp2Generator {
         layer_idx: usize,
         input: &HiddenStates,
         moe: &MoeMlp,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
-        let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
-        let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
-        let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+        let (input_host, routes) = attribution.record_result(
+            phase,
+            "ep_route_host",
+            || format!("layer.{layer_idx}.host_staged.route"),
+            Some(layer_idx),
+            token_index,
+            || {
+                let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+                let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
+                let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+                Ok((input_host, routes))
+            },
+        )?;
 
-        let shared = dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)?;
+        let shared = attribution.record_result(
+            phase,
+            "shared_expert_enqueue",
+            || format!("layer.{layer_idx}.shared_expert"),
+            Some(layer_idx),
+            token_index,
+            || dense_mlp_forward(&self.rank0.ctx, &moe.shared, input),
+        )?;
         let mut routed_accum = vec![0.0f32; input.seq_len * self.config.hidden_size];
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
@@ -440,31 +631,69 @@ impl DeepSeekV2LiteEp2Generator {
             let token_input =
                 &input_host[token * self.config.hidden_size..(token + 1) * self.config.hidden_size];
             for &(global_expert, weight) in token_routes {
-                let (out, is_remote) =
-                    self.expert_forward_host(layer_idx, global_expert, token_input)?;
+                let owner_rank = self.rank0.layout.owner_rank(global_expert)?;
+                let section = if owner_rank == 0 {
+                    "host_staged_local_expert"
+                } else {
+                    "host_staged_remote_dispatch"
+                };
+                let (out, is_remote) = attribution.record_result(
+                    phase,
+                    section,
+                    || format!("layer.{layer_idx}.{section}"),
+                    Some(layer_idx),
+                    token_index,
+                    || self.expert_forward_host(layer_idx, global_expert, token_input),
+                )?;
                 if is_remote {
                     remote_routes += 1;
                 } else {
                     local_routes += 1;
                 }
                 let offset = token * self.config.hidden_size;
-                for (dst, value) in routed_accum[offset..offset + self.config.hidden_size]
-                    .iter_mut()
-                    .zip(out)
-                {
-                    *dst += weight * value;
-                }
+                attribution.record_result(
+                    phase,
+                    "host_staged_combine_accumulate",
+                    || format!("layer.{layer_idx}.host_staged.combine_accumulate"),
+                    Some(layer_idx),
+                    token_index,
+                    || {
+                        for (dst, value) in routed_accum[offset..offset + self.config.hidden_size]
+                            .iter_mut()
+                            .zip(out)
+                        {
+                            *dst += weight * value;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
         }
 
-        let routed = hidden_from_f32_host(
-            &self.rank0.ctx,
-            &routed_accum,
-            self.config.hidden_size,
-            input.seq_len,
+        let routed = attribution.record_result(
+            phase,
+            "host_staged_combine_to_device",
+            || format!("layer.{layer_idx}.host_staged.combine_to_device"),
+            Some(layer_idx),
+            token_index,
+            || {
+                hidden_from_f32_host(
+                    &self.rank0.ctx,
+                    &routed_accum,
+                    self.config.hidden_size,
+                    input.seq_len,
+                )
+            },
         )?;
         activate(&self.rank0.ctx)?;
-        let hidden = ops::add_batch(&self.rank0.ctx, &routed, &shared)?;
+        let hidden = attribution.record_result(
+            phase,
+            "shared_plus_routed_enqueue",
+            || format!("layer.{layer_idx}.shared_plus_routed"),
+            Some(layer_idx),
+            token_index,
+            || ops::add_batch(&self.rank0.ctx, &routed, &shared),
+        )?;
         Ok((hidden, local_routes, remote_routes))
     }
 
@@ -474,20 +703,49 @@ impl DeepSeekV2LiteEp2Generator {
         layer_idx: usize,
         input: &HiddenStates,
         moe: &MoeMlp,
+        attribution: &mut DecodeAttributionProfile,
+        phase: &'static str,
+        token_index: Option<usize>,
     ) -> Result<(HiddenStates, usize, usize)> {
         activate(&self.rank0.ctx)?;
-        let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
-        let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
-        let routes = topk_softmax_routes(&self.config, &route_logits_host, input.seq_len);
+        let routes = attribution.record_result(
+            phase,
+            "ep_route_host",
+            || format!("layer.{layer_idx}.nccl.route"),
+            Some(layer_idx),
+            token_index,
+            || {
+                let input_host = hidden_to_bf16(&self.rank0.ctx, input)?;
+                let route_logits_host = gate_logits_host(&self.config, &input_host, &moe.gate_host);
+                Ok(topk_softmax_routes(
+                    &self.config,
+                    &route_logits_host,
+                    input.seq_len,
+                ))
+            },
+        )?;
 
-        let shared = dense_mlp_forward(&self.rank0.ctx, &moe.shared, input)?;
+        let shared = attribution.record_result(
+            phase,
+            "shared_expert_enqueue",
+            || format!("layer.{layer_idx}.shared_expert"),
+            Some(layer_idx),
+            token_index,
+            || dense_mlp_forward(&self.rank0.ctx, &moe.shared, input),
+        )?;
         let mut rank0_contrib = vec![0.0f32; input.seq_len * self.config.hidden_size];
         let mut rank1_contrib = vec![0.0f32; rank0_contrib.len()];
         // NCCL covers only the dense hidden exchange and final contribution
         // sum in this first gate. Route iteration and expert-output
         // accumulation stay host-side so host-staged remains a simple oracle.
-        let rank1_input =
-            nccl.dense_all_reduce_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input)?;
+        let rank1_input = attribution.record_result(
+            phase,
+            "nccl_dense_exchange",
+            || format!("layer.{layer_idx}.nccl.dense_exchange"),
+            Some(layer_idx),
+            token_index,
+            || nccl.dense_all_reduce_rank0_hidden_to_rank1(&self.rank0.ctx, &self.rank1.ctx, input),
+        )?;
         let mut local_routes = 0usize;
         let mut remote_routes = 0usize;
 
@@ -499,7 +757,14 @@ impl DeepSeekV2LiteEp2Generator {
                         local_routes += 1;
                         let expert = self.rank0.routed_expert(layer_idx, global_expert)?;
                         (
-                            expert_forward_device(&self.rank0.ctx, expert, input, token)?,
+                            attribution.record_result(
+                                phase,
+                                "nccl_local_expert",
+                                || format!("layer.{layer_idx}.nccl.local_expert"),
+                                Some(layer_idx),
+                                token_index,
+                                || expert_forward_device(&self.rank0.ctx, expert, input, token),
+                            )?,
                             &mut rank0_contrib,
                         )
                     }
@@ -507,7 +772,21 @@ impl DeepSeekV2LiteEp2Generator {
                         remote_routes += 1;
                         let expert = self.rank1.routed_expert(layer_idx, global_expert)?;
                         (
-                            expert_forward_device(&self.rank1.ctx, expert, &rank1_input, token)?,
+                            attribution.record_result(
+                                phase,
+                                "nccl_remote_expert",
+                                || format!("layer.{layer_idx}.nccl.remote_expert"),
+                                Some(layer_idx),
+                                token_index,
+                                || {
+                                    expert_forward_device(
+                                        &self.rank1.ctx,
+                                        expert,
+                                        &rank1_input,
+                                        token,
+                                    )
+                                },
+                            )?,
                             &mut rank1_contrib,
                         )
                     }
@@ -516,29 +795,64 @@ impl DeepSeekV2LiteEp2Generator {
                     }
                 };
                 let offset = token * self.config.hidden_size;
-                for (dst, value) in dst[offset..offset + self.config.hidden_size]
-                    .iter_mut()
-                    .zip(out)
-                {
-                    *dst += weight * value;
-                }
+                attribution.record_result(
+                    phase,
+                    "nccl_contribution_accumulate",
+                    || format!("layer.{layer_idx}.nccl.contribution_accumulate"),
+                    Some(layer_idx),
+                    token_index,
+                    || {
+                        for (dst, value) in dst[offset..offset + self.config.hidden_size]
+                            .iter_mut()
+                            .zip(out)
+                        {
+                            *dst += weight * value;
+                        }
+                        Ok(())
+                    },
+                )?;
             }
         }
 
-        let combined = nccl.combine_f32_contributions_to_rank0(
-            &self.rank0.ctx,
-            &self.rank1.ctx,
-            &rank0_contrib,
-            &rank1_contrib,
+        let combined = attribution.record_result(
+            phase,
+            "nccl_combine",
+            || format!("layer.{layer_idx}.nccl.combine"),
+            Some(layer_idx),
+            token_index,
+            || {
+                nccl.combine_f32_contributions_to_rank0(
+                    &self.rank0.ctx,
+                    &self.rank1.ctx,
+                    &rank0_contrib,
+                    &rank1_contrib,
+                )
+            },
         )?;
-        let routed = hidden_from_f32_host(
-            &self.rank0.ctx,
-            &combined,
-            self.config.hidden_size,
-            input.seq_len,
+        let routed = attribution.record_result(
+            phase,
+            "nccl_combine_to_device",
+            || format!("layer.{layer_idx}.nccl.combine_to_device"),
+            Some(layer_idx),
+            token_index,
+            || {
+                hidden_from_f32_host(
+                    &self.rank0.ctx,
+                    &combined,
+                    self.config.hidden_size,
+                    input.seq_len,
+                )
+            },
         )?;
         activate(&self.rank0.ctx)?;
-        let hidden = ops::add_batch(&self.rank0.ctx, &routed, &shared)?;
+        let hidden = attribution.record_result(
+            phase,
+            "shared_plus_routed_enqueue",
+            || format!("layer.{layer_idx}.shared_plus_routed"),
+            Some(layer_idx),
+            token_index,
+            || ops::add_batch(&self.rank0.ctx, &routed, &shared),
+        )?;
         Ok((hidden, local_routes, remote_routes))
     }
 
