@@ -274,6 +274,115 @@ pub(super) fn forward_mla_decode_layer_into(
     Ok(())
 }
 
+pub(super) fn forward_mla_prompt_len1_batch_layer_into(
+    ctx: &DeviceContext,
+    comm: Option<&Comm>,
+    attention: &KimiAttentionForwardCache,
+    arena: &mut KimiWorkerDecodeArena,
+    layer_idx: usize,
+    local_heads: usize,
+) -> Result<()> {
+    let KimiWorkerDecodeArena {
+        layout,
+        page_indices_d,
+        page_indptr_d,
+        last_page_len_d,
+        batch_indices_d,
+        positions_d,
+        cos_d,
+        sin_d,
+        layer_caches,
+        scratch,
+        ..
+    } = arena;
+    let layer_cache = layer_caches.get_mut(layer_idx).ok_or_else(|| {
+        anyhow::anyhow!("Kimi prompt_len1 prefill layer cache {layer_idx} out of range")
+    })?;
+
+    typed_ops::rms_norm_into(
+        ctx,
+        &scratch.mla.hidden,
+        &attention.input_norm,
+        KIMI_K2_RMS_NORM_EPS,
+        &mut scratch.mla.normed,
+    )?;
+    typed_ops::gemm_into(
+        ctx,
+        &attention.fused_qkv_a_proj,
+        &scratch.mla.normed,
+        &mut scratch.mla.qkv_a,
+    )?;
+    kimi_mla_split_qkv_a(
+        ctx,
+        &scratch.mla.qkv_a,
+        &mut scratch.mla.q_a,
+        &mut scratch.mla.compressed_kv,
+        &mut scratch.mla.k_rope,
+    )?;
+    typed_ops::rms_norm_into(
+        ctx,
+        &scratch.mla.compressed_kv,
+        &attention.kv_a_norm,
+        KIMI_K2_RMS_NORM_EPS,
+        &mut scratch.mla.compressed_normed,
+    )?;
+    kimi_mla_rope_apply_kpe(
+        ctx,
+        &scratch.mla.k_rope,
+        cos_d,
+        sin_d,
+        positions_d,
+        &mut scratch.mla.append_kpe,
+    )?;
+    kimi_mla_paged_kv_append(
+        ctx,
+        &mut layer_cache.ckv_cache,
+        &mut layer_cache.kpe_cache,
+        *layout,
+        page_indices_d,
+        page_indptr_d,
+        last_page_len_d,
+        &scratch.mla.compressed_normed,
+        &scratch.mla.append_kpe,
+        batch_indices_d,
+        positions_d,
+    )?;
+    typed_ops::gemm_dm_typed_to_hs(
+        ctx,
+        &attention.kv_b_proj,
+        &scratch.mla.compressed_normed,
+        &mut scratch.mla.kv_b,
+    )?;
+    kimi_mla_extract_prefill_v_rt(
+        ctx,
+        &scratch.mla.kv_b,
+        &mut scratch.mla.attn_out,
+        local_heads,
+    )?;
+    typed_ops::gemm_dm_hs_to_typed(
+        ctx,
+        &attention.o_proj,
+        &scratch.mla.attn_out,
+        &mut scratch.mla.projected,
+    )?;
+    if let Some(comm) = comm {
+        let active_elems = scratch.mla.projected.seq_len * KIMI_K2_HIDDEN;
+        let mut projected_view = scratch.mla.projected.data.slice_mut(0..active_elems);
+        comm.all_reduce_in_place(&mut projected_view, &ReduceOp::Sum)
+            .map_err(|err| {
+                anyhow::anyhow!("Kimi TP all-reduce bf16 hidden failed: status={:?}", err.0)
+            })?;
+    }
+    typed_ops::add_into(
+        ctx,
+        &scratch.mla.hidden,
+        &scratch.mla.projected,
+        &mut scratch.mla.normed,
+    )?;
+    std::mem::swap(&mut scratch.mla.hidden, &mut scratch.mla.normed);
+    Ok(())
+}
+
 pub(super) fn forward_dense_mlp_batch_into(
     ctx: &DeviceContext,
     comm: Option<&Comm>,

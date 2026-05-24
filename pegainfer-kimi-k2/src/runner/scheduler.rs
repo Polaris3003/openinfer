@@ -29,6 +29,9 @@ use crate::{
 };
 
 const KIMI_RUNNER_MAX_BATCH: usize = 64;
+// Batched prompt_len=1 prefill is only enabled for a single active row until
+// seq_len>1 parity is proven against the TP8 NCCL trace.
+const KIMI_PROMPT_LEN1_PREFILL_MICROBATCH: usize = 1;
 const KIMI_PREFILL_BATCH_COALESCE: Duration = Duration::from_millis(20);
 const KIMI_PREFILL_BATCH_POLL: Duration = Duration::from_micros(50);
 
@@ -292,12 +295,19 @@ impl KimiK2Scheduler {
             }
             return;
         }
-        let mut active = Vec::with_capacity(prefill_reqs.len());
-        for (slot, req) in prefill_reqs.into_iter().enumerate() {
-            if let Some(active_req) = self.prefill_request(req, slot, decode_batch_size) {
-                active.push(active_req);
+        let mut active = if prefill_reqs.len() > 1
+            && prefill_reqs.iter().all(|req| req.prompt_tokens.len() == 1)
+        {
+            self.prefill_prompt_len1_batch(prefill_reqs, decode_batch_size)
+        } else {
+            let mut active = Vec::with_capacity(prefill_reqs.len());
+            for (slot, req) in prefill_reqs.into_iter().enumerate() {
+                if let Some(active_req) = self.prefill_request(req, slot, decode_batch_size) {
+                    active.push(active_req);
+                }
             }
-        }
+            active
+        };
 
         while !active.is_empty() {
             let decode_batch_size = active[0].decode_batch_size;
@@ -444,6 +454,112 @@ impl KimiK2Scheduler {
             decode_batch_size,
         })
     }
+
+    fn prefill_prompt_len1_batch(
+        &mut self,
+        prefill_reqs: Vec<GenerateRequest>,
+        decode_batch_size: usize,
+    ) -> Vec<ActiveKimiRequest> {
+        let mut active = Vec::with_capacity(prefill_reqs.len());
+        let mut group = Vec::with_capacity(KIMI_PROMPT_LEN1_PREFILL_MICROBATCH);
+        for (slot, req) in prefill_reqs.into_iter().enumerate() {
+            group.push((slot, req));
+            if group.len() == KIMI_PROMPT_LEN1_PREFILL_MICROBATCH {
+                self.prefill_prompt_len1_microbatch(
+                    std::mem::take(&mut group),
+                    decode_batch_size,
+                    &mut active,
+                );
+            }
+        }
+        if !group.is_empty() {
+            self.prefill_prompt_len1_microbatch(group, decode_batch_size, &mut active);
+        }
+        active
+    }
+
+    fn prefill_prompt_len1_microbatch(
+        &mut self,
+        group: Vec<(usize, GenerateRequest)>,
+        decode_batch_size: usize,
+        active: &mut Vec<ActiveKimiRequest>,
+    ) {
+        let token_ids = group
+            .iter()
+            .map(|(_, req)| req.prompt_tokens[0])
+            .collect::<Vec<_>>();
+        let slots = group.iter().map(|(slot, _)| *slot).collect::<Vec<_>>();
+        let reports = match self.runtime.forward_prompt_len1_batch_next_tokens(
+            token_ids,
+            slots.clone(),
+            decode_batch_size,
+        ) {
+            Ok(reports) => reports,
+            Err(err) => {
+                let message = format!(
+                    "Kimi-K2 prompt_len1 batch forward failed after {}/{} ranks loaded: {err:#}",
+                    self.runtime.gpu_weight_ready_rank_count(),
+                    self.runtime.rank_count()
+                );
+                eprintln!("kimi-k2: {message}");
+                for (_, req) in group {
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+                return;
+            }
+        };
+        if reports.len() != group.len() {
+            let message = format!(
+                "Kimi-K2 prompt_len1 batch returned {} reports for {} requests",
+                reports.len(),
+                group.len()
+            );
+            for (_, req) in group {
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens: 0,
+                });
+            }
+            return;
+        }
+
+        for ((slot, req), report) in group.into_iter().zip(reports.into_iter()) {
+            let token_id = report.local_next_token_global_id;
+            if req
+                .token_tx
+                .send(TokenEvent::Token {
+                    id: token_id,
+                    logprob: None,
+                })
+                .is_err()
+            {
+                continue;
+            }
+            let completion_tokens = 1usize;
+            if completion_tokens >= req.max_tokens {
+                let _ = req.token_tx.send(TokenEvent::Finished {
+                    finish_reason: FinishReason::Length,
+                    prompt_tokens: req.prompt_tokens.len(),
+                    completion_tokens,
+                });
+                continue;
+            }
+            active.push(ActiveKimiRequest {
+                token_tx: req.token_tx,
+                prompt_len: req.prompt_tokens.len(),
+                completion_tokens,
+                max_tokens: req.max_tokens,
+                last_token: token_id,
+                slot,
+                decode_batch_size,
+            });
+        }
+    }
 }
 
 fn schedule_prefill_candidate(req: GenerateRequest) -> Option<GenerateRequest> {
@@ -520,6 +636,16 @@ impl KimiK2Runtime {
     ) -> Result<crate::runner::worker::KimiOneTokenForwardReport> {
         self.executor
             .forward_prefill(&input_ids, slot, decode_batch_size, 0)
+    }
+
+    fn forward_prompt_len1_batch_next_tokens(
+        &self,
+        token_ids: Vec<u32>,
+        slots: Vec<usize>,
+        decode_batch_size: usize,
+    ) -> Result<Vec<crate::runner::worker::KimiOneTokenForwardReport>> {
+        self.executor
+            .forward_prompt_len1_batch(&token_ids, &slots, decode_batch_size)
     }
 
     fn forward_decode_batch_next_tokens(

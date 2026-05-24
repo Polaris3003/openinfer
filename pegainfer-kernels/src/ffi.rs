@@ -269,6 +269,14 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn kimi_mla_extract_prefill_v_cuda(
+        kv_b: *const Half,
+        output: *mut Half,
+        batch_size: i32,
+        local_heads: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn kimi_mla_rope_split_decode_cuda(
         q_proj: *const Half,
         k_rope: *const Half,

@@ -33,6 +33,29 @@ impl ForwardExecutor for Tp1Dp8ForwardExecutor {
         Ok(report)
     }
 
+    fn forward_prompt_len1_batch(
+        &self,
+        token_ids: &[u32],
+        slots: &[usize],
+        decode_batch_size: usize,
+    ) -> Result<Vec<KimiOneTokenForwardReport>> {
+        if token_ids.is_empty() {
+            bail!("Kimi TP1 prompt_len1 batch requires at least one token");
+        }
+        if token_ids.len() != slots.len() {
+            bail!(
+                "Kimi TP1 prompt_len1 batch input mismatch: tokens={}, slots={}",
+                token_ids.len(),
+                slots.len()
+            );
+        }
+        let mut reports = Vec::with_capacity(token_ids.len());
+        for (&token_id, &slot) in token_ids.iter().zip(slots.iter()) {
+            reports.push(self.forward_prefill(&[token_id], slot, decode_batch_size, 0)?);
+        }
+        Ok(reports)
+    }
+
     fn forward_decode_batch(
         &self,
         token_ids: &[u32],

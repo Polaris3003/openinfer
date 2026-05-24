@@ -1,8 +1,6 @@
 //! Typed Kimi decode scratch buffers.
 
-use anyhow::Result;
-#[cfg(feature = "pplx-ep")]
-use anyhow::ensure;
+use anyhow::{Result, ensure};
 use cudarc::driver::CudaSlice;
 use pegainfer_kernels::gpu_buffers;
 use pegainfer_kernels::tensor::{DeviceContext, GpuTensor, HiddenStates};
@@ -36,6 +34,7 @@ pub(crate) struct MlaDecodeScratch {
     pub(crate) q_nope: HiddenStates,
     pub(crate) q_pe: HiddenStates,
     pub(crate) q_abs_nope: HiddenStates,
+    pub(crate) kv_b: HiddenStates,
     pub(crate) latent: HiddenStates,
     pub(crate) attn_out: HiddenStates,
 }
@@ -61,6 +60,7 @@ impl MlaDecodeScratch {
             q_nope: HiddenStates::zeros(ctx, dims.q_nope_out, batch_size)?,
             q_pe: HiddenStates::zeros(ctx, dims.q_pe_out, batch_size)?,
             q_abs_nope: HiddenStates::zeros(ctx, dims.abs_q_out, batch_size)?,
+            kv_b: HiddenStates::zeros(ctx, dims.kv_b_out, batch_size)?,
             latent: HiddenStates::zeros(ctx, dims.abs_q_out, batch_size)?,
             attn_out: HiddenStates::zeros(ctx, dims.o_proj_in, batch_size)?,
         })
@@ -176,6 +176,47 @@ pub(crate) struct KimiWorkerDecodeScratch {
 }
 
 impl KimiWorkerDecodeScratch {
+    pub(crate) fn set_prompt_seq_len(&mut self, seq_len: usize) -> Result<()> {
+        set_gpu_tensor_seq_len("mla.hidden", &mut self.mla.hidden, seq_len)?;
+        set_gpu_tensor_seq_len("mla.normed", &mut self.mla.normed, seq_len)?;
+        set_gpu_tensor_seq_len("mla.projected", &mut self.mla.projected, seq_len)?;
+        set_gpu_tensor_seq_len("mla.qkv_a", &mut self.mla.qkv_a, seq_len)?;
+        set_gpu_tensor_seq_len("mla.q_a", &mut self.mla.q_a, seq_len)?;
+        set_gpu_tensor_seq_len("mla.q_a_normed", &mut self.mla.q_a_normed, seq_len)?;
+        set_gpu_tensor_seq_len("mla.compressed_kv", &mut self.mla.compressed_kv, seq_len)?;
+        set_gpu_tensor_seq_len("mla.k_rope", &mut self.mla.k_rope, seq_len)?;
+        set_gpu_tensor_seq_len(
+            "mla.compressed_normed",
+            &mut self.mla.compressed_normed,
+            seq_len,
+        )?;
+        set_gpu_tensor_seq_len("mla.append_kpe", &mut self.mla.append_kpe, seq_len)?;
+        set_hidden_states_seq_len("mla.q_proj", &mut self.mla.q_proj, seq_len)?;
+        set_hidden_states_seq_len("mla.q_nope", &mut self.mla.q_nope, seq_len)?;
+        set_hidden_states_seq_len("mla.q_pe", &mut self.mla.q_pe, seq_len)?;
+        set_hidden_states_seq_len("mla.q_abs_nope", &mut self.mla.q_abs_nope, seq_len)?;
+        set_hidden_states_seq_len("mla.kv_b", &mut self.mla.kv_b, seq_len)?;
+        set_hidden_states_seq_len("mla.latent", &mut self.mla.latent, seq_len)?;
+        set_hidden_states_seq_len("mla.attn_out", &mut self.mla.attn_out, seq_len)?;
+        set_hidden_states_seq_len("dense_mlp.gate_up", &mut self.dense_mlp.gate_up, seq_len)?;
+        set_hidden_states_seq_len(
+            "dense_mlp.activated",
+            &mut self.dense_mlp.activated,
+            seq_len,
+        )?;
+        set_hidden_states_seq_len(
+            "shared_expert.gate_up",
+            &mut self.shared_expert.gate_up,
+            seq_len,
+        )?;
+        set_hidden_states_seq_len(
+            "shared_expert.activated",
+            &mut self.shared_expert.activated,
+            seq_len,
+        )?;
+        Ok(())
+    }
+
     #[cfg(feature = "pplx-ep")]
     pub(crate) fn set_moe_seq_len(&mut self, seq_len: usize) -> Result<()> {
         set_gpu_tensor_seq_len("mla.hidden", &mut self.mla.hidden, seq_len)?;
@@ -195,7 +236,6 @@ impl KimiWorkerDecodeScratch {
     }
 }
 
-#[cfg(feature = "pplx-ep")]
 fn set_gpu_tensor_seq_len<const DIM: usize>(
     name: &str,
     tensor: &mut GpuTensor<DIM>,
@@ -210,7 +250,6 @@ fn set_gpu_tensor_seq_len<const DIM: usize>(
     Ok(())
 }
 
-#[cfg(feature = "pplx-ep")]
 fn set_hidden_states_seq_len(name: &str, states: &mut HiddenStates, seq_len: usize) -> Result<()> {
     ensure!(
         seq_len > 0 && seq_len * states.hidden_dim <= states.data.len(),

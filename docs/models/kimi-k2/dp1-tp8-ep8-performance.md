@@ -161,6 +161,7 @@ cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_s
 | O1 | 2026-05-25 | this commit | scheduler / decode arena | Raise DP1 TP8 admission to bs64; allocate decode arenas lazily in `1/2/4/8/16/32/64` buckets; preflight arena allocation on all TP ranks before prefill collectives | `/tmp/kimi_pplx_tp8_correctness64_o1_bucket.json`: TP8 PPLX 64-token hash `4920f088c2338236` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_o1-bucket-07d6a40.json`: output `145.18 tok/s`, TPOT p50/p95/p99 `195.07/221.08/224.72ms`, TTFT p50/p99 `31.00/35.76s`, 256/256 success | Keep as bs64 enabling baseline; not enough for vLLM target, next profile must attack bs64 kernel/communication cost |
 | C1 | 2026-05-25 | this commit | correctness / PPLX MoE | Align TP8 PPLX with TP8 NCCL for active bs64 decode: active MoE rows, TP8-only duplicate-source canonicalization, NCCL-layout local expert compute before PPLX combine | `/tmp/kimi_pplx_tp8_active64_o5_after_review.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 per-index token mismatches; both paths hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | Not a performance optimization; PPLX correctness probe TPOT p50 `110.14ms` vs NCCL `97.53ms`; rerun canonical bs64 pressure after this correctness commit | Keep as the new correctness baseline before further optimization |
 | P1 | 2026-05-25 | documentation only | service / scheduler profile | Profile `00b3f1f` after C1 with the canonical bs64 command and an in-process bs64/output128 microbench | No code change after C1; C1 correctness baseline remains the gate | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json`: output `353.91 tok/s`, TPOT p50/p95/p99 `146.15/172.83/175.10ms`, TTFT p50/p99 `4.58/10.24s`, 256/256 success; in-process warm1 steady TPOT p50 `107.76ms` | Keep as profile baseline; next optimization should target serial first-token prefill without changing token trace |
+| O2 | 2026-05-25 | this commit | scheduler / MLA prefill | Replace prompt_len=1 first-token MLA attention with the exact single-token V path; keep microbatch at 1 because seq_len>1 drifted | `/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json` vs `/tmp/kimi_nccl_tp8_active64_o5_final.json`: 0 mismatches; hash counter `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` | `/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json`: output `414.28 tok/s`, TPOT p50/p95/p99 `133.36/147.74/149.42ms`, TTFT p50/p99 `2.76/6.90s`, 256/256 success | Keep as an incremental first-token optimization; still below vLLM, next work must make batch>1 prompt_len=1 prefill correct or reduce PPLX TPOT |
 
 ### B1 Profile Notes
 
@@ -362,6 +363,110 @@ An accepted fix needs to make the first-token path batched while preserving the
 C1 TP8 NCCL token trace. Replacing prompt prefill with decode is not sufficient;
 see the rejected item below.
 
+### O2 Prompt-Len-1 Single-Row Fast Prefill
+
+Profile:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_00b3f1f.json
+```
+
+Observed:
+
+- P1 showed canonical bs64 output throughput `353.91 tok/s`, with TTFT p50/p99
+  `4.58/10.24s` and TPOT p50/p95/p99 `146.15/172.83/175.10ms`.
+- The in-process bs64/output128 probe showed steady TPOT p50 `107.76ms`, so the
+  remaining service gap was dominated by first-token work and serving cadence,
+  not only steady decode.
+- Code inspection confirmed `64` serial `prefill_request` calls before batched
+  decode. For `prompt_len=1`, causal MLA attention has exactly one key, so the
+  attention output should equal the V slice produced by `kv_b_proj`.
+
+Motivation / expected gain:
+
+Avoid the Q branch, temporary K/V cache assembly, and FlashInfer single-prefill
+call for each one-token prompt. The change keeps the original prefill semantics:
+embedding and residual all-reduces remain BF16 NCCL, KV is still appended at
+position 0, and TP8 prompt MoE remains the NCCL path. Expected gain is lower
+TTFT and modest service throughput improvement while preserving the C1 token
+trace.
+
+Microbench:
+
+```bash
+cd /root/develop/xingming/pegainfer
+CUDA_HOME=/usr/local/cuda \
+NVCC=/usr/local/cuda/bin/nvcc \
+LD_LIBRARY_PATH=/tmp/pegainfer-nccl-lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} \
+PEGAINFER_CUDA_SM=90a \
+PEGAINFER_TRITON_PYTHON=/root/develop/xingming/pegainfer/.triton-venv/bin/python \
+PEGAINFER_KIMI_PARALLEL=tp8dp1 \
+cargo run --release -p pegainfer-server --features kimi-k2-pplx-ep --bin bench_serving -- \
+  --model-path /data/models/Kimi-K2.5 \
+  --cuda-graph false \
+  --format json \
+  --out /tmp/kimi_pplx_tp8_c1fast_mb1_o5.json \
+  request --prompt-len 1 --output-len 5 --concurrency 64 --warmup 0 --iters 1
+```
+
+Result:
+
+- TP8 NCCL fast path:
+  `/tmp/kimi_nccl_tp8_c1fast_mb1_o5.json`, TTFT p50/p99
+  `4.71/6.32s`, e2e p50 `6.92s`, steady TPOT p50 `97.81ms`.
+- TP8 PPLX fast path:
+  `/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json`, TTFT p50/p99
+  `5.27/7.35s`, e2e p50 `8.07s`, steady TPOT p50 `110.45ms`.
+- Both files match `/tmp/kimi_nccl_tp8_active64_o5_final.json` exactly:
+  0 per-index mismatches and hash counter `32x 7c4c5d83355198fd`,
+  `32x 9eecc1ca6fb3409d`.
+
+Correctness gate:
+
+```bash
+uv run --no-project python - <<'PY'
+import collections, json, subprocess
+old=json.loads(subprocess.check_output(
+    ['ssh','h20-100','cat','/tmp/kimi_nccl_tp8_active64_o5_final.json']))
+new=json.loads(subprocess.check_output(
+    ['ssh','h20-100','cat','/tmp/kimi_pplx_tp8_c1fast_mb1_o5.json']))
+mis=[i for i,(a,b) in enumerate(zip(
+    old['metrics']['generated_token_traces'],
+    new['metrics']['generated_token_traces'])) if a['prefix'] != b['prefix']]
+print(collections.Counter(t['hash'] for t in new['metrics']['generated_token_traces']))
+print('mismatches', len(mis))
+PY
+```
+
+Observed output: `Counter({'7c4c5d83355198fd': 32, '9eecc1ca6fb3409d': 32})`,
+`mismatches 0`.
+
+Performance gate:
+
+Canonical bs64 service result:
+
+```text
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.log
+/tmp/kimi-bs64-baseline/pegainfer_tp8_pplx_bs64_fastmb1_candidate.json
+```
+
+Observed:
+
+- Successful requests: `256/256`.
+- Output throughput: `414.28 tok/s` vs P1 `353.91 tok/s`.
+- Peak output throughput: `704.00 tok/s` vs P1 `640.00 tok/s`.
+- TTFT p50/p95/p99: `2.76/6.26/6.90s`.
+- TPOT p50/p95/p99: `133.36/147.74/149.42ms`.
+- ITL p50/p95/p99: `117.15/120.31/126.00ms`.
+
+Decision:
+
+Keep. The change preserves the TP8 NCCL/PPLX correctness baseline and improves
+canonical bs64 output throughput by about `17%`. It does not reach vLLM
+`583.9 tok/s`; the next optimization should either make prompt_len=1 batch>1
+prefill trace-exact, or reduce the PPLX steady TPOT gap.
+
 ## Candidate Queue
 
 | Priority | Area | Hypothesis | Correctness risk |
@@ -379,3 +484,4 @@ see the rejected item below.
 | --- | --- | --- |
 | 2026-05-25 | Use TP1/DP8 correctness as the baseline for this doc | Deferred. TP1/DP8 matched short probes but diverged at 32 tokens, so DP1 TP8 work uses TP8 NCCL/PPLX baseline first. |
 | 2026-05-25 | Use the batch decode kernel as the `prompt_len=1` first-token path | Rejected. New TP8 NCCL and PPLX matched each other (`/tmp/kimi_nccl_tp8_single_prefill_batch_o2_o5.json` vs `/tmp/kimi_pplx_tp8_single_prefill_batch_o2_o5.json`: 0 mismatches), but both changed `32/64` per-index traces compared with the C1 TP8 NCCL ground truth `/tmp/kimi_nccl_tp8_active64_o5_final.json`. Hash counter changed from `32x 7c4c5d83355198fd`, `32x 9eecc1ca6fb3409d` to `48x 9eecc1ca6fb3409d`, `16x f45b2f0248e7059d`; this is not correctness-preserving. |
+| 2026-05-25 | Run the exact prompt_len=1 fast prefill path with microbatch `2` or larger | Rejected for now. The full-batch probe `/tmp/kimi_nccl_tp8_c1batch_o5.json` produced `42/64` mismatches and hash counter `40x 7c4c5d83355198fd`, `18x f45b2f0248e7059d`, `6x 9eecc1ca6fb3409d`. A block-size-8 A/B still failed (`/tmp/kimi_nccl_tp8_c1batch_block8_o5.json`). The sweep showed bs2 correct in isolation (`/tmp/kimi_nccl_tp8_c1batch_bs2_o5.json`) but bs4+ drifted, and the scheduler microbatch=2 candidate `/tmp/kimi_nccl_tp8_c1micro2_o5.json` still had `37/64` mismatches. The accepted O2 path therefore keeps `KIMI_PROMPT_LEN1_PREFILL_MICROBATCH=1` until seq_len>1 layer parity is proven. |

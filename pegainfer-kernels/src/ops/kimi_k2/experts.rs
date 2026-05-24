@@ -2755,9 +2755,8 @@ mod tests {
             KimiMarlinWna16Workspace::new(&ctx, routing.max_m_blocks, KIMI_K2_HIDDEN, BLOCK_SIZE)
                 .expect("gemm workspace");
 
-        let hidden = crate::tensor::HiddenStates {
+        let hidden = crate::tensor::GpuTensor::<KIMI_K2_HIDDEN> {
             data: hidden_data,
-            hidden_dim: KIMI_K2_HIDDEN,
             seq_len: TOKENS,
         };
         let w13_weight = KimiMarlinFusedW13Int4Weight {
@@ -2779,9 +2778,11 @@ mod tests {
             weight_scale_permuted: &w2_scale_dev,
         };
 
-        let mut w13_out =
-            crate::tensor::HiddenStates::zeros(&ctx, 2 * KIMI_K2_EXPERT_INTERMEDIATE, route_elems)
-                .expect("w13 out");
+        let mut w13_out = crate::tensor::GpuTensor::<{ 2 * KIMI_K2_EXPERT_INTERMEDIATE }>::zeros(
+            &ctx,
+            route_elems,
+        )
+        .expect("w13 out");
         kimi_marlin_wna16_w13_gemm(
             &ctx,
             &mut gemm_workspace,
@@ -2797,13 +2798,12 @@ mod tests {
         assert_bf16_close("w13_out", &w13_got, &w13_ref, 0.5, 0.03);
 
         let mut activated =
-            crate::tensor::HiddenStates::zeros(&ctx, KIMI_K2_EXPERT_INTERMEDIATE, route_elems)
+            crate::tensor::GpuTensor::<KIMI_K2_EXPERT_INTERMEDIATE>::zeros(&ctx, route_elems)
                 .expect("activated");
         kimi_marlin_w13_swiglu(&ctx, &w13_out, &mut activated).expect("swiglu");
 
-        let mut route_output =
-            crate::tensor::HiddenStates::zeros(&ctx, KIMI_K2_HIDDEN, route_elems)
-                .expect("route output");
+        let mut route_output = crate::tensor::GpuTensor::<KIMI_K2_HIDDEN>::zeros(&ctx, route_elems)
+            .expect("route output");
         kimi_marlin_wna16_w2_gemm(
             &ctx,
             &mut gemm_workspace,

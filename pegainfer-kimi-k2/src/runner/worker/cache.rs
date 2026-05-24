@@ -295,6 +295,15 @@ impl KimiWorkerDecodeArena {
         Ok(())
     }
 
+    pub(super) fn configure_batch_prompt_len1(
+        &mut self,
+        ctx: &DeviceContext,
+        slots: &[usize],
+    ) -> Result<()> {
+        let append_positions = vec![0usize; slots.len()];
+        self.configure_batch_decode(ctx, slots, &append_positions)
+    }
+
     pub(super) fn upload_batch_tokens(
         &mut self,
         ctx: &DeviceContext,

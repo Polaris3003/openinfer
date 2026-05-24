@@ -25,10 +25,11 @@ use pegainfer_kernels::{
         kimi_add_f32_bf16_to_bf16, kimi_flashinfer_batch_decode_mla_rt,
         kimi_flashinfer_single_prefill_mla_rt, kimi_marlin_sum_topk_rows_f32,
         kimi_marlin_w13_swiglu, kimi_marlin_wna16_w2_gemm, kimi_marlin_wna16_w13_gemm,
-        kimi_mla_absorb_q_nope_rt, kimi_mla_paged_kv_append, kimi_mla_rope_apply_kpe,
-        kimi_mla_rope_assemble_prefill_rt, kimi_mla_rope_split_decode_rt, kimi_mla_split_qkv_a,
-        kimi_mla_v_up_rt, kimi_moe_marlin_align_block_size, kimi_router_noaux_tc_launch,
-        kimi_scaled_add_f32_bf16_to_bf16, repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
+        kimi_mla_absorb_q_nope_rt, kimi_mla_extract_prefill_v_rt, kimi_mla_paged_kv_append,
+        kimi_mla_rope_apply_kpe, kimi_mla_rope_assemble_prefill_rt, kimi_mla_rope_split_decode_rt,
+        kimi_mla_split_qkv_a, kimi_mla_v_up_rt, kimi_moe_marlin_align_block_size,
+        kimi_router_noaux_tc_launch, kimi_scaled_add_f32_bf16_to_bf16,
+        repeat_f32_for_reduce_scatter_into, scale_f32_in_place,
     },
     tensor::{
         DeviceContext, DeviceMatrix, DeviceVec, GpuTensor, GpuWeight, HiddenStates, NormWeight,
@@ -124,6 +125,12 @@ enum KimiRankCommand {
         input_ids: Vec<u32>,
         ep_max_seq_len: usize,
         resp: SyncSender<Result<KimiOneTokenForwardReport>>,
+    },
+    ForwardPromptLen1BatchNextTokens {
+        token_ids: Vec<u32>,
+        slots: Vec<usize>,
+        decode_batch_size: usize,
+        resp: SyncSender<Result<Vec<KimiOneTokenForwardReport>>>,
     },
     ForwardDecodeBatchNextTokens {
         token_ids: Vec<u32>,
@@ -308,6 +315,24 @@ impl KimiRankWorker {
             .send(KimiRankCommand::ForwardDecodeBatchNextTokens {
                 token_ids,
                 append_positions,
+                slots,
+                decode_batch_size,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("Kimi-K2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    pub(super) fn forward_prompt_len1_batch_next_tokens_async(
+        &self,
+        token_ids: Vec<u32>,
+        slots: Vec<usize>,
+        decode_batch_size: usize,
+    ) -> Result<Receiver<Result<Vec<KimiOneTokenForwardReport>>>> {
+        let (resp_tx, resp_rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(KimiRankCommand::ForwardPromptLen1BatchNextTokens {
+                token_ids,
                 slots,
                 decode_batch_size,
                 resp: resp_tx,
@@ -624,6 +649,19 @@ fn rank_worker_loop(rx: Receiver<KimiRankCommand>, mut state: KimiRankThreadStat
                 let result = state.forward_decode_batch_next_tokens(
                     &token_ids,
                     &append_positions,
+                    &slots,
+                    decode_batch_size,
+                );
+                let _ = resp.send(result);
+            }
+            KimiRankCommand::ForwardPromptLen1BatchNextTokens {
+                token_ids,
+                slots,
+                decode_batch_size,
+                resp,
+            } => {
+                let result = state.forward_prompt_len1_batch_next_tokens(
+                    &token_ids,
                     &slots,
                     decode_batch_size,
                 );
