@@ -4,6 +4,36 @@
 >
 > **Last touched:** 2026-05
 
+## 2026-05-25 bs64 warmup-after rerun
+
+The original bs64 row was rechecked because TP1+DP8+EP8 was expected to be
+closer to 30ms TPOT on some prior measurements. The rerun used the same H20
+node and vLLM TP1+DP8+EP8 server shape, but explicitly ran a full bs64/o128
+warmup before the measured bs64/o128 pass.
+
+Artifacts:
+
+- Output dir: `/tmp/kimi-vllm-dp8-warmup-20260525`
+- Server log: `/tmp/kimi-vllm-dp8-warmup-20260525/server.log`
+- Warmup result: `/tmp/kimi-vllm-dp8-warmup-20260525/warmup_bs64_o128.json`
+- Measured result: `/tmp/kimi-vllm-dp8-warmup-20260525/measure_bs64_o128_after_warmup.json`
+
+Server log evidence:
+
+- `Worker_DP0_EP0` through `Worker_DP7_EP7` started on 8 GPUs.
+- `Using AgRsAll2AllManager all2all manager`.
+- CUDA graph capture ran for `PIECEWISE=51` and `FULL=35`.
+
+| run | reqs | duration (s) | out tok/s | TTFT p50/p99 (ms) | TPOT p50/p95/p99 (ms) | ITL p50/p99 (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| bs64 warmup | 64 | 13.40 | 611.36 | 341.13 / 345.97 | 102.77 / 103.02 / 103.03 | 104.62 / 107.97 |
+| bs64 measured after warmup | 256 | 55.11 | 594.57 | 161.30 / 303.20 | 107.20 / 109.00 / 109.20 | 108.92 / 116.35 |
+
+Result: the explicit warmup improves the old bs64 row slightly
+(`109.00/109.76ms` → `107.20/109.20ms` TPOT p50/p99), but the H20 result is
+still 100ms-class, not 30ms-class. The 30ms expectation remains an open
+cross-hardware/backend check.
+
 ## Setup
 
 | 项 | 值 |

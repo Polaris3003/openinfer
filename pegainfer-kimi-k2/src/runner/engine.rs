@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use super::executor::ForwardExecutor;
 use super::worker::KimiOneTokenForwardReport;
 
-const MAX_BATCH_PER_DP: usize = 4;
+const MAX_BATCH_PER_DP: usize = 8;
 
 /// Coordinated DP engine: one coordinator thread drives all DP ranks in
 /// lock-step. Every decode step, ALL ranks execute forward simultaneously
@@ -32,6 +32,11 @@ struct RequestState {
     completion_tokens: usize,
     max_tokens: usize,
     last_token: u32,
+}
+
+struct PromptLen1Admission {
+    slot: usize,
+    req: GenerateRequest,
 }
 
 enum StepCommand {
@@ -118,15 +123,7 @@ impl DpCoordinator {
             }
 
             // 2. Admit pending requests to DP ranks via load balancer
-            let mut still_pending = Vec::new();
-            for req in pending_reqs.drain(..) {
-                let dp_rank = lb.pick_rank(&self.ranks);
-                match dp_rank {
-                    Some(rank) => self.admit_request(rank, req),
-                    None => still_pending.push(req),
-                }
-            }
-            pending_reqs = still_pending;
+            self.admit_pending_requests(&mut pending_reqs, &lb);
 
             // 3. Run one synchronized step across ALL ranks
             if self.global_active_count() > 0 {
@@ -147,6 +144,70 @@ impl DpCoordinator {
         self.ranks.iter().map(|r| r.active_count()).sum()
     }
 
+    fn admit_pending_requests(
+        &mut self,
+        pending_reqs: &mut Vec<GenerateRequest>,
+        lb: &super::load_balancer::DpLoadBalancer,
+    ) {
+        let mut still_pending = Vec::new();
+        let mut prompt_len1_batch = self.empty_prompt_len1_batch();
+        let mut reserved_free_slots = self.free_slot_lists();
+
+        for req in pending_reqs.drain(..) {
+            if req.prompt_tokens.len() == 1 {
+                if req.max_tokens == 0 {
+                    send_scheduled(&req);
+                    let _ = req.token_tx.send(TokenEvent::Finished {
+                        finish_reason: FinishReason::Length,
+                        prompt_tokens: req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                    continue;
+                }
+
+                let Some(rank) = pick_rank_from_free_slots(&reserved_free_slots) else {
+                    still_pending.push(req);
+                    continue;
+                };
+                let slot = reserved_free_slots[rank].remove(0);
+                send_scheduled(&req);
+                prompt_len1_batch[rank].push(PromptLen1Admission { slot, req });
+                continue;
+            }
+
+            self.flush_prompt_len1_batch(&mut prompt_len1_batch);
+            reserved_free_slots = self.free_slot_lists();
+
+            let dp_rank = lb.pick_rank(&self.ranks);
+            match dp_rank {
+                Some(rank) => {
+                    self.admit_request(rank, req);
+                    reserved_free_slots = self.free_slot_lists();
+                }
+                None => still_pending.push(req),
+            }
+        }
+
+        self.flush_prompt_len1_batch(&mut prompt_len1_batch);
+        *pending_reqs = still_pending;
+    }
+
+    fn empty_prompt_len1_batch(&self) -> Vec<Vec<PromptLen1Admission>> {
+        (0..self.dp_world).map(|_| Vec::new()).collect()
+    }
+
+    fn free_slot_lists(&self) -> Vec<Vec<usize>> {
+        self.ranks.iter().map(DpRankState::free_slots).collect()
+    }
+
+    fn flush_prompt_len1_batch(&mut self, batch: &mut Vec<Vec<PromptLen1Admission>>) {
+        if batch.iter().all(Vec::is_empty) {
+            return;
+        }
+        let ready = std::mem::replace(batch, self.empty_prompt_len1_batch());
+        self.synchronized_prompt_len1_decode(ready);
+    }
+
     fn admit_request(&mut self, dp_rank: usize, req: GenerateRequest) {
         let slot = match self.ranks[dp_rank].find_free_slot() {
             Some(s) => s,
@@ -160,12 +221,7 @@ impl DpCoordinator {
             }
         };
 
-        let scheduled_at = unix_now_s();
-        let _ = req.token_tx.send(TokenEvent::Scheduled {
-            queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at),
-            scheduled_at_unix_s: scheduled_at,
-            prompt_tokens: req.prompt_tokens.len(),
-        });
+        send_scheduled(&req);
 
         if req.max_tokens == 0 {
             let _ = req.token_tx.send(TokenEvent::Finished {
@@ -243,6 +299,104 @@ impl DpCoordinator {
         });
     }
 
+    fn synchronized_prompt_len1_decode(&mut self, mut batch: Vec<Vec<PromptLen1Admission>>) {
+        for (dp_rank, rank_batch) in batch.iter().enumerate() {
+            let cmd = if rank_batch.is_empty() {
+                build_padding_decode_command()
+            } else {
+                StepCommand::Decode {
+                    token_ids: rank_batch
+                        .iter()
+                        .map(|admission| admission.req.prompt_tokens[0])
+                        .collect(),
+                    positions: vec![0; rank_batch.len()],
+                    slots: rank_batch.iter().map(|admission| admission.slot).collect(),
+                    batch_size: rank_batch.len(),
+                }
+            };
+            let _ = self.step_txs[dp_rank].send(cmd);
+        }
+
+        for (dp_rank, rank_batch) in batch.iter_mut().enumerate() {
+            let result = match self.result_rxs[dp_rank].recv() {
+                Ok(StepResult::Decode(result)) => result,
+                Ok(StepResult::Prefill(_)) => continue,
+                Err(_) => continue,
+            };
+
+            if rank_batch.is_empty() {
+                continue;
+            }
+
+            let reports = match result {
+                Ok(reports) => reports,
+                Err(err) => {
+                    eprintln!("kimi-k2: DP rank {dp_rank} prompt_len1 decode failed: {err:#}");
+                    for admission in rank_batch.drain(..) {
+                        let _ = admission.req.token_tx.send(TokenEvent::Error {
+                            message: format!(
+                                "Kimi-K2 DP rank {dp_rank} prompt_len1 decode failed: {err:#}"
+                            ),
+                            prompt_tokens: admission.req.prompt_tokens.len(),
+                            completion_tokens: 0,
+                        });
+                    }
+                    continue;
+                }
+            };
+
+            if reports.len() != rank_batch.len() {
+                let message = format!(
+                    "Kimi-K2 DP rank {dp_rank} prompt_len1 decode returned {} reports for {} requests",
+                    reports.len(),
+                    rank_batch.len()
+                );
+                eprintln!("kimi-k2: {message}");
+                for admission in rank_batch.drain(..) {
+                    let _ = admission.req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
+                        prompt_tokens: admission.req.prompt_tokens.len(),
+                        completion_tokens: 0,
+                    });
+                }
+                continue;
+            }
+
+            for (admission, report) in rank_batch.drain(..).zip(reports.into_iter()) {
+                let token_id = report.local_next_token_global_id;
+                if admission
+                    .req
+                    .token_tx
+                    .send(TokenEvent::Token {
+                        id: token_id,
+                        logprob: None,
+                    })
+                    .is_err()
+                {
+                    continue;
+                }
+
+                let completion_tokens = 1;
+                if completion_tokens >= admission.req.max_tokens {
+                    let _ = admission.req.token_tx.send(TokenEvent::Finished {
+                        finish_reason: FinishReason::Length,
+                        prompt_tokens: admission.req.prompt_tokens.len(),
+                        completion_tokens,
+                    });
+                    continue;
+                }
+
+                self.ranks[dp_rank].slots[admission.slot] = Some(RequestState {
+                    token_tx: admission.req.token_tx,
+                    prompt_len: admission.req.prompt_tokens.len(),
+                    completion_tokens,
+                    max_tokens: admission.req.max_tokens,
+                    last_token: token_id,
+                });
+            }
+        }
+    }
+
     fn synchronized_prefill(&self, owning_rank: usize, slot: usize, req: &GenerateRequest) {
         let ep_max_seq_len = req.prompt_tokens.len();
         for dp_rank in 0..self.dp_world {
@@ -306,6 +460,14 @@ impl DpRankState {
 
     fn find_free_slot(&self) -> Option<usize> {
         self.slots.iter().position(|s| s.is_none())
+    }
+
+    fn free_slots(&self) -> Vec<usize> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, slot)| slot.is_none().then_some(idx))
+            .collect()
     }
 
     fn build_decode_command(&self) -> StepCommand {
@@ -449,4 +611,22 @@ fn unix_now_s() -> f64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0.0, |d| d.as_secs_f64())
+}
+
+fn send_scheduled(req: &GenerateRequest) {
+    let scheduled_at = unix_now_s();
+    let _ = req.token_tx.send(TokenEvent::Scheduled {
+        queued_at_unix_s: req.queued_at_unix_s.unwrap_or(scheduled_at),
+        scheduled_at_unix_s: scheduled_at,
+        prompt_tokens: req.prompt_tokens.len(),
+    });
+}
+
+fn pick_rank_from_free_slots(free_slots: &[Vec<usize>]) -> Option<usize> {
+    free_slots
+        .iter()
+        .enumerate()
+        .filter(|(_, slots)| !slots.is_empty())
+        .max_by_key(|(_, slots)| slots.len())
+        .map(|(rank, _)| rank)
 }
