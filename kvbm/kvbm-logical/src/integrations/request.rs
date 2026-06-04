@@ -42,7 +42,7 @@
 //! // total_tokens=8, num_blocks=2, nothing allocated yet
 //!
 //! // 2. Prefix match against the cache
-//! let matched_count = seq.match_and_add_prefix(&manager).unwrap();
+//! let matched_count = seq.match_and_add_prefix(&manager, usize::MAX).unwrap();
 //!
 //! // 3. Allocate blocks for the rest
 //! let remaining = seq.num_blocks() - matched_count;
@@ -106,7 +106,7 @@ use crate::blocks::{BlockMetadata, ImmutableBlock};
 use crate::manager::BlockManager;
 use crate::sequence::{BlockSequence, LogicalBlockAssignmentError, LogicalBlockAssignments};
 
-use dynamo_tokens::Token;
+use dynamo_tokens::{SaltHash, Token};
 
 /// Manages a request's block lifecycle through direct RAII integration with
 /// [`BlockManager`], bypassing the `MoveBlock` signal protocol.
@@ -144,6 +144,11 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// Creates a `RequestSequence` with token data only. No blocks are
     /// allocated and no manager interaction occurs.
     ///
+    /// `salt_hash` seeds the block-hash chain — it is the prefix-cache
+    /// isolation key. Requests that must not share cached blocks (e.g.
+    /// different LoRA adapters) pass different salts; `None` is the shared
+    /// base namespace.
+    ///
     /// The caller must use [`match_and_add_prefix`], [`allocate_blocks`],
     /// and [`complete_and_register_pending`] to search, allocate, and
     /// register blocks.
@@ -151,9 +156,14 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// [`match_and_add_prefix`]: Self::match_and_add_prefix
     /// [`allocate_blocks`]: Self::allocate_blocks
     /// [`complete_and_register_pending`]: Self::complete_and_register_pending
-    pub fn new(tokens: Vec<Token>, max_output_tokens: usize, block_size: u32) -> Self {
+    pub fn new(
+        tokens: Vec<Token>,
+        max_output_tokens: usize,
+        block_size: u32,
+        salt_hash: Option<SaltHash>,
+    ) -> Self {
         let num_input_tokens = tokens.len();
-        let sequence = BlockSequence::new(tokens, block_size, None);
+        let sequence = BlockSequence::new(tokens, block_size, salt_hash);
         let assignments = LogicalBlockAssignments::new();
 
         Self {
@@ -176,6 +186,11 @@ impl<T: BlockMetadata> RequestSequence<T> {
     /// sequence. Combines [`match_prefix`](Self::match_prefix) and
     /// [`add_matched_blocks`](Self::add_matched_blocks).
     ///
+    /// At most `max_blocks` matched blocks are added; the rest are dropped
+    /// (their `ImmutableBlock` handles return to the pools via RAII).
+    /// Callers that drive a prefill protocol use this to keep at least one
+    /// input token uncached so the final prefill chunk can emit a token.
+    ///
     /// # Panics
     ///
     /// Panics if the sequence already has assigned blocks (i.e. this is
@@ -183,12 +198,14 @@ impl<T: BlockMetadata> RequestSequence<T> {
     pub fn match_and_add_prefix(
         &mut self,
         manager: &BlockManager<T>,
+        max_blocks: usize,
     ) -> Result<usize, LogicalBlockAssignmentError<T>> {
         assert!(
             self.assignments.is_empty(),
             "match_and_add_prefix called on sequence with existing assignments"
         );
-        let matched = self.match_prefix(manager);
+        let mut matched = self.match_prefix(manager);
+        matched.truncate(max_blocks);
         if matched.is_empty() {
             return Ok(0);
         }
@@ -561,9 +578,9 @@ mod tests {
         block_size: u32,
         manager: &BlockManager<TestMeta>,
     ) -> Option<RequestSequence<TestMeta>> {
-        let mut seq = RequestSequence::new(tokens, max_output_tokens, block_size);
+        let mut seq = RequestSequence::new(tokens, max_output_tokens, block_size, None);
         let completed_blocks = seq.num_blocks();
-        let matched_count = seq.match_and_add_prefix(manager).ok()?;
+        let matched_count = seq.match_and_add_prefix(manager, usize::MAX).ok()?;
         let remaining_complete = completed_blocks - matched_count;
         let needs_generation = max_output_tokens > 0;
         let total_to_allocate = remaining_complete + usize::from(needs_generation);
@@ -581,7 +598,7 @@ mod tests {
     #[test]
     fn test_new_minimal_constructor() {
         let tokens = make_tokens(8);
-        let seq = RequestSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE);
+        let seq = RequestSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE, None);
 
         assert_eq!(seq.num_input_tokens(), 8);
         assert_eq!(seq.total_tokens(), 8);
@@ -697,7 +714,7 @@ mod tests {
     #[should_panic(expected = "matched blocks exceed completed sequence blocks")]
     fn test_add_matched_blocks_panics_when_matched_exceeds_completed() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, None);
 
         let source = BlockSequence::new(make_tokens(8), BLOCK_SIZE, None);
         let mutables = manager.allocate_blocks(2).unwrap();
@@ -713,7 +730,7 @@ mod tests {
     #[test]
     fn test_add_matched_blocks_returns_error_on_hash_mismatch() {
         let manager = create_test_manager::<TestMeta>(20);
-        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, None);
 
         let source = BlockSequence::new(vec![100, 101, 102, 103], BLOCK_SIZE, None);
         let mutable = manager
@@ -808,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_is_complete_zero_max() {
-        let seq = RequestSequence::<TestMeta>::new(make_tokens(4), 0, BLOCK_SIZE);
+        let seq = RequestSequence::<TestMeta>::new(make_tokens(4), 0, BLOCK_SIZE, None);
         assert!(seq.is_complete());
     }
 
@@ -863,8 +880,8 @@ mod tests {
             .collect();
         drop(registered);
 
-        let mut seq = RequestSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE);
-        let matched_count = seq.match_and_add_prefix(&manager).unwrap();
+        let mut seq = RequestSequence::<TestMeta>::new(tokens, 10, BLOCK_SIZE, None);
+        let matched_count = seq.match_and_add_prefix(&manager, usize::MAX).unwrap();
         assert_eq!(matched_count, 1);
         assert_eq!(seq.prefix_matched_blocks(), 1);
 
@@ -883,7 +900,7 @@ mod tests {
     #[test]
     fn test_allocate_blocks_failure() {
         let manager = create_test_manager::<TestMeta>(2);
-        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, None);
 
         assert!(!seq.allocate_blocks(3, &manager));
         assert!(seq.allocate_blocks(2, &manager));
@@ -893,7 +910,7 @@ mod tests {
     #[test]
     fn test_allocate_blocks_zero() {
         let manager = create_test_manager::<TestMeta>(2);
-        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE);
+        let mut seq = RequestSequence::<TestMeta>::new(make_tokens(4), 10, BLOCK_SIZE, None);
 
         assert!(seq.allocate_blocks(0, &manager));
         assert_eq!(seq.unassigned_blocks(), 0);

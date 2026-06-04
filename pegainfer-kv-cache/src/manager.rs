@@ -101,12 +101,25 @@ impl KvCacheManager {
         self.block_manager.total_blocks().saturating_sub(1)
     }
 
-    pub fn new_request(&self, prompt_tokens: Vec<u32>, max_output_tokens: usize) -> RequestKv {
+    /// `lora_name` scopes the prefix cache: blocks registered under one
+    /// adapter (or the base model, `None`) never match a request running
+    /// under a different adapter — the name is folded into the block-hash
+    /// chain as a salt, so K/V computed with different weights can't be
+    /// silently reused.
+    pub fn new_request(
+        &self,
+        prompt_tokens: Vec<u32>,
+        max_output_tokens: usize,
+        lora_name: Option<&str>,
+    ) -> RequestKv {
+        let salt_hash = dynamo_kv_hashing::compute_salt_hash(None, lora_name)
+            .expect("salt hash from lora name is infallible");
         let seq = SchedulableSequence::new(
             prompt_tokens,
             max_output_tokens,
             self.block_size as u32,
             None,
+            Some(salt_hash),
         );
         RequestKv { seq }
     }
@@ -121,6 +134,23 @@ pub struct RequestKv {
 }
 
 impl RequestKv {
+    // ── Prefix cache ───────────────────────────────────────────────────
+
+    /// Match the prompt's full blocks against registered blocks and skip
+    /// their prefill. Returns the number of cached tokens; `kv_position()`
+    /// advances by the same amount. Must be called on a fresh request,
+    /// before the first `schedule_prefill`.
+    ///
+    /// Matching always leaves at least one prompt token uncached so the
+    /// final prefill chunk can emit the first generated token.
+    pub fn match_and_add_prefix(&mut self, manager: &KvCacheManager) -> anyhow::Result<usize> {
+        let blocks = self
+            .seq
+            .match_and_add_prefix(&manager.block_manager)
+            .map_err(|e| anyhow::anyhow!("match_and_add_prefix: {e}"))?;
+        Ok(blocks * self.seq.block_size())
+    }
+
     // ── Scheduling (allocates blocks) ──────────────────────────────────
 
     pub fn schedule_prefill(
