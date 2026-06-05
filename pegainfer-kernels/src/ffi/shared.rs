@@ -1,0 +1,476 @@
+use super::Half;
+use cudarc::driver::sys::{CUresult, CUstream};
+
+// Shared kernels used across all models (CUDA / cuBLAS / FlashInfer).
+unsafe extern "C" {
+    pub fn rms_norm_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        n: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    pub fn rms_norm_batched_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    pub fn add_cuda(
+        a: *const Half,
+        b: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn fused_add_rms_norm_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        n: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    pub fn fused_add_rms_norm_batched_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        batch_size: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    pub fn silu_mul_triton_aot_cuda(
+        gate: *const Half,
+        up: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn embedding_batched_cuda(
+        embed: *const Half,
+        token_ids: *const u32,
+        out: *mut Half,
+        hidden_size: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn embedding_batched_vocab_shard_cuda(
+        embed: *const Half,
+        token_ids: *const u32,
+        out: *mut Half,
+        hidden_size: i32,
+        seq_len: i32,
+        vocab_start: u32,
+        part_vocab_size: u32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
+
+    pub fn flashinfer_top1_cuda(
+        logits: *const Half,
+        top1_value_scratch: *mut Half,
+        row_states_scratch: *mut u8,
+        output: *mut i32,
+        vocab_size: i32,
+        stream: CUstream,
+    );
+
+    pub fn gpu_sample_flashinfer_cuda(
+        logits: *const Half,
+        probs_scratch: *mut f32,
+        valid_scratch: *mut u8,
+        output: *mut i32,
+        vocab_size: i32,
+        inv_temperature: f32,
+        top_k: i32,
+        top_p: f32,
+        seed: u64,
+        stream: CUstream,
+    );
+
+    pub fn gemm_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn gemm_graphsafe_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        N: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Embedding lookup reading token_id from decode_meta[0] (CUDA Graph safe)
+    pub fn embedding_decode_cuda(
+        embed: *const Half,
+        token_id: *const u32,
+        out: *mut Half,
+        hidden_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn silu_mul_fused_cuda(
+        gate_up: *const Half,
+        out: *mut Half,
+        intermediate_size: i32,
+        bs: i32,
+        stream: CUstream,
+    );
+
+    pub fn cublas_init();
+    pub fn cublas_destroy();
+    pub fn cuda_set_device(device_ordinal: i32) -> i32;
+
+    // ========================================================================
+    // RMSNorm variants (offset / gated)
+    // ========================================================================
+
+    // Batched (1+weight) RMSNorm — one block per token
+    pub fn rms_norm_batched_offset_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        seq_len: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // (1+weight) RMSNorm — Qwen3.5 / Gemma style
+    pub fn rms_norm_offset_cuda(
+        x: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        n: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // Per-head RMSNorm with F32 weight + SiLU gate
+    pub fn rms_norm_gated_cuda(
+        x: *const Half,
+        weight: *const f32,
+        gate: *const Half,
+        out: *mut Half,
+        num_heads: i32,
+        head_dim: i32,
+        eps: f32,
+        stream: CUstream,
+    );
+
+    // ========================================================================
+    // Paged attention (FlashInfer)
+    // ========================================================================
+
+    // Batched QK RMSNorm + RoPE for decode with per-request positions.
+    pub fn qk_norm_rope_batched_decode_cuda(
+        q: *mut Half,
+        k: *mut Half,
+        q_norm_weight: *const Half,
+        k_norm_weight: *const Half,
+        cos_cache: *const Half,
+        sin_cache: *const Half,
+        positions: *const i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        batch_size: i32,
+        rms_eps: f32,
+        stream: CUstream,
+    );
+
+    // Scatter contiguous KV → paged layout (one layer, FlashInfer prefill append).
+    pub fn paged_kv_scatter_cuda(
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        src_k: *const Half,
+        src_v: *const Half,
+        batch_indices: *const i32,
+        positions: *const i32,
+        nnz: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        stride_page: i64,
+        src_stride_n: i64,
+        src_stride_h: i64,
+        stream: CUstream,
+    ) -> i32;
+
+    // Return the number of Q tiles for batch prefill (needed to size plan arrays).
+    pub fn batch_prefill_paged_num_tiles(
+        seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+    ) -> i32;
+
+    pub fn batch_prefill_paged_num_tiles_with_cta_tile_q(
+        seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        cta_tile_q_override: i32,
+    ) -> i32;
+
+    // Return the CTA tile size for batch prefill planning.
+    pub fn batch_prefill_cta_tile_q(
+        total_seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+    ) -> i32;
+
+    pub fn batch_prefill_cta_tile_q_with_override(
+        total_seq_len: i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        cta_tile_q_override: i32,
+    ) -> i32;
+
+    // Batch prefill with paged KV cache (FlashInfer BatchPrefill, causal, kNone).
+    pub fn batch_prefill_paged_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn batch_prefill_paged_cuda_with_cta_tile_q(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        q_indptr: *const i32,
+        request_indices: *const i32,
+        qo_tile_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        total_num_rows: *const u32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        seq_len: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        cta_tile_q_override: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Single-request prefill with contiguous HND KV cache (FlashInfer SinglePrefill, causal).
+    pub fn single_prefill_cuda(
+        q: *const Half,
+        output: *mut Half,
+        k_cache: *const Half,
+        v_cache: *const Half,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        seq_len: i32,
+        kv_len: i32,
+        max_seq_len: i32,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Paged attention decode (FlashInfer BatchDecode, no partition-KV).
+    pub fn paged_attention_decode_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+
+    // Paged attention decode (FlashInfer BatchDecode, partition-KV / split-K).
+    pub fn paged_attention_decode_split_kv_cuda(
+        q: *const Half,
+        output: *mut Half,
+        kv_data: *const Half,
+        k_offset_elems: i64,
+        v_offset_elems: i64,
+        page_indices: *const i32,
+        page_indptr: *const i32,
+        last_page_len_d: *const i32,
+        request_indices: *const i32,
+        kv_tile_indices: *const i32,
+        kv_chunk_size_ptr: *const i32,
+        o_indptr: *const i32,
+        block_valid_mask: *const u8,
+        tmp_v: *mut Half,
+        tmp_s: *mut f32,
+        num_qo_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        page_size: i32,
+        batch_size: i32,
+        padded_batch_size: i32,
+        stride_page: i64,
+        sm_scale: f32,
+        stream: CUstream,
+    ) -> i32;
+}
+
+// Added during rebase onto main: generic dtype/scale helpers, batched argmax/top1,
+// rms-norm-round variant, gemm-per-token.
+unsafe extern "C" {
+    pub fn argmax_batch_bf16_cuda(
+        x: *const Half,
+        values: *mut Half,
+        indices: *mut i32,
+        rows: i32,
+        n: i32,
+        stream: CUstream,
+    );
+
+    pub fn bf16_to_f32_cuda(
+        input: *const Half,
+        output: *mut f32,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn f32_to_bf16_cuda(
+        input: *const f32,
+        output: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn flashinfer_top1_batch_cuda(
+        logits: *const Half,
+        top1_values: *mut Half,
+        row_states_scratch: *mut u8,
+        output: *mut i32,
+        num_rows: i32,
+        vocab_size: i32,
+        stream: CUstream,
+    );
+
+    pub fn fused_add_rms_norm_round_batched_cuda(
+        hidden: *mut Half,
+        residual: *const Half,
+        weight: *const Half,
+        out: *mut Half,
+        hidden_dim: i32,
+        batch_size: i32,
+        eps: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn gemm_per_token_cuda(
+        W: *const Half,
+        X: *const Half,
+        Y: *mut Half,
+        M: i32,
+        batch: i32,
+        K: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn repeat_f32_for_reduce_scatter_cuda(
+        local: *const f32,
+        repeated: *mut f32,
+        local_elems: i32,
+        world_size: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn scaled_add_rows_cuda(
+        delta: *const Half,
+        scale: f32,
+        out: *mut Half,
+        out_hidden_dim: i32,
+        row_offset: i32,
+        rows: i32,
+        seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn scale_f32_cuda(values: *mut f32, scale: f32, n: i32, stream: CUstream) -> CUresult;
+
+}
+
+// Added during rebase: split argmax variant.
+unsafe extern "C" {
+    pub fn argmax_batch_bf16_split_cuda(
+        x: *const Half,
+        values: *mut Half,
+        indices: *mut i32,
+        partial_values: *mut f32,
+        partial_indices: *mut i32,
+        rows: i32,
+        n: i32,
+        stream: CUstream,
+    );
+
+}
