@@ -30,7 +30,8 @@ use pegainfer_core::sampler::SamplingParams;
 use pegainfer_core::tensor::DeviceVec;
 
 use self::plan::{
-    ExecutionPlan, admit_pending_requests, compaction_after_retire, slot_for_new_request,
+    ActiveKvBudget, ExecutionPlan, admit_pending_requests, compaction_after_retire, max_kv_tokens,
+    slot_for_new_request,
 };
 
 // ── Internal types ──────────────────────────────────────────────────────
@@ -98,14 +99,7 @@ pub fn start_with_capacity(
         .spawn(move || match bind_model_thread(&model) {
             Ok(_guard) => {
                 let _ = startup_tx.send(Ok(()));
-                scheduler_loop(
-                    model,
-                    submit_rx,
-                    graph_state,
-                    sample_scratch,
-                    seed,
-                    max_batch,
-                );
+                scheduler_loop(model, graph_state, sample_scratch, submit_rx, seed);
             }
             Err(err) => {
                 let _ = startup_tx.send(Err(err));
@@ -155,15 +149,15 @@ fn bind_model_thread(model: &Qwen35Model) -> Result<CublasThreadGuard> {
 #[allow(clippy::needless_pass_by_value)]
 fn scheduler_loop(
     model: Qwen35Model,
-    mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     mut graph_state: BatchDecodeGraphState,
     mut sample_scratch: SampleScratch,
+    mut submit_rx: mpsc::UnboundedReceiver<SchedulerRequest>,
     seed: u64,
-    max_batch: usize,
 ) {
     let mut rng = StdRng::seed_from_u64(seed);
     let mut active: Vec<ActiveRequest35> = Vec::new();
     let mut deferred: Vec<SchedulerRequest> = Vec::new();
+    let max_batch = graph_state.slot_states.len();
 
     info!("Qwen3.5 scheduler ready (max_batch={})", max_batch);
 
@@ -187,40 +181,69 @@ fn scheduler_loop(
             }
         }
 
+        let active_budget: Vec<ActiveKvBudget> = active
+            .iter()
+            .map(|req| ActiveKvBudget {
+                prompt_len: req.prompt_len,
+                generated_count: req.generated_count,
+                max_tokens: req.max_tokens,
+            })
+            .collect();
         let admission = admit_pending_requests(
             pending,
-            active.len(),
-            graph_state.slot_states.len(),
+            &active_budget,
+            max_batch,
             model.kv_pool().layout().page_size,
             model.kv_pool().available_pages(),
+            // KvPool capacity includes the CUDA Graph padding page reserved at
+            // construction, so a real request can use at most the remaining pages.
+            model.kv_pool().capacity_pages().saturating_sub(1),
             |req| req.prompt_tokens.len(),
+            |req| req.max_tokens,
         );
+        for rejected in &admission.rejected {
+            send_rejection(rejected);
+        }
         let pending = admission.pending;
         deferred = admission.deferred;
 
-        match plan::build_next_plan(!active.is_empty(), pending) {
-            Some(ExecutionPlan::Unified { pending }) => unified_step_sched(
-                &model,
-                &mut active,
-                pending,
-                &mut graph_state,
-                &mut sample_scratch,
-                &mut rng,
-            ),
-            Some(ExecutionPlan::Prefill { pending }) => prefill_batch(
-                &model,
-                &mut active,
-                pending,
-                &mut graph_state,
-                &mut sample_scratch,
-                &mut rng,
-            ),
-            Some(ExecutionPlan::Decode) => {
-                decode_step(&model, &mut active, &mut graph_state, &mut rng)
+        if let Some(plan) = plan::build_next_plan(!active.is_empty(), pending) {
+            match plan {
+                ExecutionPlan::Unified { pending } => unified_step_sched(
+                    &model,
+                    &mut active,
+                    pending,
+                    &mut graph_state,
+                    &mut sample_scratch,
+                    &mut rng,
+                ),
+                ExecutionPlan::Prefill { pending } => prefill_batch(
+                    &model,
+                    &mut active,
+                    pending,
+                    &mut graph_state,
+                    &mut sample_scratch,
+                    &mut rng,
+                ),
+                ExecutionPlan::Decode => {
+                    decode_step(&model, &mut active, &mut graph_state, &mut rng);
+                }
             }
-            None => {}
         }
     }
+}
+
+fn send_rejection(req: &SchedulerRequest) {
+    let max_request_tokens = max_kv_tokens(req.prompt_tokens.len(), req.max_tokens);
+    let _ = req.token_tx.send(TokenEvent::Rejected {
+        message: format!(
+            "request requires more KV pages than this model instance can provide: prompt_tokens={}, max_request_tokens={}",
+            req.prompt_tokens.len(),
+            max_request_tokens
+        ),
+        prompt_tokens: req.prompt_tokens.len(),
+        completion_tokens: 0,
+    });
 }
 
 // ── Batch prefill ───────────────────────────────────────────────────────
@@ -246,9 +269,10 @@ fn prefill_batch(
         Ok(v) => v,
         Err(e) => {
             warn!("Qwen3.5 batch prefill failed: {e}");
+            let message = e.to_string();
             for req in pending {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_tokens.len(),
                     completion_tokens: 0,
                 });
@@ -265,6 +289,11 @@ fn prefill_batch(
             Ok(t) => t,
             Err(e) => {
                 warn!("First token sampling failed for request {i}: {e}");
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: e.to_string(),
+                    prompt_tokens: prompt_len,
+                    completion_tokens: 0,
+                });
                 continue;
             }
         };
@@ -371,18 +400,19 @@ fn unified_step_sched(
         Ok(v) => v,
         Err(e) => {
             warn!("Qwen3.5 unified step failed: {e}");
+            let message = e.to_string();
             // Notify all pending requests
             for req in pending {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_tokens.len(),
                     completion_tokens: 0,
                 });
             }
             // Notify all active decode requests
             for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_len,
                     completion_tokens: req.generated_count,
                 });
@@ -403,6 +433,11 @@ fn unified_step_sched(
                 Ok(t) => t,
                 Err(e) => {
                     warn!("First token sampling failed for request {i}: {e}");
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: e.to_string(),
+                        prompt_tokens: prompt_len,
+                        completion_tokens: 0,
+                    });
                     continue;
                 }
             };
@@ -485,9 +520,10 @@ fn decode_step(
 
     if let Err(e) = model.batch_decode_graph(&token_ids, &mut kv_refs, graph_state) {
         warn!("Qwen3.5 batch_decode_graph error: {e}");
+        let message = e.to_string();
         for req in active.drain(..) {
-            let _ = req.token_tx.send(TokenEvent::Finished {
-                finish_reason: FinishReason::Stop,
+            let _ = req.token_tx.send(TokenEvent::Error {
+                message: message.clone(),
                 prompt_tokens: req.prompt_len,
                 completion_tokens: req.generated_count,
             });
@@ -519,9 +555,10 @@ fn decode_step(
         Ok(t) => t,
         Err(e) => {
             warn!("Qwen3.5 sampling error: {e}");
+            let message = e.to_string();
             for req in active.drain(..) {
-                let _ = req.token_tx.send(TokenEvent::Finished {
-                    finish_reason: FinishReason::Stop,
+                let _ = req.token_tx.send(TokenEvent::Error {
+                    message: message.clone(),
                     prompt_tokens: req.prompt_len,
                     completion_tokens: req.generated_count,
                 });
@@ -567,9 +604,10 @@ fn process_decode_logits(
             }
             Err(e) => {
                 warn!("decode sampling error: {e}");
+                let message = e.to_string();
                 for req in active.drain(..) {
-                    let _ = req.token_tx.send(TokenEvent::Finished {
-                        finish_reason: FinishReason::Stop,
+                    let _ = req.token_tx.send(TokenEvent::Error {
+                        message: message.clone(),
                         prompt_tokens: req.prompt_len,
                         completion_tokens: req.generated_count,
                     });
@@ -757,3 +795,6 @@ fn compute_logprobs_from_cpu(
         top_logprobs: top,
     })
 }
+
+#[cfg(test)]
+mod tests;
