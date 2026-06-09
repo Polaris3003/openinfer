@@ -18,8 +18,8 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use tokio::sync::mpsc;
 
-use crate::Qwen3LoraOptions;
 use crate::executor::{ModelExecutor, Qwen3Executor, RequestId};
+use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use pegainfer_core::engine::{
     EngineCommand, EngineControlRequest, EngineHandle, GenerateRequest, TokenEvent,
 };
@@ -54,6 +54,10 @@ pub(super) struct PendingRequest {
     pub(super) token_tx: mpsc::UnboundedSender<TokenEvent>,
     pub(super) logprobs: usize,
     pub(super) echo: bool,
+    /// Whether this request has already been offered to async KV prefetch.
+    /// Offered at most once; a no-hit offer leaves the request in the normal
+    /// admission flow with this set so it isn't re-probed every tick.
+    pub(super) prefetch_offered: bool,
 }
 
 impl PendingRequest {
@@ -67,6 +71,7 @@ impl PendingRequest {
             token_tx: req.token_tx,
             logprobs: req.logprobs,
             echo: req.echo,
+            prefetch_offered: false,
         }
     }
 }
@@ -78,8 +83,17 @@ pub(crate) fn start_qwen3(
     enable_cuda_graph: bool,
     device_ordinals: &[usize],
     seed: u64,
+    offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
 ) -> Result<EngineHandle> {
-    let executor = Qwen3Executor::from_runtime(model_path, enable_cuda_graph, device_ordinals)?;
+    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
+        model_path,
+        enable_cuda_graph,
+        device_ordinals,
+        Qwen3LoraOptions::default(),
+        offload_options,
+    )?;
+    executor.set_no_prefix_cache(no_prefix_cache);
     Ok(start_with_executor(executor, seed))
 }
 
@@ -89,13 +103,17 @@ pub(crate) fn start_qwen3_with_lora_control(
     device_ordinals: &[usize],
     seed: u64,
     lora_options: Qwen3LoraOptions,
+    offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
 ) -> Result<EngineHandle> {
-    let executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
         model_path,
         enable_cuda_graph,
         device_ordinals,
         lora_options,
+        offload_options,
     )?;
+    executor.set_no_prefix_cache(no_prefix_cache);
     Ok(start_with_executor_with_lora_control(executor, seed))
 }
 
@@ -148,6 +166,90 @@ where
     EngineHandle::new_with_command_channel(command_tx).with_servable_len(servable)
 }
 
+// ── KV-offload prefetch admission helpers ────────────────────────────────
+
+/// Move requests whose async CPU-tier prefetch just settled from `loading`
+/// back to the front of `deferred` — their KV is hot, so admit them first.
+fn reclaim_ready_prefetch<E: ModelExecutor>(
+    executor: &mut E,
+    deferred: &mut Vec<PendingRequest>,
+    loading: &mut Vec<PendingRequest>,
+) {
+    promote_ready(executor.drain_ready_prefetch(), deferred, loading);
+}
+
+/// Offer each not-yet-offered `deferred` request to async CPU-tier prefetch,
+/// moving the ones that start loading out of `deferred` into `loading`. A
+/// request that doesn't start a load (pure GPU hit, miss, or block pressure)
+/// stays in `deferred`, flagged so it isn't re-probed next tick.
+///
+/// Echo requests are never offered: their prefill forwards the whole prompt to
+/// recover prompt logprobs and so skips `match_and_add_prefix` (see
+/// `execute_prefill`). Prefetched blocks would never be matched/reused — they
+/// would only park restored KV that admission credits but prefill can't spend,
+/// starving the request under tight budgets. Leaving `prefetch_offered` unset
+/// for echo is harmless: the `!req.echo` guard keeps them from being probed.
+fn offer_prefetch<E: ModelExecutor>(
+    executor: &mut E,
+    deferred: &mut Vec<PendingRequest>,
+    loading: &mut Vec<PendingRequest>,
+) {
+    let mut keep = Vec::with_capacity(deferred.len());
+    for mut req in deferred.drain(..) {
+        if !req.prefetch_offered && !req.echo {
+            req.prefetch_offered = true;
+            if executor.begin_kv_prefetch(
+                req.request_id,
+                &req.prompt_tokens,
+                req.lora_adapter.as_deref(),
+            ) {
+                loading.push(req);
+                continue;
+            }
+        }
+        keep.push(req);
+    }
+    *deferred = keep;
+}
+
+/// Block until at least one in-flight prefetch settles, then promote the
+/// settled requests to `deferred`. Called only when the scheduler is otherwise
+/// idle, so blocking on the DMA costs nothing.
+fn block_on_loading<E: ModelExecutor>(
+    executor: &mut E,
+    deferred: &mut Vec<PendingRequest>,
+    loading: &mut Vec<PendingRequest>,
+) {
+    promote_ready(executor.wait_ready_prefetch(), deferred, loading);
+}
+
+fn promote_ready(
+    ready: Vec<RequestId>,
+    deferred: &mut Vec<PendingRequest>,
+    loading: &mut Vec<PendingRequest>,
+) {
+    for id in ready {
+        if let Some(pos) = loading.iter().position(|p| p.request_id == id) {
+            deferred.insert(0, loading.remove(pos));
+        }
+    }
+}
+
+/// Release any executor-side state a request accumulated before it was rejected
+/// at admission. A rejected request never prefills, so the only state it can
+/// hold is a settled KV prefetch — committed prefix blocks parked in the
+/// executor while the request waited in `deferred`. Without this they would
+/// leak (blocks pinned, map entry stranded) for the engine's lifetime. Idempotent
+/// and harmless for requests that were never prefetched.
+fn release_rejected<E: ModelExecutor>(executor: &mut E, req: &PendingRequest) {
+    if let Err(e) = executor.drop_request(req.request_id) {
+        warn!(
+            "failed to release state for rejected {:?}: {e}",
+            req.request_id
+        );
+    }
+}
+
 // ── Main loop ───────────────────────────────────────────────────────────
 
 fn scheduler_loop<E>(
@@ -163,6 +265,8 @@ fn scheduler_loop<E>(
     // Requests that could not be admitted due to KV budget pressure.
     // Held here so they aren't lost; re-evaluated every loop iteration.
     let mut deferred: Vec<PendingRequest> = Vec::new();
+    // Requests parked while their async CPU-tier KV prefetch loads.
+    let mut loading: Vec<PendingRequest> = Vec::new();
 
     info!("Scheduler ready");
 
@@ -176,8 +280,18 @@ fn scheduler_loop<E>(
             next_request_id += 1;
         }
 
-        // 2. Nothing active and nothing deferred → block until a request arrives.
+        // 2. Reclaim settled prefetches, then offer fresh requests to prefetch.
+        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
+        offer_prefetch(&mut executor, &mut deferred, &mut loading);
+
+        // 3. Nothing active and nothing admittable → block. Prefer blocking on
+        // an in-flight load (so its request prefills next) over a new submit;
+        // only truly idle (no loads either) do we block on the channel.
         if active.is_empty() && deferred.is_empty() {
+            if !loading.is_empty() {
+                block_on_loading(&mut executor, &mut deferred, &mut loading);
+                continue;
+            }
             if let Some(req) = submit_rx.blocking_recv() {
                 deferred.push(PendingRequest::from_scheduler_request(
                     RequestId(next_request_id),
@@ -195,11 +309,13 @@ fn scheduler_loop<E>(
                 ));
                 next_request_id += 1;
             }
+            continue;
         }
 
         let lora_validation = reject_unknown_lora_requests(deferred, &executor);
         for rejected in &lora_validation.rejected {
             send_unknown_lora_rejection(rejected);
+            release_rejected(&mut executor, rejected);
         }
 
         let admission = admit_deferred_requests(
@@ -210,9 +326,11 @@ fn scheduler_loop<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
+            release_rejected(&mut executor, rejected);
         }
         let pending = admission.pending;
         deferred = admission.deferred;
@@ -245,6 +363,7 @@ fn scheduler_loop_with_lora_control<E>(
     let mut active: Vec<ActiveRequestState> = Vec::new();
     let mut next_request_id = 0u64;
     let mut deferred: Vec<PendingRequest> = Vec::new();
+    let mut loading: Vec<PendingRequest> = Vec::new();
     let mut pending_control: VecDeque<EngineControlRequest> = VecDeque::new();
     let mut post_control_deferred: Vec<PendingRequest> = Vec::new();
 
@@ -263,6 +382,14 @@ fn scheduler_loop_with_lora_control<E>(
             );
         }
 
+        // 1b. Reclaim settled prefetches and offer fresh requests. Control
+        // commands gate generation, so only offer once no control is pending
+        // (a prefetch must not race ahead of an adapter load it depends on).
+        reclaim_ready_prefetch(&mut executor, &mut deferred, &mut loading);
+        if pending_control.is_empty() {
+            offer_prefetch(&mut executor, &mut deferred, &mut loading);
+        }
+
         // 2. Once idle, apply pending control commands before admitting newer
         // generation requests that arrived behind them.
         if active.is_empty() && deferred.is_empty() {
@@ -272,9 +399,13 @@ fn scheduler_loop_with_lora_control<E>(
             }
         }
 
-        // 3. Nothing active and no deferred generation → block until any
-        // command arrives.
+        // 3. Nothing active and no deferred generation → block. An in-flight
+        // load takes priority over waiting on a new command.
         if active.is_empty() && deferred.is_empty() {
+            if !loading.is_empty() {
+                block_on_loading(&mut executor, &mut deferred, &mut loading);
+                continue;
+            }
             if let Some(command) = command_rx.blocking_recv() {
                 enqueue_engine_command(
                     command,
@@ -307,6 +438,7 @@ fn scheduler_loop_with_lora_control<E>(
         let lora_validation = reject_unknown_lora_requests(deferred, &executor);
         for rejected in &lora_validation.rejected {
             send_unknown_lora_rejection(rejected);
+            release_rejected(&mut executor, rejected);
         }
 
         let admission = admit_deferred_requests(
@@ -317,14 +449,21 @@ fn scheduler_loop_with_lora_control<E>(
             executor.max_request_blocks(),
             executor.max_context_tokens(),
             executor.max_decode_batch_size(),
+            |id| executor.prefetched_blocks(id),
         );
         for (rejected, reason) in &admission.rejected {
             send_rejection(rejected, *reason);
+            release_rejected(&mut executor, rejected);
         }
         let pending = admission.pending;
         deferred = admission.deferred;
 
         if active.is_empty() && pending.is_empty() {
+            // A parked load must still be polled to completion before we block.
+            if !loading.is_empty() {
+                block_on_loading(&mut executor, &mut deferred, &mut loading);
+                continue;
+            }
             if let Some(command) = command_rx.blocking_recv() {
                 enqueue_engine_command(
                     command,
@@ -520,6 +659,11 @@ fn admit_deferred_requests(
     max_request_blocks: usize,
     max_context_tokens: usize,
     max_decode_batch_size: usize,
+    // Blocks a request already holds from a settled prefetch. These are already
+    // out of `available_blocks`, so they must be credited against the request's
+    // need or admission double-counts them and can wedge a near-budget CPU-hit
+    // request forever (never admitted, prefetch never released).
+    prefetch_credit: impl Fn(RequestId) -> usize,
 ) -> AdmissionOutcome {
     let mut budget = available_blocks.saturating_sub(active_future_blocks(active, block_size));
     let mut decode_slots = max_decode_batch_size.saturating_sub(active.len());
@@ -539,14 +683,19 @@ fn admit_deferred_requests(
             continue;
         }
 
-        let max_needed = blocks_needed(max_request_tokens(&req), block_size);
-        if max_needed > max_request_blocks {
+        // Full physical footprint gates the per-request cap (a request occupies
+        // all of it, prefetched or not)…
+        let footprint = blocks_needed(max_request_tokens(&req), block_size);
+        if footprint > max_request_blocks {
             rejected.push((req, RejectReason::KvBudget));
             continue;
         }
 
-        if max_needed <= budget && decode_slots > 0 {
-            budget -= max_needed;
+        // …but only the blocks not already held by this request's prefetch must
+        // come from the free-pool budget.
+        let fresh_needed = footprint.saturating_sub(prefetch_credit(req.request_id));
+        if fresh_needed <= budget && decode_slots > 0 {
+            budget -= fresh_needed;
             decode_slots -= 1;
             pending.push(req);
         } else {
@@ -679,6 +828,7 @@ mod tests {
         decode_delay: Duration,
         loaded_lora_adapters: HashSet<String>,
         dropped: Arc<Mutex<Vec<u64>>>,
+        prefetch_offers: Arc<Mutex<Vec<u64>>>,
         prefill_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
         decode_batches: Arc<Mutex<Vec<Vec<RequestId>>>>,
         prefill_lora_batches: Arc<Mutex<Vec<Vec<Option<String>>>>>,
@@ -697,6 +847,7 @@ mod tests {
                 decode_delay: Duration::ZERO,
                 loaded_lora_adapters: HashSet::new(),
                 dropped,
+                prefetch_offers: Arc::new(Mutex::new(Vec::new())),
                 prefill_batches: Arc::new(Mutex::new(Vec::new())),
                 decode_batches: Arc::new(Mutex::new(Vec::new())),
                 prefill_lora_batches: Arc::new(Mutex::new(Vec::new())),
@@ -793,6 +944,16 @@ mod tests {
             }
             self.dropped.lock().unwrap().push(request_id.get());
             Ok(())
+        }
+
+        fn begin_kv_prefetch(
+            &mut self,
+            request_id: RequestId,
+            _prompt_tokens: &[u32],
+            _lora_adapter: Option<&str>,
+        ) -> bool {
+            self.prefetch_offers.lock().unwrap().push(request_id.get());
+            false
         }
 
         fn list_lora_adapters(&self) -> Vec<String> {
@@ -1016,7 +1177,7 @@ mod tests {
         ];
 
         // available 4 blocks - 2 reserved for active growth = budget of 2.
-        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 4, 4, usize::MAX, 64, |_| 0);
 
         let ids =
             |reqs: &[PendingRequest]| reqs.iter().map(|r| r.request_id.get()).collect::<Vec<_>>();
@@ -1055,7 +1216,7 @@ mod tests {
             mk(3, 40, 1), // request 3: 40 prompt + 1 max = 41 total: overflows by 9 tokens → rejected
         ];
 
-        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64);
+        let outcome = admit_deferred_requests(deferred, &active, 16, 1000, 1000, 32, 64, |_| 0);
 
         let pending_ids = outcome
             .pending
@@ -1101,8 +1262,16 @@ mod tests {
         }
         let pending = PendingRequest::from_scheduler_request(RequestId(64), request(16, 1).0);
 
-        let outcome =
-            admit_deferred_requests(vec![pending], &active, 16, 1024, 1024, usize::MAX, 64);
+        let outcome = admit_deferred_requests(
+            vec![pending],
+            &active,
+            16,
+            1024,
+            1024,
+            usize::MAX,
+            64,
+            |_| 0,
+        );
 
         assert!(
             outcome.pending.is_empty(),
@@ -1171,6 +1340,43 @@ mod tests {
         assert!(
             matches!(wait_rx.blocking_recv(), Some(TokenEvent::Finished { .. })),
             "waiting request should finish after admission"
+        );
+    }
+
+    fn pending(request_id: u64, echo: bool) -> PendingRequest {
+        let (token_tx, _token_rx) = mpsc::unbounded_channel();
+        PendingRequest {
+            request_id: RequestId::new(request_id),
+            lora_adapter: None,
+            prompt_tokens: vec![1; 32],
+            params: SamplingParams::default(),
+            max_tokens: 1,
+            token_tx,
+            logprobs: 0,
+            echo,
+            prefetch_offered: false,
+        }
+    }
+
+    #[test]
+    fn echo_requests_are_never_offered_to_prefetch() {
+        let dropped = Arc::new(Mutex::new(Vec::new()));
+        let mut executor = FakeExecutor::new(64, dropped);
+        let offers = Arc::clone(&executor.prefetch_offers);
+
+        let mut deferred = vec![pending(1, true), pending(2, false)];
+        let mut loading = Vec::new();
+        offer_prefetch(&mut executor, &mut deferred, &mut loading);
+
+        // The plain request is probed; the echo request is skipped entirely, so
+        // its prefill forwards the whole prompt without parking unspendable KV.
+        assert_eq!(*offers.lock().unwrap(), vec![2]);
+        let echo = deferred.iter().find(|r| r.request_id.get() == 1).unwrap();
+        assert!(!echo.prefetch_offered, "echo request must stay un-probed");
+        let plain = deferred.iter().find(|r| r.request_id.get() == 2).unwrap();
+        assert!(
+            plain.prefetch_offered,
+            "plain request must be marked probed"
         );
     }
 
