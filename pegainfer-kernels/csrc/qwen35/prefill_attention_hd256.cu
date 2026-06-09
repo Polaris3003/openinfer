@@ -21,7 +21,24 @@ __device__ __forceinline__ void apply_rope_pair_hd256(
     x1 = __float2bfloat16(fx0 * fs + fx1 * fc);
 }
 
-__global__ void prefill_qk_norm_rope_hd256_kernel(
+__device__ __forceinline__ int64_t qwen35_paged_kv_offset_hd256(
+    int page_id,
+    int64_t layer_offset_elems,
+    int64_t stride_page,
+    int page_size,
+    int num_kv_heads,
+    int pos,
+    int kv_head,
+    int d) {
+    int offset_in_page = pos % page_size;
+    return static_cast<int64_t>(page_id) * stride_page
+        + layer_offset_elems
+        + static_cast<int64_t>(offset_in_page) * num_kv_heads * HD256
+        + static_cast<int64_t>(kv_head) * HD256
+        + d;
+}
+
+__global__ void prefill_qk_norm_rope_hd256_paged_kernel(
     const __nv_bfloat16* __restrict__ q_full_batch,  // [q_full_dim, seq_len]
     const __nv_bfloat16* __restrict__ k_batch,       // [kv_dim, seq_len]
     const __nv_bfloat16* __restrict__ q_norm_weight, // [HD256]
@@ -29,18 +46,23 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
     const __nv_bfloat16* __restrict__ cos_cache,     // [max_seq * rotary_dim]
     const __nv_bfloat16* __restrict__ sin_cache,
     __nv_bfloat16* __restrict__ q_batch_out,         // [q_dim, seq_len]
-    __nv_bfloat16* __restrict__ k_cache,             // [num_kvheads * max_seq * HD256]
+    __nv_bfloat16* __restrict__ kv_data,             // paged KV pool
+    int64_t k_offset_elems,
+    const int* __restrict__ page_indices,            // request page list
     int num_q_heads,
     int num_kv_heads,
     int seq_len,
-    const int* __restrict__ start_pos_ptr,           // GPU-resident for CUDA Graph safety
+    const int* __restrict__ start_pos_ptr,           // device pointer to this prefill's base position
     int rotary_dim,
     float rms_eps,
-    int max_seq_len
+    int page_size,
+    int64_t stride_page
 ) {
+    // seq_len is mapped onto grid.x (limit ~2^31) and the head index onto
+    // grid.y so prompts longer than the 65535 grid.y limit still launch.
     int start_pos = *start_pos_ptr;
-    int head_global = blockIdx.x;
-    int token = blockIdx.y;
+    int token = blockIdx.x;
+    int head_global = blockIdx.y;
     int d = threadIdx.x;
 
     bool is_q = head_global < num_q_heads;
@@ -96,9 +118,12 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
             q_batch_out[dst + d] = lo;
             q_batch_out[dst + d + half_rotary] = hi;
         } else {
-            int dst = head_local * max_seq_len * HD256 + pos * HD256;
-            k_cache[dst + d] = lo;
-            k_cache[dst + d + half_rotary] = hi;
+            int page_id = page_indices[pos / page_size];
+            int64_t dst = qwen35_paged_kv_offset_hd256(
+                page_id, k_offset_elems, stride_page, page_size,
+                num_kv_heads, pos, head_local, d);
+            kv_data[dst] = lo;
+            kv_data[dst + half_rotary] = hi;
         }
     }
 
@@ -107,29 +132,40 @@ __global__ void prefill_qk_norm_rope_hd256_kernel(
             int dst = token * q_dim + head_local * HD256;
             q_batch_out[dst + d] = smem[d];
         } else {
-            int dst = head_local * max_seq_len * HD256 + pos * HD256;
-            k_cache[dst + d] = smem[d];
+            int page_id = page_indices[pos / page_size];
+            int64_t dst = qwen35_paged_kv_offset_hd256(
+                page_id, k_offset_elems, stride_page, page_size,
+                num_kv_heads, pos, head_local, d);
+            kv_data[dst] = smem[d];
         }
     }
 }
 
-__global__ void prefill_v_cache_write_hd256_kernel(
+__global__ void prefill_v_cache_write_hd256_paged_kernel(
     const __nv_bfloat16* __restrict__ v_batch,  // [kv_dim, seq_len]
-    __nv_bfloat16* __restrict__ v_cache,        // [num_kvheads * max_seq * HD256]
+    __nv_bfloat16* __restrict__ kv_data,        // paged KV pool
+    int64_t v_offset_elems,
+    const int* __restrict__ page_indices,       // request page list
     int num_kv_heads,
     int seq_len,
-    const int* __restrict__ start_pos_ptr,      // GPU-resident
-    int max_seq_len
+    const int* __restrict__ start_pos_ptr,      // device pointer to this prefill's base position
+    int page_size,
+    int64_t stride_page
 ) {
+    // seq_len on grid.x, kv-head on grid.y (see prep kernel note).
     int start_pos = *start_pos_ptr;
-    int kv_head = blockIdx.x;
-    int token = blockIdx.y;
+    int token = blockIdx.x;
+    int kv_head = blockIdx.y;
     int d = threadIdx.x;
 
+    int pos = start_pos + token;
     int kv_dim = num_kv_heads * HD256;
     int src = token * kv_dim + kv_head * HD256 + d;
-    int dst = kv_head * max_seq_len * HD256 + (start_pos + token) * HD256 + d;
-    v_cache[dst] = v_batch[src];
+    int page_id = page_indices[pos / page_size];
+    int64_t dst = qwen35_paged_kv_offset_hd256(
+        page_id, v_offset_elems, stride_page, page_size,
+        num_kv_heads, pos, kv_head, d);
+    kv_data[dst] = v_batch[src];
 }
 
 __global__ void attention_gate_batch_hd256_kernel(
@@ -289,7 +325,7 @@ void qk_norm_partial_rope_batched_decode_hd256_cuda(
     );
 }
 
-void prefill_attention_hd256_prep_cuda(
+void prefill_attention_hd256_prep_paged_cuda(
     const __nv_bfloat16* q_full_batch,
     const __nv_bfloat16* k_batch,
     const __nv_bfloat16* v_batch,
@@ -298,19 +334,22 @@ void prefill_attention_hd256_prep_cuda(
     const __nv_bfloat16* cos_cache,
     const __nv_bfloat16* sin_cache,
     __nv_bfloat16* q_batch_out,
-    __nv_bfloat16* k_cache,
-    __nv_bfloat16* v_cache,
+    __nv_bfloat16* kv_data,
+    int64_t k_offset_elems,
+    int64_t v_offset_elems,
+    const int* page_indices,
     int num_q_heads,
     int num_kv_heads,
     int seq_len,
     const int* start_pos_ptr,
     int rotary_dim,
     float rms_eps,
-    int max_seq_len,
+    int page_size,
+    int64_t stride_page,
     cudaStream_t stream
 ) {
-    dim3 prep_grid(num_q_heads + num_kv_heads, seq_len);
-    prefill_qk_norm_rope_hd256_kernel<<<prep_grid, THREADS_HD256, 0, stream>>>(
+    dim3 prep_grid(seq_len, num_q_heads + num_kv_heads);
+    prefill_qk_norm_rope_hd256_paged_kernel<<<prep_grid, THREADS_HD256, 0, stream>>>(
         q_full_batch,
         k_batch,
         q_norm_weight,
@@ -318,24 +357,30 @@ void prefill_attention_hd256_prep_cuda(
         cos_cache,
         sin_cache,
         q_batch_out,
-        k_cache,
+        kv_data,
+        k_offset_elems,
+        page_indices,
         num_q_heads,
         num_kv_heads,
         seq_len,
         start_pos_ptr,
         rotary_dim,
         rms_eps,
-        max_seq_len
+        page_size,
+        stride_page
     );
 
-    dim3 v_grid(num_kv_heads, seq_len);
-    prefill_v_cache_write_hd256_kernel<<<v_grid, THREADS_HD256, 0, stream>>>(
+    dim3 v_grid(seq_len, num_kv_heads);
+    prefill_v_cache_write_hd256_paged_kernel<<<v_grid, THREADS_HD256, 0, stream>>>(
         v_batch,
-        v_cache,
+        kv_data,
+        v_offset_elems,
+        page_indices,
         num_kv_heads,
         seq_len,
         start_pos_ptr,
-        max_seq_len
+        page_size,
+        stride_page
     );
 }
 
