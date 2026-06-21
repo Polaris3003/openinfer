@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use cudarc::driver::{DevicePtr, DevicePtrMut};
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
+use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesRef};
 
 /// GEMMs at or below this N consult the cublasLt plan cache. 32 covers the
 /// decode buckets where cuBLAS's GemmEx heuristic picks badly (worst at
@@ -233,7 +233,16 @@ pub fn gemm_graphsafe_into_checked(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) -> Result<()> {
-    gemm_into_with_policy(ctx, weight, x, out, true)
+    gemm_ref_into_with_policy(ctx, weight, x.as_ref(), out, true)
+}
+
+pub fn gemm_graphsafe_ref_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: HiddenStatesRef<'_>,
+    out: &mut HiddenStates,
+) -> Result<()> {
+    gemm_ref_into_with_policy(ctx, weight, x, out, true)
 }
 
 pub fn gemm_per_token_into_checked(
@@ -298,6 +307,16 @@ fn gemm_into_with_policy(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,
+    out: &mut HiddenStates,
+    graphsafe: bool,
+) -> Result<()> {
+    gemm_ref_into_with_policy(ctx, weight, x.as_ref(), out, graphsafe)
+}
+
+fn gemm_ref_into_with_policy(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: HiddenStatesRef<'_>,
     out: &mut HiddenStates,
     graphsafe: bool,
 ) -> Result<()> {

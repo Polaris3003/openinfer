@@ -169,6 +169,7 @@ unsafe extern "C" {
     ) -> i32;
 
     pub fn cublas_init();
+    pub fn cublas_activate_device_handles() -> i32;
     pub fn cublas_destroy();
     pub fn cuda_set_device(device_ordinal: i32) -> i32;
 

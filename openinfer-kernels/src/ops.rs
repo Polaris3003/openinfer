@@ -3,6 +3,8 @@
 mod attention;
 #[cfg(feature = "kimi-k2")]
 mod deepep;
+#[cfg(feature = "deepseek-v2-lite")]
+mod deepseek_v2_lite;
 mod elementwise;
 mod embedding;
 #[cfg(feature = "kimi-k2")]
@@ -21,6 +23,8 @@ pub use attention::{
 pub use deepep::{
     DeepEp, DeepEpDispatchScratch, DeepEpPrefillCounts, deepep_info, deepep_unique_id,
 };
+#[cfg(feature = "deepseek-v2-lite")]
+pub use deepseek_v2_lite::*;
 pub use elementwise::{
     accumulate_bf16_token_scaled_to_f32_into, add_batch, add_batch_into, bf16_hidden_to_f32_into,
     extract_vec, extract_vec_into, extract_vec_ref, extract_vec_ref_into, f32_to_bf16_hidden_into,
@@ -33,9 +37,9 @@ pub use embedding::{embedding_batch, embedding_batch_vocab_shard, embedding_deco
 #[cfg(feature = "kimi-k2")]
 pub use kimi_k2::*;
 pub use linear::{
-    GEMM_LT_MAX_N, gemm, gemm_graphsafe_into_checked, gemm_into, gemm_into_checked, gemm_lt_tune,
-    gemm_per_token, gemm_per_token_into_checked, gemm_rows_into, gemm_rows_into_checked,
-    gemm_token_range_into_checked, gemv, linear,
+    GEMM_LT_MAX_N, gemm, gemm_graphsafe_into_checked, gemm_graphsafe_ref_into_checked, gemm_into,
+    gemm_into_checked, gemm_lt_tune, gemm_per_token, gemm_per_token_into_checked, gemm_rows_into,
+    gemm_rows_into_checked, gemm_token_range_into_checked, gemv, linear,
 };
 pub use lora::{
     LoraDecodeGroupedProjection, lora_decode_fused_delta_group3_into, lora_decode_fused_delta_into,

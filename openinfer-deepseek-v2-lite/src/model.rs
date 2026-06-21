@@ -9,8 +9,10 @@ use half::bf16;
 use log::info;
 use openinfer_core::{
     ops,
-    tensor::{DeviceContext, DeviceMatrix, HiddenStates},
-    weight_loader::{deserialize_shards, load_shard_info, load_tensor_2d, mmap_shards},
+    tensor::{DeviceContext, DeviceMatrix, HiddenStates, HiddenStatesRef},
+    weight_loader::{
+        deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
+    },
 };
 use safetensors::Dtype;
 
@@ -22,18 +24,22 @@ pub(crate) struct DriverRankModel {
     pub(crate) embed_tokens: DeviceMatrix,
     pub(crate) lm_head: DeviceMatrix,
     pub(crate) norm_host: Vec<f32>,
+    pub(crate) norm_device: openinfer_core::tensor::DeviceVec,
     pub(crate) layers: Vec<LayerWeights>,
 }
 
 pub(crate) struct ExpertRankModel {
     pub(crate) ctx: DeviceContext,
     pub(crate) layout: ExpertParallelLayout,
+    pub(crate) gate_devices: Vec<Option<DeviceMatrix>>,
     layers: Vec<Option<Vec<ExpertMlp>>>,
 }
 
 pub(crate) struct LayerWeights {
     pub(crate) input_layernorm_host: Vec<f32>,
+    pub(crate) input_layernorm_device: openinfer_core::tensor::DeviceVec,
     pub(crate) post_attention_layernorm_host: Vec<f32>,
+    pub(crate) post_attention_layernorm_device: openinfer_core::tensor::DeviceVec,
     pub(crate) attention: AttentionWeights,
     pub(crate) mlp: MlpWeights,
 }
@@ -42,6 +48,7 @@ pub(crate) struct AttentionWeights {
     pub(crate) q_proj: DeviceMatrix,
     pub(crate) kv_a_proj: DeviceMatrix,
     pub(crate) kv_a_norm_host: Vec<f32>,
+    pub(crate) kv_a_norm_device: openinfer_core::tensor::DeviceVec,
     pub(crate) kv_b_proj: DeviceMatrix,
     pub(crate) o_proj: DeviceMatrix,
 }
@@ -56,8 +63,27 @@ pub(crate) struct DenseMlp {
     down_proj: DeviceMatrix,
 }
 
+pub(crate) struct DenseMlpForwardScratch {
+    gate_up: HiddenStates,
+    act: HiddenStates,
+    pub(crate) out: HiddenStates,
+}
+
+impl DenseMlpForwardScratch {
+    pub(crate) fn new(ctx: &DeviceContext, mlp: &DenseMlp, seq_len: usize) -> Result<Self> {
+        Ok(Self {
+            gate_up: HiddenStates::zeros(ctx, mlp.gate_up_proj.rows, seq_len)?,
+            act: HiddenStates::zeros(ctx, mlp.gate_up_proj.rows / 2, seq_len)?,
+            out: HiddenStates::zeros(ctx, mlp.down_proj.rows, seq_len)?,
+        })
+    }
+}
+
 pub(crate) struct MoeMlp {
     pub(crate) gate_host: Vec<f32>,
+    // Probe-only fixed-topology MoE uses this for device routing. The eager
+    // oracle path keeps using `gate_host` for host-side routing.
+    pub(crate) gate_device: DeviceMatrix,
     pub(crate) shared: DenseMlp,
     pub(crate) experts: Vec<ExpertMlp>,
 }
@@ -87,26 +113,26 @@ impl DriverRankModel {
             );
             let lm_head = load_tensor_2d(&ctx, shards, weight_map, "lm_head.weight")?;
             let norm_host = load_tensor_1d_host(shards, weight_map, "model.norm.weight")?;
+            let norm_device = load_tensor_1d(&ctx, shards, weight_map, "model.norm.weight")?;
 
             let mut layers = Vec::with_capacity(config.num_hidden_layers);
             for layer_idx in 0..config.num_hidden_layers {
                 let prefix = format!("model.layers.{layer_idx}");
-                let input_layernorm_host = load_tensor_1d_host(
-                    shards,
-                    weight_map,
-                    &format!("{prefix}.input_layernorm.weight"),
-                )?;
-                let post_attention_layernorm_host = load_tensor_1d_host(
-                    shards,
-                    weight_map,
-                    &format!("{prefix}.post_attention_layernorm.weight"),
-                )?;
+                let input_layernorm_name = format!("{prefix}.input_layernorm.weight");
+                let input_layernorm_host =
+                    load_tensor_1d_host(shards, weight_map, &input_layernorm_name)?;
+                let input_layernorm_device =
+                    load_tensor_1d(&ctx, shards, weight_map, &input_layernorm_name)?;
+                let post_attention_layernorm_name =
+                    format!("{prefix}.post_attention_layernorm.weight");
+                let post_attention_layernorm_host =
+                    load_tensor_1d_host(shards, weight_map, &post_attention_layernorm_name)?;
+                let post_attention_layernorm_device =
+                    load_tensor_1d(&ctx, shards, weight_map, &post_attention_layernorm_name)?;
                 let attn = format!("{prefix}.self_attn");
-                let kv_a_norm_host = load_tensor_1d_host(
-                    shards,
-                    weight_map,
-                    &format!("{attn}.kv_a_layernorm.weight"),
-                )?;
+                let kv_a_norm_name = format!("{attn}.kv_a_layernorm.weight");
+                let kv_a_norm_host = load_tensor_1d_host(shards, weight_map, &kv_a_norm_name)?;
+                let kv_a_norm_device = load_tensor_1d(&ctx, shards, weight_map, &kv_a_norm_name)?;
                 let attention = AttentionWeights {
                     q_proj: load_tensor_2d(
                         &ctx,
@@ -121,6 +147,7 @@ impl DriverRankModel {
                         &format!("{attn}.kv_a_proj_with_mqa.weight"),
                     )?,
                     kv_a_norm_host,
+                    kv_a_norm_device,
                     kv_b_proj: load_tensor_2d(
                         &ctx,
                         shards,
@@ -149,7 +176,9 @@ impl DriverRankModel {
                 };
                 layers.push(LayerWeights {
                     input_layernorm_host,
+                    input_layernorm_device,
                     post_attention_layernorm_host,
+                    post_attention_layernorm_device,
                     attention,
                     mlp,
                 });
@@ -168,6 +197,7 @@ impl DriverRankModel {
                 embed_tokens,
                 lm_head,
                 norm_host,
+                norm_device,
                 layers,
             })
         })
@@ -202,13 +232,21 @@ impl ExpertRankModel {
         with_weight_shards(model_path, layout.rank(), "expert", |shards, weight_map| {
             let gpu_started = Instant::now();
             let mut layers = Vec::with_capacity(config.num_hidden_layers);
+            let mut gate_devices = Vec::with_capacity(config.num_hidden_layers);
             for layer_idx in 0..config.num_hidden_layers {
                 if config.is_moe_layer(layer_idx) {
                     let prefix = format!("model.layers.{layer_idx}.mlp");
+                    gate_devices.push(Some(load_tensor_2d(
+                        &ctx,
+                        shards,
+                        weight_map,
+                        &format!("{prefix}.gate.weight"),
+                    )?));
                     layers.push(Some(load_owned_experts(
                         &ctx, shards, weight_map, config, &layout, &prefix,
                     )?));
                 } else {
+                    gate_devices.push(None);
                     layers.push(None);
                 }
             }
@@ -223,9 +261,18 @@ impl ExpertRankModel {
             Ok(Self {
                 ctx,
                 layout,
+                gate_devices,
                 layers,
             })
         })
+    }
+
+    pub(crate) fn gate_device(&self, layer_idx: usize) -> Result<&DeviceMatrix> {
+        self.gate_devices
+            .get(layer_idx)
+            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} out of range"))?
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("layer {layer_idx} is not a MoE layer"))
     }
 
     pub(crate) fn routed_expert(
@@ -327,11 +374,14 @@ fn load_moe_mlp(
     layout: &ExpertParallelLayout,
     prefix: &str,
 ) -> Result<MoeMlp> {
-    let gate_host = load_tensor_2d_host(shards, weight_map, &format!("{prefix}.gate.weight"))?;
+    let gate_name = format!("{prefix}.gate.weight");
+    let gate_host = load_tensor_2d_host(shards, weight_map, &gate_name)?;
+    let gate_device = load_tensor_2d(ctx, shards, weight_map, &gate_name)?;
     let shared = load_dense_mlp(ctx, shards, weight_map, &format!("{prefix}.shared_experts"))?;
     let experts = load_owned_experts(ctx, shards, weight_map, config, layout, prefix)?;
     Ok(MoeMlp {
         gate_host,
+        gate_device,
         shared,
         experts,
     })
@@ -463,3 +513,40 @@ pub(crate) fn dense_mlp_forward_per_token(
     ops::silu_mul_fused_batch_into(ctx, &gate_up, &mut act)?;
     ops::gemm_per_token(ctx, &mlp.down_proj, &act)
 }
+
+pub(crate) fn dense_mlp_forward_preallocated_into(
+    ctx: &DeviceContext,
+    mlp: &DenseMlp,
+    input: &HiddenStates,
+    scratch: &mut DenseMlpForwardScratch,
+) -> Result<()> {
+    dense_mlp_forward_preallocated_ref_into(ctx, mlp, input.as_ref(), scratch)
+}
+
+pub(crate) fn dense_mlp_forward_preallocated_ref_into(
+    ctx: &DeviceContext,
+    mlp: &DenseMlp,
+    input: HiddenStatesRef<'_>,
+    scratch: &mut DenseMlpForwardScratch,
+) -> Result<()> {
+    activate(ctx)?;
+    ensure!(
+        scratch.gate_up.hidden_dim == mlp.gate_up_proj.rows
+            && scratch.gate_up.seq_len == input.seq_len,
+        "DeepSeek-V2-Lite MLP preallocated scratch gate_up shape mismatch"
+    );
+    ensure!(
+        scratch.act.hidden_dim == mlp.gate_up_proj.rows / 2 && scratch.act.seq_len == input.seq_len,
+        "DeepSeek-V2-Lite MLP preallocated scratch act shape mismatch"
+    );
+    ensure!(
+        scratch.out.hidden_dim == mlp.down_proj.rows && scratch.out.seq_len == input.seq_len,
+        "DeepSeek-V2-Lite MLP preallocated scratch out shape mismatch"
+    );
+    ops::gemm_graphsafe_ref_into_checked(ctx, &mlp.gate_up_proj, input, &mut scratch.gate_up)?;
+    ops::silu_mul_fused_batch_into(ctx, &scratch.gate_up, &mut scratch.act)?;
+    ops::gemm_graphsafe_into_checked(ctx, &mlp.down_proj, &scratch.act, &mut scratch.out)
+}
+
+#[cfg(test)]
+mod tests;

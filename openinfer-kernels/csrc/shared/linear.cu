@@ -21,6 +21,9 @@ static int cublas_status_to_error(cublasStatus_t status) {
 thread_local cublasHandle_t g_cublas_handle = nullptr;
 thread_local cublasHandle_t g_cublas_prefill_handle = nullptr;
 thread_local void *g_cublas_workspace = nullptr;
+thread_local std::map<int, cublasHandle_t> g_cublas_handles_by_device;
+thread_local std::map<int, cublasHandle_t> g_cublas_prefill_handles_by_device;
+thread_local std::map<int, void *> g_cublas_workspaces_by_device;
 static const size_t CUBLAS_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
 
 // cublasLt path for small-N decode GEMMs. cuBLAS's default heuristic leaves
@@ -116,31 +119,77 @@ extern "C" {
 int cuda_set_device(int device_ordinal) { return static_cast<int>(cudaSetDevice(device_ordinal)); }
 
 void cublas_init() {
-  if (g_cublas_handle == nullptr) {
-    cublasCreate(&g_cublas_handle);
-    cublasSetMathMode(g_cublas_handle, CUBLAS_TENSOR_OP_MATH);
+  int device = 0;
+  cudaGetDevice(&device);
+
+  auto handle_it = g_cublas_handles_by_device.find(device);
+  if (handle_it == g_cublas_handles_by_device.end()) {
+    cublasHandle_t handle = nullptr;
+    cublasCreate(&handle);
+    cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+    handle_it = g_cublas_handles_by_device.emplace(device, handle).first;
   }
-  if (g_cublas_prefill_handle == nullptr) {
-    cublasCreate(&g_cublas_prefill_handle);
-    cublasSetMathMode(g_cublas_prefill_handle, CUBLAS_TENSOR_OP_MATH);
-    cudaMalloc(&g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
-    cublasSetWorkspace(g_cublas_prefill_handle, g_cublas_workspace, CUBLAS_WORKSPACE_SIZE);
+  g_cublas_handle = handle_it->second;
+
+  auto prefill_it = g_cublas_prefill_handles_by_device.find(device);
+  if (prefill_it == g_cublas_prefill_handles_by_device.end()) {
+    cublasHandle_t handle = nullptr;
+    void *workspace = nullptr;
+    cublasCreate(&handle);
+    cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH);
+    cudaMalloc(&workspace, CUBLAS_WORKSPACE_SIZE);
+    cublasSetWorkspace(handle, workspace, CUBLAS_WORKSPACE_SIZE);
+    prefill_it = g_cublas_prefill_handles_by_device.emplace(device, handle).first;
+    g_cublas_workspaces_by_device.emplace(device, workspace);
   }
+  g_cublas_prefill_handle = prefill_it->second;
+  g_cublas_workspace = g_cublas_workspaces_by_device[device];
+}
+
+int cublas_activate_device_handles() {
+  int device = 0;
+  cudaError_t cuda_status = cudaGetDevice(&device);
+  if (cuda_status != cudaSuccess) {
+    return static_cast<int>(cuda_status);
+  }
+
+  auto handle_it = g_cublas_handles_by_device.find(device);
+  auto prefill_it = g_cublas_prefill_handles_by_device.find(device);
+  auto workspace_it = g_cublas_workspaces_by_device.find(device);
+  if (handle_it == g_cublas_handles_by_device.end() ||
+      prefill_it == g_cublas_prefill_handles_by_device.end() ||
+      workspace_it == g_cublas_workspaces_by_device.end()) {
+    return static_cast<int>(cudaErrorInvalidResourceHandle);
+  }
+
+  g_cublas_handle = handle_it->second;
+  g_cublas_prefill_handle = prefill_it->second;
+  g_cublas_workspace = workspace_it->second;
+  return static_cast<int>(cudaSuccess);
 }
 
 void cublas_destroy() {
-  if (g_cublas_handle != nullptr) {
-    cublasDestroy(g_cublas_handle);
-    g_cublas_handle = nullptr;
+  for (auto &entry : g_cublas_handles_by_device) {
+    if (entry.second != nullptr) {
+      cublasDestroy(entry.second);
+    }
   }
-  if (g_cublas_prefill_handle != nullptr) {
-    cublasDestroy(g_cublas_prefill_handle);
-    g_cublas_prefill_handle = nullptr;
+  g_cublas_handles_by_device.clear();
+  for (auto &entry : g_cublas_prefill_handles_by_device) {
+    if (entry.second != nullptr) {
+      cublasDestroy(entry.second);
+    }
   }
-  if (g_cublas_workspace != nullptr) {
-    cudaFree(g_cublas_workspace);
-    g_cublas_workspace = nullptr;
+  g_cublas_prefill_handles_by_device.clear();
+  for (auto &entry : g_cublas_workspaces_by_device) {
+    if (entry.second != nullptr) {
+      cudaFree(entry.second);
+    }
   }
+  g_cublas_workspaces_by_device.clear();
+  g_cublas_handle = nullptr;
+  g_cublas_prefill_handle = nullptr;
+  g_cublas_workspace = nullptr;
   for (auto &entry : g_lt_plans) {
     lt_plan_destroy(entry.second);
   }

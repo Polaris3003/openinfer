@@ -3763,6 +3763,7 @@ dependencies = [
  "nvtx",
  "openinfer-core",
  "openinfer-engine",
+ "openinfer-kernels",
  "safetensors",
  "serde",
  "serde_json",

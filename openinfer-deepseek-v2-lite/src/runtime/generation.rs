@@ -370,7 +370,7 @@ impl DeepSeekV2LiteEp2Generator {
         })
     }
 
-    fn prefill_next_token(
+    pub(super) fn prefill_next_token(
         &mut self,
         prompt_tokens: &[u32],
         cache: &mut DecodeCache,
@@ -396,7 +396,7 @@ impl DeepSeekV2LiteEp2Generator {
         )
     }
 
-    fn decode_next_token(
+    pub(super) fn decode_next_token(
         &mut self,
         token: u32,
         position: usize,
