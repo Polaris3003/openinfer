@@ -18,6 +18,20 @@ use openinfer_kv_cache::{
 };
 use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
 
+mod dflash_lane;
+mod dflash_prefill;
+mod spec;
+
+use crate::dflash::DFlashDraftModel;
+use crate::speculative::{
+    DraftPlan, DraftResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
+    build_verify_results,
+};
+use dflash_lane::DFlashLaneState;
+use dflash_prefill::{DFlashPrefillAction, dflash_prefill_action};
+
+use crate::verify_graph::VerifyGraphBuffers;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct RequestId(pub(crate) u64);
 
@@ -264,8 +278,26 @@ fn execute_step_on_lane(
                 .iter()
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
-            let (logits, all_position_logits) =
-                lane.execute_prefill(&prompts, kv_views, &lora_adapters, *echo)?;
+            // When DFlash is loaded, capture target hidden states for eligible
+            // requests so they can seed the draft model after prefill finishes.
+            let capture_requested = lane.should_capture_dflash_prefill_context(requests);
+            let capture_layer_ids = if capture_requested {
+                lane.dflash_capture_layer_ids()
+            } else {
+                None
+            };
+            let (logits, all_position_logits, captured_hidden) = lane.execute_prefill(
+                &prompts,
+                kv_views,
+                &lora_adapters,
+                *echo,
+                capture_layer_ids.as_deref(),
+            )?;
+            let dflash_context_captured_requests = lane.record_prefill_dflash_context(
+                requests,
+                capture_requested,
+                captured_hidden.as_ref(),
+            )?;
             if collect_result {
                 let params: Vec<&SamplingParams> = requests.iter().map(|r| &r.params).collect();
                 let tokens = lane.select_step_tokens(&logits, &params, *sample_seed)?;
@@ -278,6 +310,7 @@ fn execute_step_on_lane(
                         all_position_logits.as_ref(),
                         *echo,
                     )?,
+                    dflash_context_captured_requests,
                 }))
             } else {
                 Ok(WorkerStepOutcome::Ack)
@@ -396,11 +429,12 @@ fn execute_step_on_lane(
 
             // Launch prefill on prefill partition stream.
             unsafe { set_stream_override(prefill_stream.0) };
-            let (prefill_logits, _) = lane.execute_prefill(
+            let (prefill_logits, _, _) = lane.execute_prefill(
                 &prefill_prompts,
                 prefill_kv_views,
                 &prefill_lora_adapters,
                 false,
+                None,
             )?;
             clear_stream_override();
 
@@ -458,6 +492,19 @@ fn execute_step_on_lane(
                 Ok(WorkerStepOutcome::Ack)
             }
         }
+        StepCommand::SpeculativeVerify { requests, kv_views } => {
+            // One target forward over each request's K+1 draft span with a
+            // speculative KV view. The fixed-buffer verify path computes all-
+            // position logits (accept_greedy needs the target's posterior at
+            // each span position) and captures the target hidden states (at the
+            // DFlash layers) to seed the next draft — all into reused,
+            // pointer-stable scratch (`VerifyGraphBuffers`).
+            let result = lane.execute_dflash_verify(requests, kv_views)?;
+            Ok(WorkerStepOutcome::SpeculativeVerify(result))
+        }
+        StepCommand::SpeculativeDraft { requests } => Ok(WorkerStepOutcome::SpeculativeDraft(
+            lane.execute_dflash_draft(requests)?,
+        )),
     }
 }
 
@@ -595,6 +642,10 @@ pub struct DecodeRequestResult {
 
 pub struct PrefillResult {
     pub requests: Vec<PrefillRequestResult>,
+    /// Requests whose DFlash target context was captured this prefill step.
+    /// Empty unless speculative decoding is enabled. The executor folds these
+    /// into its `dflash_ready_requests` set once the prompt is fully prefilled.
+    pub dflash_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -618,6 +669,27 @@ pub(crate) trait ModelExecutor: Send {
     fn execute_prefill(&mut self, plan: PrefillPlan<'_>) -> Result<PrefillResult>;
     fn execute_decode(&mut self, plan: DecodePlan<'_>) -> Result<DecodeResult>;
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult>;
+
+    /// Run one speculative draft round (propose `K` tokens per request). Only
+    /// meaningful when [`Self::speculative_enabled`] is true.
+    fn execute_speculative_draft(&mut self, _plan: DraftPlan<'_>) -> Result<DraftResult> {
+        anyhow::bail!("speculative draft is not implemented for this executor")
+    }
+
+    /// Verify a draft span with one target forward and accept the greedy prefix.
+    fn execute_speculative_verify(&mut self, _plan: VerifyPlan<'_>) -> Result<VerifyResult> {
+        anyhow::bail!("speculative verification is not implemented for this executor")
+    }
+
+    /// Whether a draft model is loaded and speculative decoding is active.
+    fn speculative_enabled(&self) -> bool {
+        false
+    }
+
+    /// Whether `request_id` has captured draft context and can be drafted.
+    fn speculative_request_ready(&self, _request_id: RequestId) -> bool {
+        false
+    }
 
     fn load_lora_adapter(&mut self, request: &LoadLoraAdapterRequest) -> Result<()> {
         anyhow::bail!(
@@ -732,6 +804,13 @@ pub struct Qwen3Executor {
     /// In-flight async prefill state. Populated by the SplitConcurrent step,
     /// consumed by `poll_async_prefill`.
     async_prefill: Option<AsyncPrefillState>,
+    /// DFlash draft metadata; `Some` once a draft model is loaded into the
+    /// primary lane. Speculative decoding is enabled iff this is set.
+    speculative: Option<DFlashMeta>,
+    /// Requests whose DFlash context is captured and ready to draft. A request
+    /// enters this set when its prompt finishes prefilling with captured target
+    /// context, and leaves on retire or a plain (non-speculative) decode.
+    dflash_ready_requests: HashSet<RequestId>,
 }
 
 /// State for an in-flight async prefill on the prefill overlap stream.
@@ -768,10 +847,15 @@ impl Qwen3Executor {
         model: Qwen3Model,
         offload_opts: &Qwen3OffloadOptions,
         max_prefill_tokens: usize,
+        dflash_kv_bytes_per_token: usize,
         memory_options: Qwen3MemoryOptions,
     ) -> Result<Self> {
-        let (model, budget) =
-            profile_kv_budget_on_worker(model, max_prefill_tokens, memory_options)?;
+        let (model, budget) = profile_kv_budget_on_worker(
+            model,
+            max_prefill_tokens,
+            dflash_kv_bytes_per_token,
+            memory_options,
+        )?;
         let kv_mgr = KvCacheManager::new(
             &model.device_ctx().stream,
             budget.num_layers,
@@ -809,6 +893,8 @@ impl Qwen3Executor {
             l1_retention_disabled: false,
             overlap: None,
             async_prefill: None,
+            speculative: None,
+            dflash_ready_requests: HashSet::new(),
         })
     }
 
@@ -824,6 +910,7 @@ impl Qwen3Executor {
             Qwen3LoraOptions::default(),
             Qwen3OffloadOptions::disabled(),
             crate::scheduler::DEFAULT_MAX_PREFILL_TOKENS,
+            None,
             Qwen3MemoryOptions::default(),
         )
     }
@@ -835,9 +922,10 @@ impl Qwen3Executor {
         lora_options: Qwen3LoraOptions,
         offload_options: Qwen3OffloadOptions,
         max_prefill_tokens: usize,
+        dflash_draft_path: Option<&str>,
         memory_options: Qwen3MemoryOptions,
     ) -> Result<Self> {
-        let memory_options = memory_options.validate()?;
+        let mut memory_options = memory_options.validate()?;
         let lora_options = lora_options.validate()?;
         anyhow::ensure!(
             !device_ordinals.is_empty(),
@@ -860,11 +948,36 @@ impl Qwen3Executor {
                     max_lora_rank: lora_options.max_lora_rank,
                 },
             )?;
-            let mut executor =
-                Self::single(model, &offload_options, max_prefill_tokens, memory_options)?;
+            // The DFlash draft model loads after profiling but lives outside the
+            // paged KV pool, so reserve its footprint up front from the draft
+            // config: fixed bytes (weights + block scratch) via the margin, and
+            // pool-scaling per-token bytes folded into the block budget.
+            let dflash_kv_bytes_per_token = match dflash_draft_path {
+                Some(path) => {
+                    let reservation = crate::dflash::DFlashMemoryReservation::from_path(
+                        path,
+                        *BATCH_BUCKETS.last().unwrap(),
+                    )?;
+                    memory_options.kv_cache_memory_margin_bytes += reservation.fixed_bytes;
+                    reservation.kv_bytes_per_token
+                }
+                None => 0,
+            };
+            let mut executor = Self::single(
+                model,
+                &offload_options,
+                max_prefill_tokens,
+                dflash_kv_bytes_per_token,
+                memory_options,
+            )?;
             executor.lora_options = lora_options;
             return Ok(executor);
         }
+        anyhow::ensure!(
+            dflash_draft_path.is_none(),
+            "speculative decoding requires the single-GPU path (got {} devices)",
+            device_ordinals.len()
+        );
 
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
@@ -887,8 +1000,9 @@ impl Qwen3Executor {
         let mut profiled_models = Vec::with_capacity(world_size);
         let mut budgets = Vec::with_capacity(world_size);
         for model in models {
+            // DFlash is single-GPU only, so the TP path reserves nothing for it.
             let (model, budget) =
-                profile_kv_budget_on_worker(model, max_prefill_tokens, memory_options)?;
+                profile_kv_budget_on_worker(model, max_prefill_tokens, 0, memory_options)?;
             profiled_models.push(model);
             budgets.push(budget);
         }
@@ -987,6 +1101,8 @@ impl Qwen3Executor {
             l1_retention_disabled: false,
             overlap: None,
             async_prefill: None,
+            speculative: None,
+            dflash_ready_requests: HashSet::new(),
         })
     }
 
@@ -1066,6 +1182,33 @@ impl Qwen3Executor {
         } else {
             self.prefix_cache_enabled = !on;
         }
+    }
+
+    /// Enable speculative decoding by loading a DFlash draft model into the
+    /// primary lane.
+    ///
+    /// Requires the single-GPU topology (tensor parallel shards KV per rank) and
+    /// is incompatible with KV offload. Disables the prefix cache: speculative
+    /// capture needs clean, uncached target hidden states for every prompt
+    /// token, and a prefix-cache hit skips the forward that would produce them.
+    pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.workers.is_empty(),
+            "speculative decoding requires the single-GPU path (got {} extra ranks)",
+            self.workers.len()
+        );
+        anyhow::ensure!(
+            self.offload.is_none(),
+            "speculative decoding is not supported together with KV offload"
+        );
+        let meta = self.primary.load_dflash(draft_path.to_string())?;
+        log::info!(
+            "Qwen3 DFlash speculative decoding enabled: draft block size {}",
+            meta.block_size
+        );
+        self.prefix_cache_enabled = false;
+        self.speculative = Some(meta);
+        Ok(())
     }
 
     /// Whether KV offload is active on this executor.
@@ -1293,6 +1436,7 @@ impl Qwen3Executor {
 fn profile_kv_budget_on_worker(
     model: Qwen3Model,
     max_prefill_tokens: usize,
+    dflash_kv_bytes_per_token: usize,
     memory_options: Qwen3MemoryOptions,
 ) -> Result<(Qwen3Model, KvBudget)> {
     let handle = thread::Builder::new()
@@ -1309,6 +1453,7 @@ fn profile_kv_budget_on_worker(
             let budget = model.profiled_kv_budget(
                 max_prefill_tokens,
                 *BATCH_BUCKETS.last().unwrap(),
+                dflash_kv_bytes_per_token,
                 memory_options,
             )?;
             Ok((model, budget))
@@ -1379,7 +1524,15 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn max_context_tokens(&self) -> usize {
-        self.metadata.config.max_position_embeddings
+        let target = self.metadata.config.max_position_embeddings;
+        match &self.speculative {
+            // The draft's fixed-width in-fill block writes `block_size` positions
+            // past the committed length each step, so a request may use at most
+            // `draft.max_pos - block_size` tokens before the draft cache would
+            // overflow. Reject the rest at admission instead of crashing mid-prefill.
+            Some(meta) => target.min(meta.max_position_embeddings.saturating_sub(meta.block_size)),
+            None => target,
+        }
     }
 
     fn max_decode_batch_size(&self) -> usize {
@@ -1418,6 +1571,10 @@ impl ModelExecutor for Qwen3Executor {
             }
         }
         self.saved_cursor.remove(&request_id);
+        if self.speculative.is_some() {
+            self.dflash_ready_requests.remove(&request_id);
+            self.primary.drop_dflash_request(request_id)?;
+        }
         Ok(())
     }
 
@@ -1582,6 +1739,28 @@ impl ModelExecutor for Qwen3Executor {
         for req_result in &result.requests {
             self.apply_prefill_result(req_result)?;
         }
+        // A request becomes draft-ready once its prompt is fully prefilled with
+        // captured target context. Partial chunks stay pending; ineligible
+        // requests drop any stale worker state.
+        if self.speculative.is_some() {
+            for req_result in &result.requests {
+                let captured = result
+                    .dflash_context_captured_requests
+                    .contains(&req_result.request_id);
+                match dflash_prefill_action(captured, req_result.completed) {
+                    DFlashPrefillAction::MarkReady => {
+                        self.dflash_ready_requests.insert(req_result.request_id);
+                    }
+                    DFlashPrefillAction::KeepPending => {
+                        self.dflash_ready_requests.remove(&req_result.request_id);
+                    }
+                    DFlashPrefillAction::Drop => {
+                        self.dflash_ready_requests.remove(&req_result.request_id);
+                        self.primary.drop_dflash_request(req_result.request_id)?;
+                    }
+                }
+            }
+        }
         // 5. Offload the blocks this prefill just sealed (post-step-sync).
         for req_result in &result.requests {
             self.save_sealed_blocks(req_result.request_id);
@@ -1634,12 +1813,37 @@ impl ModelExecutor for Qwen3Executor {
                 .expect("request must exist after decode");
             rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
         }
+        // A plain decode advances the sequence outside the speculative path, so
+        // any captured draft context is now stale — drop it.
+        if self.speculative.is_some() {
+            for req_result in &result.requests {
+                if self.dflash_ready_requests.remove(&req_result.request_id) {
+                    self.primary.drop_dflash_request(req_result.request_id)?;
+                }
+            }
+        }
         // 5. Offload any block this decode step just sealed (post-step-sync).
         for req_result in &result.requests {
             self.save_sealed_blocks(req_result.request_id);
         }
 
         Ok(result)
+    }
+
+    fn execute_speculative_draft(&mut self, plan: DraftPlan<'_>) -> Result<DraftResult> {
+        self.execute_speculative_draft_impl(plan)
+    }
+
+    fn execute_speculative_verify(&mut self, plan: VerifyPlan<'_>) -> Result<VerifyResult> {
+        self.execute_speculative_verify_impl(plan)
+    }
+
+    fn speculative_enabled(&self) -> bool {
+        self.speculative.is_some()
+    }
+
+    fn speculative_request_ready(&self, request_id: RequestId) -> bool {
+        self.dflash_ready_requests.contains(&request_id)
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
@@ -2038,6 +2242,19 @@ impl Drop for Qwen3Executor {
     }
 }
 
+/// What the executor learns about the draft model after loading it on the
+/// worker: the draft block size (`K` candidates per round) and which target
+/// layers feed the draft (the worker captures these; kept for diagnostics).
+#[derive(Clone, Debug)]
+struct DFlashMeta {
+    block_size: usize,
+    /// Draft's max cacheable position; with the `block_size` in-fill headroom
+    /// this caps the DFlash-effective context to `max_position_embeddings - block_size`.
+    max_position_embeddings: usize,
+    #[allow(dead_code)]
+    target_layer_ids: Vec<usize>,
+}
+
 struct LocalQwen3Lane {
     model: Qwen3Model,
     kv_buffer: KvBuffer,
@@ -2046,6 +2263,16 @@ struct LocalQwen3Lane {
     sample_scratch: openinfer_sample::SampleScratch,
     /// In-flight prefill from a previous SplitConcurrent step (not yet synced).
     inflight_prefill: Option<InflightPrefillState>,
+    /// DFlash draft lane (the draft model + per-request draft state). `None`
+    /// unless speculative decoding is enabled; only the primary rank carries it.
+    dflash: Option<DFlashLaneState>,
+    /// Fixed, pre-allocated scratch for the DFlash verify forward. Lazily built
+    /// on the first verify step (its shape depends on the loaded draft model's
+    /// block size and the target's capture layers). Pointer-stable for the
+    /// upcoming verify CUDA Graph.
+    verify_bufs: Option<VerifyGraphBuffers>,
+    /// KV pool block count — the worst-case page-list bound for `verify_bufs`.
+    total_blocks: usize,
 }
 
 /// Stored state for an async prefill that was launched but not yet synced.
@@ -2101,7 +2328,34 @@ impl LocalQwen3Lane {
             bufs,
             sample_scratch,
             inflight_prefill: None,
+            dflash: None,
+            verify_bufs: None,
+            total_blocks,
         })
+    }
+
+    /// Load the DFlash draft model into this lane (primary rank only). The draft
+    /// model is built here on the worker thread because it reads the co-located
+    /// target model's embeddings and head.
+    fn load_dflash(&mut self, draft_path: &str) -> Result<DFlashMeta> {
+        let model = DFlashDraftModel::from_safetensors_for_target(
+            self.model.device_ctx(),
+            draft_path,
+            &self.model,
+        )?;
+        model.tune_gemm_algos(&self.model)?;
+        let meta = DFlashMeta {
+            block_size: model.block_size(),
+            max_position_embeddings: model.max_position_embeddings(),
+            target_layer_ids: model.target_layer_ids().to_vec(),
+        };
+        let max_decode_batch_size = *BATCH_BUCKETS.last().unwrap();
+        self.dflash = Some(DFlashLaneState::new(
+            self.model.device_ctx(),
+            model,
+            max_decode_batch_size,
+        )?);
+        Ok(meta)
     }
 
     fn bind(&self) -> Result<CublasThreadGuard> {
@@ -2142,7 +2396,12 @@ impl LocalQwen3Lane {
             false,
         )?;
 
-        Ok(PrefillResult { requests: results })
+        // Split-concurrent prefill never runs with DFlash (capture needs the
+        // synchronous result), so no context is captured here.
+        Ok(PrefillResult {
+            requests: results,
+            dflash_context_captured_requests: Vec::new(),
+        })
     }
 
     /// Pick one token per logits column (batched argmax for greedy rows,
@@ -2202,7 +2461,8 @@ impl LocalQwen3Lane {
         kv_views: &[KvView],
         lora_adapters: &[Option<&str>],
         echo: bool,
-    ) -> Result<(HiddenStates, Option<HiddenStates>)> {
+        capture_layer_ids: Option<&[usize]>,
+    ) -> Result<(HiddenStates, Option<HiddenStates>, Option<HiddenStates>)> {
         self.model.batch_prefill(
             prompts,
             kv_views,
@@ -2210,7 +2470,71 @@ impl LocalQwen3Lane {
             self.kv_buffer.buffer(),
             &self.layout,
             echo,
+            capture_layer_ids,
         )
+    }
+
+    /// DFlash verify forward over each request's `block_size`-token span, using
+    /// the fixed pre-allocated [`VerifyGraphBuffers`] (no per-step allocation).
+    /// Numerically equivalent to the `batch_prefill(echo=true)` verify path it
+    /// replaces; the buffers are lazily built on first use.
+    fn execute_dflash_verify(
+        &mut self,
+        requests: &[VerifyStepItem],
+        kv_views: &[KvView],
+    ) -> Result<VerifyResult> {
+        let capture_layer_ids = self.dflash_capture_layer_ids().ok_or_else(|| {
+            anyhow::anyhow!("DFlash verify requested but no draft model is loaded")
+        })?;
+        let block_size = self
+            .dflash
+            .as_ref()
+            .expect("DFlash present when capture layers exist")
+            .model
+            .block_size();
+
+        if self.verify_bufs.is_none() {
+            let max_batch = *BATCH_BUCKETS.last().unwrap();
+            self.verify_bufs = Some(VerifyGraphBuffers::new(
+                &self.model,
+                max_batch,
+                block_size,
+                capture_layer_ids.len(),
+                self.total_blocks,
+            )?);
+        }
+
+        // Take the buffers out of `self` so the forward (borrows `&self.model`,
+        // `&mut bufs`) and the subsequent sampling (`&mut self.sample_scratch`)
+        // and context record (`&mut self.dflash`) don't alias a `self` borrow.
+        let mut bufs = self.verify_bufs.take().expect("verify buffers just set");
+        let result = (|| -> Result<VerifyResult> {
+            let spans: Vec<&[u32]> = requests.iter().map(VerifyStepItem::as_slice).collect();
+            self.model.batch_prefill_into(
+                &spans,
+                kv_views,
+                self.kv_buffer.buffer(),
+                &self.layout,
+                &capture_layer_ids,
+                &mut bufs,
+            )?;
+
+            let total_tokens: usize = requests.iter().map(|req| req.as_slice().len()).sum();
+            let greedy = SamplingParams::default();
+            let params: Vec<&SamplingParams> = vec![&greedy; total_tokens];
+            let target_tokens = self.select_step_tokens(bufs.all_logits(), &params, 0)?;
+            let request_results = build_verify_results(requests, &target_tokens)?;
+            self.record_verify_dflash_context(
+                requests,
+                &request_results,
+                Some(bufs.captured_hidden()),
+            )?;
+            Ok(VerifyResult {
+                requests: request_results,
+            })
+        })();
+        self.verify_bufs = Some(bufs);
+        result
     }
 
     fn execute_decode(
@@ -2302,6 +2626,16 @@ enum StepCommand {
         decode_stream: crate::green_ctx::SendStream,
         sample_seed: u64,
     },
+    /// Speculative verify: one target forward over each request's `K + 1` draft
+    /// span (with a speculative KV view), capturing target hidden states for the
+    /// next draft round. Greedy argmax per position drives [`accept_greedy`].
+    SpeculativeVerify {
+        requests: Vec<VerifyStepItem>,
+        kv_views: Vec<KvView>,
+    },
+    /// Speculative draft: roll the DFlash draft model forward one block per
+    /// request. Uses the draft's own KV — no target KV views.
+    SpeculativeDraft { requests: Vec<DraftStepItem> },
 }
 
 impl StepCommand {
@@ -2311,6 +2645,8 @@ impl StepCommand {
             Self::Decode { .. } => "decode",
             Self::Unified { .. } => "unified",
             Self::SplitConcurrent { .. } => "split_concurrent",
+            Self::SpeculativeVerify { .. } => "speculative_verify",
+            Self::SpeculativeDraft { .. } => "speculative_draft",
         }
     }
 }
@@ -2340,6 +2676,18 @@ enum WorkerCommand {
     ResolvePrefill {
         resp: channel::Sender<Result<PrefillResult>>,
     },
+    /// Load the DFlash draft model into the primary lane (built on the worker
+    /// thread because it reads the co-located target model).
+    LoadDflash {
+        draft_path: String,
+        resp: channel::Sender<Result<DFlashMeta>>,
+    },
+    /// Drop a request's DFlash draft state (request retired, or it fell back to
+    /// a plain decode that advanced the sequence outside the speculative path).
+    DropDflash {
+        request_id: RequestId,
+        resp: channel::Sender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -2357,6 +2705,8 @@ enum WorkerStepOutcome {
         /// query this to check if prefill is done without blocking.
         prefill_event: SendEvent,
     },
+    SpeculativeVerify(VerifyResult),
+    SpeculativeDraft(DraftResult),
 }
 
 impl WorkerStepOutcome {
@@ -2367,6 +2717,8 @@ impl WorkerStepOutcome {
             Self::Decode(_) => "decode",
             Self::Unified(_) => "unified",
             Self::SplitDecodeReady { .. } => "split_decode_ready",
+            Self::SpeculativeVerify(_) => "speculative_verify",
+            Self::SpeculativeDraft(_) => "speculative_draft",
         }
     }
 }
@@ -2420,6 +2772,14 @@ impl RankWorker {
                                     let result = lane.resolve_inflight_prefill();
                                     let _ = resp.send(result);
                                 }
+                                WorkerCommand::LoadDflash { draft_path, resp } => {
+                                    let result = lane.load_dflash(&draft_path);
+                                    let _ = resp.send(result);
+                                }
+                                WorkerCommand::DropDflash { request_id, resp } => {
+                                    lane.drop_dflash_request(request_id);
+                                    let _ = resp.send(Ok(()));
+                                }
                                 WorkerCommand::Shutdown => break,
                             }
                         }
@@ -2462,6 +2822,35 @@ impl RankWorker {
             .send(WorkerCommand::ResolvePrefill { resp: resp_tx })
             .map_err(|_| anyhow::anyhow!("worker channel closed on resolve_prefill"))?;
         Ok(resp_rx)
+    }
+
+    /// Load the DFlash draft model into this worker's lane and return its
+    /// metadata. Blocks until the worker finishes loading.
+    fn load_dflash(&self, draft_path: String) -> Result<DFlashMeta> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::LoadDflash {
+                draft_path,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on load_dflash"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped load_dflash response"))?
+    }
+
+    /// Drop a request's DFlash state. Blocks until the worker acknowledges.
+    fn drop_dflash_request(&self, request_id: RequestId) -> Result<()> {
+        let (resp_tx, resp_rx) = channel::bounded(1);
+        self.tx
+            .send(WorkerCommand::DropDflash {
+                request_id,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("worker channel closed on drop_dflash"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("worker dropped drop_dflash response"))?
     }
 
     fn load_lora_adapter(
