@@ -24,13 +24,15 @@
 //! rank workers.
 
 use openinfer_core::engine::{FinishReason, GenerateRequest, TokenEvent, unix_now_s};
+use openinfer_sample::{SamplingParams, mix_seed};
 use tokio::sync::mpsc;
 
+use crate::config::GLM52_VOCAB;
 use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_greedy};
 use crate::model::{
     GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, GLM52_MLA_TOPK_SHORT, Glm52StepShape,
 };
-use crate::runner::{Glm52RankWorker, Glm52StepFlags};
+use crate::runner::{Glm52RankWorker, Glm52RowSample, Glm52StepFlags};
 
 /// What a rank forwards this step. Idle ranks feed the padding input; its
 /// KV/index-cache writes land in the idle rank's own dead cache slots and are
@@ -99,6 +101,11 @@ pub(crate) struct Glm52SlotState {
 /// the tail is simply not fed.
 const GLM52_DSPARK_SPAN_DRAFTS: usize = 3;
 
+/// Engine-level philox seed for unseeded non-greedy rows (the Kimi
+/// convention: unseeded requests need no replay guarantee, so a fixed engine
+/// seed suffices; per-request `seed` params replay through `mix_seed`).
+const GLM52_SAMPLE_SEED: u64 = 42;
+
 /// Accept histogram over a request's verify rounds (spans that actually fed
 /// drafts; bonus-only single-row spans don't count).
 #[derive(Debug, Default)]
@@ -163,6 +170,28 @@ impl Glm52SlotState {
                 token,
                 position: self.prompt.len() + self.completion - 1 + offset,
             }
+        }
+    }
+
+    /// The span row whose output `advance_span` will commit, for the sampler
+    /// to overwrite: the prompt-completing span's last row (its output is the
+    /// first generated token) or the plain decode row. `None` while the span
+    /// is still mid-prompt (outputs discarded). Only meaningful for
+    /// non-greedy requests, which never carry drafts (DSpark verify is
+    /// greedy-only), so a decode span is always the single anchor row.
+    pub(crate) fn sampling_row(&self, span_rows: usize) -> Option<usize> {
+        debug_assert!(span_rows > 0);
+        if self.fed < self.prompt.len() {
+            (self.fed + span_rows == self.prompt.len()).then(|| span_rows - 1)
+        } else {
+            // Sampling a verify span would feed a sampled token into
+            // `accept_greedy` — whoever lifts the DSpark greedy-only gate
+            // must build rejection sampling first, not trip this in release.
+            assert!(
+                self.drafts.is_empty(),
+                "sampling a DSpark verify span is unsupported (greedy-only gate breached)"
+            );
+            Some(0)
         }
     }
 
@@ -272,7 +301,11 @@ impl SpecStats {
     }
 }
 
-pub(crate) fn validate_request(req: &GenerateRequest, max_model_len: usize) -> Result<(), String> {
+pub(crate) fn validate_request(
+    req: &GenerateRequest,
+    max_model_len: usize,
+    dspark_enabled: bool,
+) -> Result<(), String> {
     if req.prompt_tokens.is_empty() {
         return Err("GLM5.2 requires a non-empty prompt".to_owned());
     }
@@ -290,8 +323,39 @@ pub(crate) fn validate_request(req: &GenerateRequest, max_model_len: usize) -> R
             req.max_tokens
         ));
     }
+    // Plain decode samples per-row; the DSpark verify span is greedy-only
+    // ([`accept_greedy`] compares the target's argmax against the drafts —
+    // rejection sampling is future work).
+    if dspark_enabled && !req.params.is_greedy() {
+        return Err(
+            "GLM5.2 with the DSpark drafter supports greedy sampling only (temperature 0)"
+                .to_owned(),
+        );
+    }
+    // Mirror the sampler kernel's parameter ensures HERE: past intake a bad
+    // value only surfaces as a failed step, and a failed step tears the whole
+    // EP8 engine down (`fail_step`) — user input must be rejected at the
+    // door, never inside a collective.
     if !req.params.is_greedy() {
-        return Err("GLM5.2 bring-up supports greedy sampling only (temperature 0)".to_owned());
+        let p = &req.params;
+        if !p.temperature.is_finite() {
+            return Err(format!(
+                "GLM5.2 sampling requires a finite temperature, got {}",
+                p.temperature
+            ));
+        }
+        if !(p.top_p > 0.0 && p.top_p <= 1.0) {
+            return Err(format!(
+                "GLM5.2 sampling requires top_p in (0, 1], got {}",
+                p.top_p
+            ));
+        }
+        if !(p.min_p.is_finite() && (0.0..1.0).contains(&p.min_p)) {
+            return Err(format!(
+                "GLM5.2 sampling requires min_p in [0, 1), got {}",
+                p.min_p
+            ));
+        }
     }
     if req.logprobs > 0 || req.echo {
         return Err("GLM5.2 bring-up does not support logprobs/echo".to_owned());
@@ -409,10 +473,11 @@ fn plan_step_shapes(wants: &[[usize; GLM52_MAX_BATCH_PER_RANK]]) -> Vec<Glm52Ste
 /// `consume`: this step IS the speculation every rank enqueued (same shapes
 /// AND no slot changed hands — a finish + admission can reuse a slot id
 /// under an identical-looking shape). `lease`: every rank must enqueue the
-/// next step speculatively — pure single-token decode everywhere with
-/// model-length headroom, nothing queued, no draft round. Both are global
-/// claims: a speculative replay is a full set of collectives, so per-rank
-/// discretion would desync the pairing.
+/// next step speculatively — pure single-token GREEDY decode everywhere (the
+/// speculation feeds each row's argmax token, so a sampled row would replay
+/// the wrong input) with model-length headroom, nothing queued, no draft
+/// round. Both are global claims: a speculative replay is a full set of
+/// collectives, so per-rank discretion would desync the pairing.
 fn launch_ahead_flags(
     shapes: &[Glm52StepShape],
     leased_shapes: Option<&[Glm52StepShape]>,
@@ -429,10 +494,50 @@ fn launch_ahead_flags(
             .iter()
             .flat_map(|rank_slots| rank_slots.iter().flatten())
             .all(|active| {
-                active.state.feed_want() == 1
+                takes_argmax(&active.req.params)
+                    && active.state.feed_want() == 1
                     && active.state.next_input_at(0).position + 1 < max_model_len
             });
     Glm52StepFlags { consume, lease }
+}
+
+/// Whether a request's committed rows take the fused argmax — the shared
+/// effectively-greedy predicate over the GLM vocab (a `top_p <= 1/vocab`
+/// nucleus holds only the argmax token; routing it to the sampler would make
+/// bf16-tied maxima stochastic, diverging from `select_batch`'s semantics).
+/// The SAME predicate gates lease-granting and sampling-row collection, which
+/// is what keeps "sampled row never rides a launch-ahead step" structural.
+fn takes_argmax(params: &SamplingParams) -> bool {
+    openinfer_sample::effectively_greedy(params, GLM52_VOCAB)
+}
+
+/// The step rows a rank samples instead of argmaxes: walk the shape's
+/// contiguous per-slot runs and mark each non-greedy slot's committed row
+/// (see [`Glm52SlotState::sampling_row`]) with its request params and
+/// request-local decode step. Rows come out strictly ascending — the runs
+/// are disjoint and walked in order — which `sample_rows_into` re-checks.
+fn collect_sampling_rows(shape: &Glm52StepShape, rank_slots: &RankSlots) -> Vec<Glm52RowSample> {
+    let mut sampling = Vec::new();
+    let mut row = 0usize;
+    while row < shape.bucket {
+        let slot = shape.slots[row] as usize;
+        let mut end = row + 1;
+        while end < shape.bucket && shape.slots[end] as usize == slot {
+            end += 1;
+        }
+        if let Some(active) = &rank_slots[slot]
+            && !takes_argmax(&active.req.params)
+            && let Some(offset) = active.state.sampling_row(end - row)
+        {
+            sampling.push(Glm52RowSample {
+                row: row + offset,
+                params: active.req.params,
+                step: active.state.completion_tokens() as u64,
+            });
+        }
+        row = end;
+    }
+    sampling
 }
 
 fn feed_wants(slots: &[RankSlots]) -> Vec<[usize; GLM52_MAX_BATCH_PER_RANK]> {
@@ -508,7 +613,9 @@ pub(crate) fn run_dp8_coordinator(
             }
             let responses = match workers
                 .iter()
-                .map(|worker| worker.step_async(inputs, shape, Glm52StepFlags::plain()))
+                .map(|worker| {
+                    worker.step_async(inputs, shape, Glm52StepFlags::plain(), Vec::new(), 0)
+                })
                 .collect::<anyhow::Result<Vec<_>>>()
             {
                 Ok(responses) => responses,
@@ -543,18 +650,22 @@ pub(crate) fn run_dp8_coordinator(
     // so the decision lives here, on global data, not on the ranks).
     let mut leased_shapes: Option<Vec<Glm52StepShape>> = None;
     let mut slots_changed = false;
+    // Global step counter driving the non-greedy rows' philox seeds: a fresh
+    // well-mixed seed per (step, rank), so no two ranks — whose row indices
+    // collide — ever share a philox stream.
+    let mut sample_step: u64 = 0;
 
     'serve: loop {
         // Intake: block when fully idle, otherwise drain what's queued.
         if channel_open && all_idle(&slots) && pending.is_empty() {
             match submit_rx.blocking_recv() {
-                Some(req) => intake(req, &mut pending, max_model_len),
+                Some(req) => intake(req, &mut pending, max_model_len, dspark_enabled),
                 None => channel_open = false,
             }
         }
         while channel_open {
             match submit_rx.try_recv() {
-                Ok(req) => intake(req, &mut pending, max_model_len),
+                Ok(req) => intake(req, &mut pending, max_model_len, dspark_enabled),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
@@ -614,11 +725,13 @@ pub(crate) fn run_dp8_coordinator(
         );
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
+        sample_step += 1;
         let responses = slots
             .iter()
             .zip(&workers)
             .zip(&shapes)
-            .map(|((rank_slots, worker), shape)| {
+            .enumerate()
+            .map(|(rank, ((rank_slots, worker), shape))| {
                 let mut inputs = [(GLM52_PADDING_STEP.token, GLM52_PADDING_STEP.position);
                     GLM52_MAX_BATCH_PER_RANK];
                 // Row r is offset `span_offset[slot]` into its slot's span —
@@ -632,7 +745,9 @@ pub(crate) fn run_dp8_coordinator(
                         *input = (step.token, step.position);
                     }
                 }
-                worker.step_async(inputs, *shape, flags)
+                let sampling = collect_sampling_rows(shape, rank_slots);
+                let seed = mix_seed(mix_seed(GLM52_SAMPLE_SEED, sample_step), rank as u64);
+                worker.step_async(inputs, *shape, flags, sampling, seed)
             })
             .collect::<anyhow::Result<Vec<_>>>();
         let responses = match responses {
@@ -843,8 +958,9 @@ fn intake(
     req: GenerateRequest,
     pending: &mut std::collections::VecDeque<GenerateRequest>,
     max_model_len: usize,
+    dspark_enabled: bool,
 ) {
-    if let Err(message) = validate_request(&req, max_model_len) {
+    if let Err(message) = validate_request(&req, max_model_len, dspark_enabled) {
         let prompt_tokens = req.prompt_tokens.len();
         let queued_at_unix_s = req.queued_at_unix_s.unwrap_or_else(unix_now_s);
         let _ = req.token_tx.send(TokenEvent::Scheduled {
@@ -931,6 +1047,55 @@ mod launch_ahead_flag_tests {
         let shapes = vec![shape(1, 1)];
         let flags = launch_ahead_flags(&shapes, None, false, false, false, &[], 4096);
         assert!(!flags.lease && !flags.consume);
+    }
+
+    /// One rank holding a single decoding request with the given params (its
+    /// prompt token is already fed, so `feed_want() == 1`).
+    fn decoding_fleet(params: openinfer_sample::SamplingParams) -> Vec<RankSlots> {
+        let (token_tx, _token_rx) = openinfer_core::engine::TokenSink::standalone();
+        let req = GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens: vec![10],
+            params,
+            max_tokens: 8,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        };
+        let mut state = Glm52SlotState::new(req.prompt_tokens.clone(), req.max_tokens, false);
+        assert!(matches!(
+            state.advance_span(&[20], &[]),
+            Glm52StepOutcome::Commit { .. }
+        ));
+        let mut slots: RankSlots = std::array::from_fn(|_| None);
+        slots[0] = Some(ActiveRequest { req, state });
+        vec![slots]
+    }
+
+    #[test]
+    fn non_greedy_request_blocks_the_lease() {
+        // The speculation feeds each row's argmax token; a sampled row would
+        // replay the wrong input, so any non-greedy active blocks the lease.
+        let shapes = vec![shape(1, 1)];
+        let greedy = decoding_fleet(openinfer_sample::SamplingParams::default());
+        assert!(launch_ahead_flags(&shapes, None, false, true, false, &greedy, 4096).lease);
+
+        let sampled = decoding_fleet(openinfer_sample::SamplingParams {
+            temperature: 0.7,
+            ..Default::default()
+        });
+        assert!(!launch_ahead_flags(&shapes, None, false, true, false, &sampled, 4096).lease);
+
+        // An effectively-greedy request (top_p nucleus <= 1/vocab holds only
+        // the argmax token) takes the argmax path, so it may ride the lease.
+        let tiny_top_p = decoding_fleet(openinfer_sample::SamplingParams {
+            temperature: 0.7,
+            top_p: 0.5 / GLM52_VOCAB as f32,
+            ..Default::default()
+        });
+        assert!(launch_ahead_flags(&shapes, None, false, true, false, &tiny_top_p, 4096).lease);
     }
 }
 
@@ -1207,6 +1372,187 @@ mod tests {
         assert!(state.wants_drafts());
         assert_eq!(state.advance_span(&[21], EOS), commit(&[21], None, 1));
         assert!(!state.wants_drafts(), "one-token tail is a plain row");
+    }
+
+    #[test]
+    fn sampling_row_is_the_committed_row_of_the_span() {
+        let mut state = Glm52SlotState::new(vec![10, 11, 12], 4, false);
+        // Mid-prompt span: outputs discarded, nothing to sample.
+        assert_eq!(state.sampling_row(2), None);
+        // Prompt-completing span: the last row's output is the first
+        // generated token.
+        assert_eq!(state.sampling_row(3), Some(2));
+        assert_eq!(
+            state.advance_span(&[99, 98, 42], EOS),
+            commit(&[42], None, 3)
+        );
+        // Plain decode: the single anchor row.
+        assert_eq!(state.sampling_row(1), Some(0));
+    }
+
+    fn request(
+        prompt: Vec<u32>,
+        params: openinfer_sample::SamplingParams,
+        max_tokens: usize,
+    ) -> GenerateRequest {
+        let (token_tx, _token_rx) = openinfer_core::engine::TokenSink::standalone();
+        GenerateRequest {
+            request_id: None,
+            queued_at_unix_s: None,
+            prompt_tokens: prompt,
+            params,
+            max_tokens,
+            lora_adapter: None,
+            token_tx,
+            logprobs: 0,
+            echo: false,
+        }
+    }
+
+    fn sampled(temperature: f32) -> openinfer_sample::SamplingParams {
+        openinfer_sample::SamplingParams {
+            temperature,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn non_greedy_is_rejected_only_with_the_drafter() {
+        let req = request(vec![10], sampled(0.7), 4);
+        assert!(validate_request(&req, 4096, false).is_ok());
+        assert!(validate_request(&req, 4096, true).is_err());
+    }
+
+    #[test]
+    fn malformed_sampling_params_die_at_intake() {
+        // Values the sampler kernel would reject with an `ensure!` — which
+        // past intake means a failed step and a whole-engine teardown.
+        let cases = [
+            openinfer_sample::SamplingParams {
+                top_p: 0.0,
+                ..sampled(0.8)
+            },
+            openinfer_sample::SamplingParams {
+                top_p: 1.5,
+                ..sampled(0.8)
+            },
+            openinfer_sample::SamplingParams {
+                top_p: f32::NAN,
+                ..sampled(0.8)
+            },
+            sampled(f32::INFINITY),
+            sampled(f32::NAN),
+            openinfer_sample::SamplingParams {
+                min_p: 1.0,
+                ..sampled(0.8)
+            },
+            openinfer_sample::SamplingParams {
+                min_p: -0.1,
+                ..sampled(0.8)
+            },
+        ];
+        for params in cases {
+            let req = request(vec![10], params, 4);
+            assert!(
+                validate_request(&req, 4096, false).is_err(),
+                "params must be rejected at intake: {params:?}"
+            );
+        }
+        // The greedy path never reaches the sampler: out-of-range values that
+        // ride a greedy request stay accepted (temperature 0 ignores top_p).
+        let req = request(
+            vec![10],
+            openinfer_sample::SamplingParams {
+                top_p: 0.0,
+                ..Default::default()
+            },
+            4,
+        );
+        assert!(validate_request(&req, 4096, false).is_ok());
+    }
+
+    #[test]
+    fn collect_sampling_rows_marks_each_spans_committed_row() {
+        // Bucket 8: slot 0 decodes (non-greedy), slot 1 finishes its prompt
+        // with a 3-row span (non-greedy), slot 3 is mid-prompt (non-greedy,
+        // span does NOT complete), slot 2 decodes greedily, slots 4-5 pad.
+        let shape = Glm52StepShape {
+            bucket: 8,
+            slots: [0, 1, 1, 1, 3, 2, 4, 5],
+            active_rows: 6,
+        };
+        let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
+
+        let mut decode_state = Glm52SlotState::new(vec![10], 8, false);
+        assert_eq!(
+            decode_state.advance_span(&[20], EOS),
+            commit(&[20], None, 1)
+        );
+        rank_slots[0] = Some(ActiveRequest {
+            req: request(vec![10], sampled(0.8), 8),
+            state: decode_state,
+        });
+
+        let mut boundary_state = Glm52SlotState::new(vec![10, 11, 12, 13, 14], 8, false);
+        assert_eq!(
+            boundary_state.advance_span(&[99, 98], EOS),
+            Glm52StepOutcome::Prefilling
+        );
+        rank_slots[1] = Some(ActiveRequest {
+            req: request(vec![10, 11, 12, 13, 14], sampled(0.8), 8),
+            state: boundary_state,
+        });
+
+        let mut greedy_state = Glm52SlotState::new(vec![10], 8, false);
+        assert_eq!(
+            greedy_state.advance_span(&[20], EOS),
+            commit(&[20], None, 1)
+        );
+        rank_slots[2] = Some(ActiveRequest {
+            req: request(vec![10], openinfer_sample::SamplingParams::default(), 8),
+            state: greedy_state,
+        });
+
+        rank_slots[3] = Some(ActiveRequest {
+            req: request(vec![30; 10], sampled(0.8), 8),
+            state: Glm52SlotState::new(vec![30; 10], 8, false),
+        });
+
+        let rows = collect_sampling_rows(&shape, &rank_slots);
+        let picked: Vec<(usize, u64)> = rows.iter().map(|s| (s.row, s.step)).collect();
+        // Slot 0's decode row is step row 0 (one committed token so far →
+        // request-local step 1); slot 1's boundary span commits its LAST row
+        // (row 1 + offset 2 = 3, first generated token → step 0). Slot 3's
+        // mid-prompt span and slot 2's greedy row contribute nothing.
+        assert_eq!(picked, vec![(0, 1), (3, 0)]);
+    }
+
+    #[test]
+    fn effectively_greedy_rows_take_the_argmax_path() {
+        // temperature > 0 but the top_p nucleus (<= 1/vocab) holds only the
+        // argmax token: the row must NOT be collected for the sampler — the
+        // FlashInfer pass could pick a different bf16-tied maximum, whereas
+        // `select_batch` pins this case to the deterministic argmax.
+        let shape = Glm52StepShape {
+            bucket: 1,
+            slots: [0; GLM52_MAX_BATCH_PER_RANK],
+            active_rows: 1,
+        };
+        let mut rank_slots: RankSlots = std::array::from_fn(|_| None);
+        let mut state = Glm52SlotState::new(vec![10], 8, false);
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], None, 1));
+        rank_slots[0] = Some(ActiveRequest {
+            req: request(
+                vec![10],
+                openinfer_sample::SamplingParams {
+                    top_p: 0.5 / GLM52_VOCAB as f32,
+                    ..sampled(0.8)
+                },
+                8,
+            ),
+            state,
+        });
+        assert!(collect_sampling_rows(&shape, &rank_slots).is_empty());
     }
 
     #[test]
