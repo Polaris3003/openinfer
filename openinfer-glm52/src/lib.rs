@@ -22,6 +22,7 @@ mod mla_decode;
 mod model;
 mod moe_decode;
 mod moe_ep8;
+mod moe_tp8;
 #[cfg(test)]
 mod oracle;
 mod rows;
@@ -77,6 +78,42 @@ pub struct Glm52LaunchOptions {
     /// Requires the prefix cache (rejected at launch alongside the DSpark
     /// drafter or `no_prefix_cache`).
     pub kv_offload: Option<Glm52KvOffloadOptions>,
+    /// TP8 low-latency MoE pilot: the first N MoE layers additionally load a
+    /// 1/8-intermediate slice of ALL experts per rank and run bucket-1 decode
+    /// through the phase-kernel chain (larger buckets keep the EP8
+    /// dispatch/combine chain — both banks stay resident). 0 = off. Only
+    /// meaningful under the EP8 topology (rejected with `MoeTopo::Tp8`).
+    pub moe_tp8_pilot_layers: usize,
+    /// Launch-time MoE sharding topology. `Ep8` (default) is the
+    /// high-throughput configuration: 32 whole experts per rank, DeepEP
+    /// dispatch/combine, buckets 1-8. `Tp8` is the low-latency
+    /// configuration: every rank holds a 1/8-intermediate slice of ALL
+    /// experts on every MoE layer, decode runs bucket-1 only (at most one
+    /// request per rank, prefill advances one token per step), and the MoE
+    /// path is the TP8 phase-kernel chain on all 75 layers.
+    pub moe_topo: Glm52MoeTopo,
+}
+
+/// Launch-time MoE sharding topology (the expert slab is repacked during
+/// H2D load, so this is a boot choice — the two layouts never co-reside
+/// except in the pilot).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Glm52MoeTopo {
+    #[default]
+    Ep8,
+    Tp8,
+}
+
+impl std::str::FromStr for Glm52MoeTopo {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "ep8" => Ok(Self::Ep8),
+            "tp8" => Ok(Self::Tp8),
+            other => anyhow::bail!("GLM5.2 MoE topology must be ep8 or tp8, got {other}"),
+        }
+    }
 }
 
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
@@ -103,6 +140,8 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         max_model_len,
         no_prefix_cache,
         kv_offload,
+        moe_tp8_pilot_layers,
+        moe_topo,
     } = options;
     ensure!(tp_size == 1, "GLM5.2 requires --tp-size=1, got {tp_size}");
     ensure!(
@@ -118,6 +157,16 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-offload requires the prefix cache: drop --no-prefix-cache and the \
          DSpark drafter (speculative decoding and prefix caching are mutually exclusive)"
     );
+    ensure!(
+        moe_topo == Glm52MoeTopo::Ep8 || moe_tp8_pilot_layers == 0,
+        "GLM5.2 --moe-tp8-pilot-layers is the EP8-topology dual-resident pilot; \
+         under --moe-topo tp8 every MoE layer is already TP8-sharded"
+    );
+    ensure!(
+        moe_topo == Glm52MoeTopo::Ep8 || dspark_draft_model_path.is_none(),
+        "GLM5.2 --moe-topo tp8 does not support the DSpark drafter yet (draft \
+         verify spans need buckets > 1)"
+    );
     start_engine(
         model_path,
         &Glm52LoadOptions {
@@ -130,6 +179,8 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         max_model_len,
         no_prefix_cache,
         kv_offload,
+        moe_tp8_pilot_layers,
+        moe_topo,
     )
 }
 
@@ -298,9 +349,11 @@ fn start_engine(
     requested_max_model_len: Option<usize>,
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
+    moe_tp8_pilot_layers: usize,
+    moe_topo: Glm52MoeTopo,
 ) -> Result<EngineHandle> {
-    let startup = validate_startup(model_path, options)?;
-    let loaded = load_rank_weights_to_gpu(model_path, &startup)?;
+    let startup = validate_startup(model_path, options, moe_topo)?;
+    let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_tp8_pilot_layers, moe_topo)?;
     log::info!(
         "GLM5.2 load-weight startup complete: ranks={}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}",
         startup.device_ordinals.len(),
@@ -343,14 +396,29 @@ fn start_engine(
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
-    let rank_arenas = build_rank_models(&loaded.workers, max_model_len)?;
-    // From here the DeepEP contexts exist and their destruction is COLLECTIVE:
-    // a startup failure must broadcast Shutdown to every rank BEFORE the
-    // workers' sequential Drop joins them one by one (the same teardown
-    // contract as the coordinator exit) — otherwise the first dropped worker
-    // blocks in the destroy barrier waiting for ranks that were never told to
-    // shut down, and the launch error surfaces only after the ~100 s DeepEP
-    // device timeout.
+    // build_rank_models sends SetupComm, so from inside it the DeepEP
+    // contexts exist and their destruction is COLLECTIVE: any startup failure
+    // from here on must broadcast Shutdown to every rank BEFORE the workers'
+    // sequential Drop joins them one by one (the same teardown contract as
+    // the coordinator exit) — otherwise the first dropped worker blocks in
+    // the destroy barrier waiting for ranks that were never told to shut
+    // down, and the launch error surfaces only after the ~100 s DeepEP
+    // device timeout. The TP8 LL rendezvous rejecting a topology (poison
+    // pill, NVLink probe) is a real failure landing exactly in this window.
+    let rank_arenas = match build_rank_models(
+        &loaded.workers,
+        max_model_len,
+        moe_topo,
+        moe_tp8_pilot_layers > 0 || moe_topo == Glm52MoeTopo::Tp8,
+    ) {
+        Ok(rank_arenas) => rank_arenas,
+        Err(err) => {
+            for worker in &loaded.workers {
+                let _ = worker.request_shutdown();
+            }
+            return Err(err);
+        }
+    };
     let post_comm_startup = || -> Result<(bool, Option<Vec<OffloadEngine>>)> {
         let dspark_enabled = if let Some(dspark_path) = dspark_path {
             load_dspark_drafters(&loaded.workers, dspark_path)?;
@@ -373,6 +441,13 @@ fn start_engine(
             return Err(err);
         }
     };
+    // TP8 topology is a bucket-1 low-latency configuration: every MoE layer's
+    // TP8 forward asserts batch==1, so the scheduler must never plan a larger
+    // bucket (and admission caps the fleet at 1 request per rank).
+    let max_rows_per_rank = match moe_topo {
+        Glm52MoeTopo::Tp8 => 1,
+        Glm52MoeTopo::Ep8 => model::GLM52_MAX_BATCH_PER_RANK,
+    };
     let (submit_tx, submit_rx) = mpsc::unbounded_channel();
     let coord_handle = std::thread::Builder::new()
         .name("glm52-coord".into())
@@ -385,6 +460,7 @@ fn start_engine(
                 max_model_len,
                 no_prefix_cache,
                 offload,
+                max_rows_per_rank,
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to spawn GLM5.2 coordinator: {err}"))?;
@@ -457,11 +533,13 @@ fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
 fn build_rank_models(
     workers: &[Glm52RankWorker],
     max_model_len: usize,
+    moe_topo: Glm52MoeTopo,
+    tp8_active: bool,
 ) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
-        .map(|worker| worker.build_model_async(max_model_len))
+        .map(|worker| worker.build_model_async(max_model_len, moe_topo))
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {
@@ -473,9 +551,11 @@ fn build_rank_models(
     }
 
     let unique_id = openinfer_kernels::ops::glm52_deepep_unique_id()?;
+    let tp8_exchange =
+        tp8_active.then(|| std::sync::Arc::new(crate::moe_tp8::Glm52Tp8Exchange::new()));
     let responses = workers
         .iter()
-        .map(|worker| worker.setup_comm_async(unique_id))
+        .map(|worker| worker.setup_comm_async(unique_id, tp8_exchange.clone()))
         .collect::<Result<Vec<_>>>()?;
     for (rank, response) in responses.into_iter().enumerate() {
         response
@@ -570,7 +650,11 @@ fn read_eos_token_ids(model_path: &Path) -> Result<Vec<u32>> {
     Ok(ids)
 }
 
-fn validate_startup(model_path: &Path, options: &Glm52LoadOptions) -> Result<StartupValidation> {
+fn validate_startup(
+    model_path: &Path,
+    options: &Glm52LoadOptions,
+    moe_topo: Glm52MoeTopo,
+) -> Result<StartupValidation> {
     let config_path = model_path.join("config.json");
     let content = std::fs::read_to_string(&config_path)
         .map_err(|err| anyhow::anyhow!("read {}: {err}", config_path.display()))?;
@@ -604,7 +688,7 @@ fn validate_startup(model_path: &Path, options: &Glm52LoadOptions) -> Result<Sta
     );
 
     let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
-    let rank_bundles = manifest.all_rank_load_bundles()?;
+    let rank_bundles = manifest.all_rank_load_bundles(moe_topo == Glm52MoeTopo::Ep8)?;
     let mut rank_tensor_counts = Vec::with_capacity(rank_bundles.len());
     let mut rank_expert_ranges = Vec::with_capacity(rank_bundles.len());
     for bundle in &rank_bundles {
@@ -635,6 +719,8 @@ fn validate_startup(model_path: &Path, options: &Glm52LoadOptions) -> Result<Sta
 fn load_rank_weights_to_gpu(
     model_path: &Path,
     startup: &StartupValidation,
+    tp8_pilot_layers: usize,
+    moe_topo: Glm52MoeTopo,
 ) -> Result<LoadedGlm52Runtime> {
     let spawn_started = Instant::now();
     log::info!(
@@ -660,7 +746,7 @@ fn load_rank_weights_to_gpu(
     );
     let load_results = workers
         .iter()
-        .map(|worker| worker.load_weights_async(model_path))
+        .map(|worker| worker.load_weights_async(model_path, tp8_pilot_layers, moe_topo))
         .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(load_results.len());
     for (rank, rx) in load_results.into_iter().enumerate() {
