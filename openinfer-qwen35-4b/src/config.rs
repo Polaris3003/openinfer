@@ -232,8 +232,7 @@ mod tests {
 
     #[test]
     fn guard_accepts_48_value_heads() {
-        let dir = std::env::temp_dir().join(format!("qwen35-config-guard-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let json = r#"{
   "max_position_embeddings": 4096,
   "tie_word_embeddings": true,
@@ -256,7 +255,7 @@ mod tests {
     "eos_token_id": 0
   }
 }"#;
-        std::fs::write(dir.join("config.json"), json).unwrap();
-        Config35::from_file(dir.to_str().unwrap()).expect("48 value heads must load");
+        std::fs::write(dir.path().join("config.json"), json).unwrap();
+        Config35::from_file(dir.path().to_str().unwrap()).expect("48 value heads must load");
     }
 }
