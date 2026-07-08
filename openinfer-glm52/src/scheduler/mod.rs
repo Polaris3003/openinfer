@@ -128,8 +128,25 @@ pub(crate) fn run_dp8_coordinator(
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
-    max_rows_per_rank: usize,
+    moe_topo: crate::Glm52MoeTopo,
 ) {
+    // TP8 is the low-latency configuration: fleet concurrency is one slot
+    // per rank at bucket-1 — EXCEPT when the fleet holds exactly one active
+    // request, which may take the whole bucket-8 span shape (prefill spans
+    // and speculative verify rounds; all 8 rows on the owning rank through
+    // the span MoE mapping).
+    let (max_rows_per_rank, tp8_solo_span) = match moe_topo {
+        crate::Glm52MoeTopo::Ep8 => (GLM52_MAX_BATCH_PER_RANK, false),
+        crate::Glm52MoeTopo::Tp8 => (1, true),
+    };
+    // Verify-span draft budget: EP8 feeds 3 (the measured bucket-4 optimum);
+    // the tp8 span shape computes 8 rows at bucket-1 MoE cost, so it feeds
+    // the drafter's full proposal.
+    let span_drafts = if tp8_solo_span {
+        crate::dspark::GLM52_DSPARK_DRAFTS
+    } else {
+        slot::GLM52_DSPARK_EP8_SPAN_DRAFTS
+    };
     let offload: Option<Vec<offload::RankOffload>> =
         offload.map(|engines| engines.into_iter().map(offload::RankOffload::new).collect());
     // One KV page pool per rank: pool block ids index the rank's per-layer
@@ -184,7 +201,13 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, max_rows_per_rank) {
+    if let Err(err) = precapture_step_graphs(
+        &workers,
+        &pools,
+        table_width,
+        max_rows_per_rank,
+        tp8_solo_span,
+    ) {
         log::error!("GLM5.2 graph pre-capture failed: {err:#}");
         for worker in &workers {
             let _ = worker.request_shutdown();
@@ -248,8 +271,8 @@ pub(crate) fn run_dp8_coordinator(
         // active slot's span of consecutive next tokens, padding rows on the
         // free slots — and all responses are joined before any output is
         // interpreted.
-        let shapes = plan_step_shapes(&feed_wants(&slots), max_rows_per_rank);
-        let flags = launch_ahead_flags(
+        let shapes = plan_step_shapes(&feed_wants(&slots), max_rows_per_rank, tp8_solo_span);
+        let mut flags = launch_ahead_flags(
             &shapes,
             leased_shapes.as_deref(),
             slots_changed,
@@ -259,6 +282,15 @@ pub(crate) fn run_dp8_coordinator(
             &slots,
             max_model_len,
         );
+        if tp8_solo_span && shapes[0].bucket == GLM52_MAX_BATCH_PER_RANK {
+            // The span shape only ever plans with exactly one active rank
+            // (see plan_step_shapes); every rank stages the same owner.
+            let owner = shapes
+                .iter()
+                .position(|shape| shape.active_rows > 0)
+                .expect("a span step has exactly one active rank");
+            flags.tp8_span_owner = Some(owner as u8);
+        }
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
         sample_step += 1;
@@ -279,7 +311,7 @@ pub(crate) fn run_dp8_coordinator(
             }
         };
 
-        let (rank_appends, rank_proposals) = match apply_step_outputs(
+        let (rank_appends, mut rank_proposals) = match apply_step_outputs(
             &mut slots,
             outputs,
             &shapes,
@@ -297,6 +329,22 @@ pub(crate) fn run_dp8_coordinator(
                 break 'serve;
             }
         };
+        // TP8 clamps a concurrent fleet to bucket-1, where a verify span can
+        // never be fed — drafting there burns a drafter forward every step
+        // for zero accepted tokens. Suppress the proposals (appends and
+        // resets still flow, so the drafter's shadow KV stays fresh and
+        // proposals resume the round after the fleet drains back to solo).
+        if tp8_solo_span
+            && slots
+                .iter()
+                .flat_map(|rank_slots| rank_slots.iter().flatten())
+                .count()
+                != 1
+        {
+            for proposals in &mut rank_proposals {
+                proposals.clear();
+            }
+        }
 
         if dspark_enabled
             && let Err(err) = run_draft_round(
@@ -306,6 +354,7 @@ pub(crate) fn run_dp8_coordinator(
                 &mut pending_resets,
                 rank_appends,
                 rank_proposals,
+                span_drafts,
             )
         {
             fail_step(&mut slots, &err);
@@ -355,10 +404,17 @@ fn precapture_step_graphs(
     pools: &[BlockPool],
     table_width: usize,
     max_rows_per_rank: usize,
+    tp8_solo_span: bool,
 ) -> anyhow::Result<()> {
+    // tp8 serves exactly two shapes: bucket-1 dp8 and the bucket-8 span
+    // (which needs a staged owner even for the warm capture run — rank 0's
+    // pad rows play the owner, every rank spins on real cross-rank packets).
+    let capture_bucket = |bucket: usize| {
+        bucket <= max_rows_per_rank || (tp8_solo_span && bucket == GLM52_MAX_BATCH_PER_RANK)
+    };
     for &bucket in GLM52_DECODE_BUCKETS
         .iter()
-        .filter(|&&bucket| bucket <= max_rows_per_rank)
+        .filter(|&&bucket| capture_bucket(bucket))
     {
         for full_tier in [false, true] {
             let mut shape = Glm52StepShape {
@@ -374,12 +430,16 @@ fn precapture_step_graphs(
             if full_tier {
                 inputs[0] = (GLM52_PADDING_STEP.token, GLM52_MLA_TOPK_SHORT);
             }
+            let mut flags = Glm52StepFlags::plain();
+            if tp8_solo_span && bucket == GLM52_MAX_BATCH_PER_RANK {
+                flags.tp8_span_owner = Some(0);
+            }
             let responses = workers
                 .iter()
                 .zip(pools)
                 .map(|(worker, pool)| {
                     let kv = padding_step_kv(bucket, table_width, pool.padding_block_id(), &inputs);
-                    worker.step_async(inputs, shape, kv, Glm52StepFlags::plain(), Vec::new(), 0)
+                    worker.step_async(inputs, shape, kv, flags, Vec::new(), 0)
                 })
                 .collect::<anyhow::Result<Vec<_>>>()
                 .context("GLM5.2 graph pre-capture submit")?;
@@ -400,7 +460,7 @@ fn precapture_step_graphs(
         "GLM5.2 whole-step graphs pre-captured: {} buckets x 2 tiers",
         GLM52_DECODE_BUCKETS
             .iter()
-            .filter(|&&bucket| bucket <= max_rows_per_rank)
+            .filter(|&&bucket| capture_bucket(bucket))
             .count()
     );
     Ok(())
@@ -838,6 +898,7 @@ fn run_draft_round(
     pending_resets: &mut [Vec<usize>],
     rank_appends: Vec<Vec<(usize, usize)>>,
     rank_proposals: Vec<Vec<(usize, u32, usize)>>,
+    span_drafts: usize,
 ) -> anyhow::Result<()> {
     let mut draft_joins = Vec::new();
     for (rank, (worker, (appends, proposals))) in workers
@@ -874,7 +935,7 @@ fn run_draft_round(
         }
         for (slot_id, span) in proposal_slots.into_iter().zip(spans) {
             if let Some(active) = slots[rank][slot_id].as_mut() {
-                active.state.set_drafts(span.to_vec());
+                active.state.set_drafts(span.to_vec(), span_drafts);
             }
         }
     }

@@ -17,11 +17,11 @@ use anyhow::{Context, Result, bail, ensure};
 use cudarc::driver::CudaSlice;
 use half::bf16;
 use openinfer_kernels::ops::{
-    GLM52_TP8_AG_SLOT_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN, GLM52_TP8_CPART_LEN,
-    GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS, GLM52_TP8_SLICE_I,
-    GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOPK, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
-    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, glm52_moe_tp8_epoch_advance, glm52_moe_tp8_layer_launch,
-    glm52_moe_tp8_max_blocks,
+    GLM52_TP8_AG_PACKETS, GLM52_TP8_AG_SLOT_PACKETS, GLM52_TP8_BANK_EXPERTS, GLM52_TP8_BPART_LEN,
+    GLM52_TP8_CPART_LEN, GLM52_TP8_HIDDEN, GLM52_TP8_RANKS, GLM52_TP8_RS_SLOT_PACKETS,
+    GLM52_TP8_SLICE_I, GLM52_TP8_SLICE_ROWS, GLM52_TP8_TOPK, GLM52_TP8_UG_LEN, GLM52_TP8_UNION_MAX,
+    Glm52MoeTp8Buffers, Glm52Tp8LlBuffer, Glm52Tp8RowMap, glm52_moe_tp8_epoch_advance,
+    glm52_moe_tp8_layer_launch, glm52_moe_tp8_max_blocks,
 };
 use openinfer_kernels::tensor::DeviceContext;
 
@@ -33,6 +33,12 @@ use crate::weights::{Glm52WeightManifest, expected_tensor_contract, mmap_file, r
 
 const H: usize = GLM52_TP8_HIDDEN;
 const RANKS: usize = GLM52_TP8_RANKS;
+
+// The span shape assumes the scheduler's largest bucket IS the kernel's row
+// count: a bigger bucket would pass every >= buffer ensure while the kernel
+// silently computes only 8 rows (stale mlp_out on the rest).
+const _: () =
+    assert!(crate::model::GLM52_MAX_BATCH_PER_RANK == openinfer_kernels::ops::GLM52_TP8_TOKENS);
 const BANK: usize = GLM52_TP8_BANK_EXPERTS;
 const SLICE_ROWS: usize = GLM52_TP8_SLICE_ROWS;
 const SLICE_I: usize = GLM52_TP8_SLICE_I;
@@ -386,6 +392,7 @@ pub(crate) struct Glm52MoeTp8State {
     peer_ag: [u64; RANKS],
     peer_rs: [u64; RANKS],
     epoch_dev: CudaSlice<u64>,
+    span_owner_dev: CudaSlice<i32>,
     xg: CudaSlice<bf16>,
     topk_all_idx: CudaSlice<i32>,
     topk_all_prob: CudaSlice<f32>,
@@ -437,8 +444,12 @@ impl Glm52MoeTp8State {
         // source-rank slot. Kernel buffer layout is [parity][src_rank][packet]
         // (the kernel adds the parity offset itself), so the slot stride is
         // one rank's packet count x 16 B.
-        let ag_slot = (GLM52_TP8_AG_SLOT_PACKETS / RANKS / 2) * 16;
-        let rs_slot = (GLM52_TP8_RS_SLOT_PACKETS / RANKS / 2) * 16;
+        // Per-SRC strides: peer pointers are baked to this rank's source slot.
+        // AG region is [parity][src][packets]; RS region is [parity][row]
+        // [src][hidden] (the kernel adds the row stride itself), so the src
+        // stride is one hidden row of packets in both mappings.
+        let ag_slot = GLM52_TP8_AG_PACKETS * 16;
+        let rs_slot = GLM52_TP8_HIDDEN * 16;
         let peer_ag =
             std::array::from_fn(|p| table[p].ag[device_ordinal] + (rank * ag_slot) as u64);
         let peer_rs =
@@ -447,6 +458,7 @@ impl Glm52MoeTp8State {
         // never match a live epoch.
         let mut epoch_dev = ctx.stream.alloc_zeros::<u64>(1)?;
         ctx.stream.memcpy_htod(&[1u64], &mut epoch_dev)?;
+        let span_owner_dev = ctx.stream.alloc_zeros::<i32>(1)?;
         let grid_blocks = glm52_moe_tp8_max_blocks()?;
         Ok(Self {
             rank,
@@ -458,6 +470,7 @@ impl Glm52MoeTp8State {
             peer_ag,
             peer_rs,
             epoch_dev,
+            span_owner_dev,
             xg: ctx.stream.alloc_zeros(RANKS * H)?,
             topk_all_idx: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
             topk_all_prob: ctx.stream.alloc_zeros(RANKS * GLM52_TP8_TOPK)?,
@@ -475,6 +488,16 @@ impl Glm52MoeTp8State {
     /// layer's `forward` of that step (captured into the same graph).
     pub(crate) fn advance_epoch(&mut self, ctx: &DeviceContext) -> Result<()> {
         glm52_moe_tp8_epoch_advance(ctx, &mut self.epoch_dev)
+    }
+
+    /// Stage the span owner for this step's replay — once per span step,
+    /// BEFORE the graph launch (every span layer kernel reads it at run
+    /// time, so one captured span graph serves any owner).
+    pub(crate) fn stage_span_owner(&mut self, ctx: &DeviceContext, owner: usize) -> Result<()> {
+        ensure!(owner < RANKS, "TP8 span owner {owner} out of range");
+        ctx.stream
+            .memcpy_htod(&[owner as i32], &mut self.span_owner_dev)?;
+        Ok(())
     }
 
     /// One layer's TP8 MoE for this rank's single token (bucket-1 only): the
@@ -512,9 +535,65 @@ impl Glm52MoeTp8State {
         glm52_moe_tp8_layer_launch(
             ctx,
             slot,
+            Glm52Tp8RowMap::Dp8,
             normed2,
             &router.route.topk_idx,
             &router.route.topk_weight,
+            &bank.w13,
+            &bank.w13_scale,
+            &bank.w2,
+            &bank.w2_scale,
+            mlp_out,
+            &mut bufs,
+            self.rank,
+            self.grid_blocks,
+        )
+    }
+
+    /// Span-mode layer forward: all 8 rows (1 committed + 7 drafts) belong
+    /// to the rank staged via [`Self::stage_span_owner`] (once per step,
+    /// before the first span layer). Every rank passes 8-row buffers: the
+    /// kernels read the inputs only on the owner, whose `mlp_out` receives
+    /// 8 rows of routed + shared; the other ranks' `mlp_out` is zero-filled
+    /// (pads never enter the MoE).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_span(
+        &mut self,
+        ctx: &DeviceContext,
+        slot: usize,
+        bank: &Glm52MoeTp8SliceBank,
+        normed2: &CudaSlice<bf16>,
+        topk_idx: &CudaSlice<i32>,
+        topk_prob: &CudaSlice<f32>,
+        mlp_out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        debug_assert_eq!(GLM52_HIDDEN, H);
+        let mut bufs = Glm52MoeTp8Buffers {
+            xg: &mut self.xg,
+            topk_all_idx: &mut self.topk_all_idx,
+            topk_all_prob: &mut self.topk_all_prob,
+            guidx: &mut self.guidx,
+            guprob: &mut self.guprob,
+            gucnt: &mut self.gucnt,
+            gused: &mut self.gused,
+            bpart: &mut self.bpart,
+            ug: &mut self.ug,
+            cpart: &mut self.cpart,
+            ag_local: self.ag_local,
+            rs_local: self.rs_local,
+            peer_ag: self.peer_ag,
+            peer_rs: self.peer_rs,
+            epoch_dev: &mut self.epoch_dev,
+        };
+        glm52_moe_tp8_layer_launch(
+            ctx,
+            slot,
+            Glm52Tp8RowMap::Span {
+                owner_dev: &self.span_owner_dev,
+            },
+            normed2,
+            topk_idx,
+            topk_prob,
             &bank.w13,
             &bank.w13_scale,
             &bank.w2,
