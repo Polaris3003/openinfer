@@ -98,6 +98,7 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
                 "versions": {
                     "nvidia_smi": {"stdout": "NVIDIA GPU, 580.95.05, 12.0"},
                     "nvcc": {"stdout": "Cuda compilation tools, release 12.8"},
+                    "nccl": {"available": True, "exit_code": 0, "stdout": "2.30.4"},
                     "vllm": {"stdout": "vllm 0.23.0"},
                 },
             },
@@ -846,6 +847,29 @@ class BenchDsv2LiteMatrixTests(unittest.TestCase):
             )
 
         self.assertIn("gpu_probe_changed", regression["comparability"]["reasons"])
+        self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
+
+    def test_regression_summary_detects_nccl_version_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            current_path = root / "summary.json"
+            baseline_path = root / "baseline-summary.json"
+            current = self.minimal_summary()
+            baseline = self.minimal_summary()
+            current["metadata"]["versions"]["nccl"]["stdout"] = "2.31.0"
+            baseline["metadata"]["versions"]["nccl"]["stdout"] = "2.30.4"
+            current_path.write_text(json.dumps(current), encoding="utf-8")
+            baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+            regression = bench_matrix.build_regression_summary(
+                current,
+                baseline,
+                current_summary_path=current_path,
+                baseline_summary_path=baseline_path,
+                noisy_threshold=0.05,
+            )
+
+        self.assertIn("nccl_version_changed", regression["comparability"]["reasons"])
         self.assertEqual(regression["comparability"]["claim_marker"], "no directional claim")
 
     def test_regression_summary_marks_noisy_http_cell_no_directional(self) -> None:

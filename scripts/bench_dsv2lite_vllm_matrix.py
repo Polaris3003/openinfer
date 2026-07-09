@@ -1671,9 +1671,26 @@ def comparability_reasons(summary: dict[str, Any], baseline: dict[str, Any]) -> 
     ):
         if nested_get(current_meta, key_path) != nested_get(baseline_meta, key_path):
             reasons.append(label)
+    if version_probe_projection(current_meta, "nccl") != version_probe_projection(
+        baseline_meta,
+        "nccl",
+    ):
+        reasons.append("nccl_version_changed")
     if gpu_probe_projection(current_meta) != gpu_probe_projection(baseline_meta):
         reasons.append("gpu_probe_changed")
     return reasons
+
+
+def version_probe_projection(metadata_payload: dict[str, Any], probe_name: str) -> Any:
+    versions = metadata_payload.get("versions") if isinstance(metadata_payload, dict) else {}
+    probe = versions.get(probe_name) if isinstance(versions, dict) else None
+    if not isinstance(probe, dict):
+        return None
+    return {
+        "available": probe.get("available"),
+        "exit_code": probe.get("exit_code"),
+        "stdout": probe.get("stdout"),
+    }
 
 
 def gpu_probe_projection(metadata_payload: dict[str, Any]) -> Any:
