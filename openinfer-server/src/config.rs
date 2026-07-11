@@ -63,12 +63,13 @@ pub(crate) struct Args {
     #[arg(long, default_value_t = 0)]
     pub device_ordinal: usize,
 
-    /// Tensor-parallel world size (Qwen3 and Kimi-K2; GLM5.2 requires 1)
+    /// Tensor-parallel world size. GLM5.2 supports TP1/EP8 today; TP4/GB300
+    /// bring-up uses --tp-size=4 --moe-topo=tp4.
     #[arg(long, default_value_t = 1)]
     pub tp_size: usize,
 
-    /// Data-parallel world size. Kimi-K2 and GLM5.2 both default to 8; GLM5.2
-    /// requires exactly 8.
+    /// Data-parallel world size. Kimi-K2 and GLM5.2 EP8/TP8 default to 8;
+    /// GLM5.2 TP4 defaults to 1.
     #[arg(long)]
     pub dp_size: Option<usize>,
 
@@ -153,7 +154,8 @@ pub(crate) struct Args {
     /// high-throughput configuration (32 whole experts per rank, DeepEP
     /// dispatch/combine, buckets 1-8); `tp8` is the low-latency
     /// configuration (1/8-intermediate slice of ALL experts per rank on
-    /// every MoE layer, bucket-1 only — at most one request per rank).
+    /// every MoE layer, bucket-1 only — at most one request per rank);
+    /// `tp4` is the GB300 four-GPU bring-up topology.
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
 
@@ -384,12 +386,30 @@ impl Args {
         }
         #[cfg(feature = "glm52")]
         if matches!(model_type, ModelType::Glm52) {
+            // Parse the topology here so an invalid --moe-topo string fails
+            // with the real problem instead of a misleading dp/tp complaint;
+            // the accepted strings live in one place (the model crate).
+            let moe_topo: openinfer_glm52::Glm52MoeTopo = self
+                .moe_topo
+                .parse()
+                .map_err(|err| anyhow::anyhow!("--moe-topo: {err}"))?;
             if let Some(dp_size) = self.dp_size {
-                if dp_size != 8 {
+                let expected_dp_size = moe_topo.default_dp_size();
+                if dp_size != expected_dp_size {
                     bail!(
-                        "GLM5.2 requires --dp-size=8 when provided; omit --dp-size to use DP8/EP8"
+                        "GLM5.2 --moe-topo={} requires --dp-size={} when provided; omit --dp-size to use the topology default",
+                        self.moe_topo,
+                        expected_dp_size
                     );
                 }
+            }
+            let expected_tp_size = moe_topo.expected_tp_size();
+            if self.tp_size != expected_tp_size {
+                bail!(
+                    "GLM5.2 --moe-topo={} requires --tp-size={expected_tp_size}, got {}",
+                    self.moe_topo,
+                    self.tp_size
+                );
             }
         }
         Ok(())
@@ -648,11 +668,68 @@ mod tests {
 
     #[cfg(feature = "glm52")]
     #[test]
-    fn glm52_rejects_non_dp8() {
+    fn glm52_rejects_non_dp8_for_ep8() {
         let (args, provided) = parse_with_provided(&["openinfer", "--dp-size", "1"]);
         let error = args
             .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 should reject explicit non-DP8");
-        assert!(error.to_string().contains("DP8/EP8"));
+        assert!(error.to_string().contains("--dp-size=8"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_accepts_tp4_dp1() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--moe-topo", "tp4", "--tp-size", "4"]);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("GLM5.2 TP4 should default to DP1");
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_tp4_rejects_non_dp1() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--moe-topo",
+            "tp4",
+            "--tp-size",
+            "4",
+            "--dp-size",
+            "8",
+        ]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 TP4 should reject explicit non-DP1");
+        assert!(error.to_string().contains("--dp-size=1"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_tp4_rejects_omitted_tp_size() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--moe-topo", "tp4"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 TP4 should reject the default --tp-size=1");
+        assert!(error.to_string().contains("--tp-size=4"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_ep8_rejects_tp4_tp_size() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--tp-size", "4"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 EP8 should reject --tp-size=4");
+        assert!(error.to_string().contains("--tp-size=1"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_rejects_unknown_moe_topo() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--moe-topo", "tp2"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("GLM5.2 should reject an unknown topology string");
+        assert!(error.to_string().contains("ep8, tp8, or tp4"));
     }
 }

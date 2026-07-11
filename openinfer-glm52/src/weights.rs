@@ -239,7 +239,7 @@ impl Glm52WeightManifest {
         &self,
         moe_topo: crate::Glm52MoeTopo,
     ) -> Result<Vec<Glm52RankLoadBundle>> {
-        (0..GLM52_EP_RANKS)
+        (0..moe_topo.device_count())
             .map(|rank| self.rank_load_bundle(rank, moe_topo))
             .collect()
     }

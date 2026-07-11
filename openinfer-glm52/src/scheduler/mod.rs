@@ -120,13 +120,18 @@ pub(crate) fn run_dp8_coordinator(
     moe_topo: crate::Glm52MoeTopo,
     load_txs: Vec<watch::Sender<LoadSnapshot>>,
 ) {
-    // TP8 replicated topology: ONE logical rank drives 8 mirrored executors.
+    // Tensor-replicated topology: ONE logical rank drives mirrored executors.
     // Every worker receives the identical step (inputs, shape, KV, seed) and
     // must return bit-identical outputs — the scheduler admits, plans, and
     // applies on the single logical rank; the fan-out lives in the submit
     // and draft joins.
-    let mirrored = moe_topo == crate::Glm52MoeTopo::Tp8;
-    let logical_ranks = if mirrored { 1 } else { workers.len() };
+    let mirrored = moe_topo.uses_tensor_replicated_moe();
+    // TP8's phase kernels retain their original single bucket-8 contract.
+    // TP4 pads only the MoE phase chain internally, so attention, projections,
+    // norms, and sampling can use the smallest regular decode bucket.
+    let full_bucket = matches!(moe_topo, crate::Glm52MoeTopo::Tp8);
+    let logical_ranks = moe_topo.logical_rank_count();
+    debug_assert_eq!(logical_ranks, if mirrored { 1 } else { workers.len() });
     assert_eq!(
         load_txs.len(),
         logical_ranks,
@@ -194,7 +199,7 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored) {
+    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket) {
         log::error!("GLM5.2 graph pre-capture failed: {err:#}");
         for worker in &workers {
             let _ = worker.request_shutdown();
@@ -259,7 +264,7 @@ pub(crate) fn run_dp8_coordinator(
         // active slot's span of consecutive next tokens, padding rows on the
         // free slots — and all responses are joined before any output is
         // interpreted.
-        let shapes = plan_step_shapes(&feed_wants(&slots), mirrored);
+        let shapes = plan_step_shapes(&feed_wants(&slots), full_bucket);
         let flags = launch_ahead_flags(
             &shapes,
             leased_shapes.as_deref(),
@@ -390,10 +395,11 @@ fn precapture_step_graphs(
     pools: &[BlockPool],
     table_width: usize,
     mirrored: bool,
+    full_bucket: bool,
 ) -> anyhow::Result<()> {
-    // tp8 serves exactly one shape (the full bucket, every worker mirrored);
-    // EP8 captures every bucket.
-    let capture_bucket = |bucket: usize| !mirrored || bucket == GLM52_MAX_BATCH_PER_RANK;
+    // TP8 serves exactly one shape. EP8 and TP4 capture every bucket; TP4 is
+    // still mirrored, but only its MoE subgraph pads to eight rows.
+    let capture_bucket = |bucket: usize| !full_bucket || bucket == GLM52_MAX_BATCH_PER_RANK;
     for &bucket in GLM52_DECODE_BUCKETS
         .iter()
         .filter(|&&bucket| capture_bucket(bucket))
