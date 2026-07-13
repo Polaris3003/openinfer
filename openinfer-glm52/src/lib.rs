@@ -21,11 +21,12 @@ mod layer;
 mod mla_decode;
 mod model;
 mod moe_decode;
-mod moe_ep4;
 mod moe_ep8;
+mod moe_ep_wo;
 mod moe_tp;
 #[cfg(test)]
 mod oracle;
+mod remote;
 mod rows;
 mod runner;
 mod scheduler;
@@ -42,7 +43,10 @@ use anyhow::{Context as _, Result, ensure};
 use bytesize::ByteSize;
 use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
 use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
-use runner::{Glm52RankPlacement, Glm52RankWorker};
+use remote::Glm52RemoteNode;
+use runner::{Glm52RankPlacement, Glm52RankWorker, Glm52Worker};
+
+pub use remote::serve_rank_host;
 use tokio::sync::{mpsc, watch};
 use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
 
@@ -98,11 +102,44 @@ pub struct Glm52LaunchOptions {
     /// The requested PNG gets a complete sibling `.dot` for machine
     /// inspection.
     pub dump_graph_png: Option<PathBuf>,
+    /// Remote rank-host nodes (cross-node EP): each entry contributes its
+    /// `ranks` workers AFTER the local ranks, in list order. The local
+    /// process keeps ranks `0..device_count - Σ remote` on its own GPUs.
+    /// Empty (the default) is the single-node engine, byte-for-byte.
+    pub rank_hosts: Vec<Glm52RankHostSpec>,
+}
+
+/// One `--rank-hosts` entry: `host:port=ranks` (e.g. `10.13.84.7:19000=4`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Glm52RankHostSpec {
+    pub addr: String,
+    pub ranks: usize,
+}
+
+impl std::str::FromStr for Glm52RankHostSpec {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        let (addr, ranks) = s
+            .rsplit_once('=')
+            .with_context(|| format!("rank-host spec `{s}` must be host:port=ranks"))?;
+        let ranks: usize = ranks
+            .parse()
+            .with_context(|| format!("rank-host spec `{s}` has a non-numeric rank count"))?;
+        ensure!(
+            !addr.is_empty() && ranks > 0,
+            "rank-host spec `{s}` must be host:port=ranks with ranks > 0"
+        );
+        Ok(Self {
+            addr: addr.to_string(),
+            ranks,
+        })
+    }
 }
 
 /// Launch-time MoE sharding topology (the expert slab is repacked during
 /// H2D load, so this is a boot choice — the two layouts never co-reside).
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Glm52MoeTopo {
     #[default]
     Ep8,
@@ -112,6 +149,12 @@ pub enum Glm52MoeTopo {
     /// arch-portable weight-only mma chain instead of the sm_90a DeepGEMM
     /// masked chain.
     Ep4,
+    /// Cross-tray expert-parallel widths on GB300 NVL72 (4 GPUs per tray,
+    /// remote ranks behind `--rank-hosts`). Same DeepEP protocol with one
+    /// shim instantiation per width; all run the weight-only chain.
+    Ep16,
+    Ep32,
+    Ep64,
     Tp8,
     Tp4,
 }
@@ -120,9 +163,8 @@ impl Glm52MoeTopo {
     #[must_use]
     pub fn default_dp_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
-            Self::Ep4 => 4,
             Self::Tp4 => 1,
+            _ => self.device_count(),
         }
     }
 
@@ -131,6 +173,9 @@ impl Glm52MoeTopo {
         match self {
             Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
             Self::Ep4 | Self::Tp4 => 4,
+            Self::Ep16 => 16,
+            Self::Ep32 => 32,
+            Self::Ep64 => 64,
         }
     }
 
@@ -150,23 +195,23 @@ impl Glm52MoeTopo {
     #[must_use]
     pub fn expected_tp_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Ep4 | Self::Tp8 => 1,
             Self::Tp4 => 4,
+            _ => 1,
         }
     }
 
     #[must_use]
     pub(crate) fn expected_ep_size(self) -> usize {
         match self {
-            Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
-            Self::Ep4 => 4,
+            Self::Tp8 => GLM52_EP_RANKS,
             Self::Tp4 => 1,
+            _ => self.device_count(),
         }
     }
 
     #[must_use]
     pub(crate) fn uses_ep_expert_bundles(self) -> bool {
-        matches!(self, Self::Ep8 | Self::Ep4)
+        !self.uses_tensor_replicated_moe()
     }
 
     /// Whole routed experts per rank of an expert-bundle topology (EP8 → 32,
@@ -188,12 +233,18 @@ impl std::str::FromStr for Glm52MoeTopo {
 
     fn from_str(s: &str) -> Result<Self> {
         match s {
-            "ep8" => Ok(Self::Ep8),
             "ep4" => Ok(Self::Ep4),
+            "ep8" => Ok(Self::Ep8),
+            "ep16" => Ok(Self::Ep16),
+            "ep32" => Ok(Self::Ep32),
+            "ep64" => Ok(Self::Ep64),
             "tp8" => Ok(Self::Tp8),
             "tp4" => Ok(Self::Tp4),
             other => {
-                anyhow::bail!("GLM5.2 MoE topology must be ep8, ep4, tp8, or tp4, got {other}")
+                anyhow::bail!(
+                    "GLM5.2 MoE topology must be ep4, ep8, ep16, ep32, ep64, tp8, or tp4, \
+                     got {other}"
+                )
             }
         }
     }
@@ -243,6 +294,25 @@ mod topology_tests {
         assert_eq!(Glm52MoeTopo::Ep4.ep_local_experts(), 64);
         assert_eq!("ep4".parse::<Glm52MoeTopo>().unwrap(), Glm52MoeTopo::Ep4);
     }
+
+    #[test]
+    fn cross_tray_ep_widths_shard_all_routed_experts() {
+        for (topo, ranks, local) in [
+            (Glm52MoeTopo::Ep16, 16, 16),
+            (Glm52MoeTopo::Ep32, 32, 8),
+            (Glm52MoeTopo::Ep64, 64, 4),
+        ] {
+            assert_eq!(topo.default_dp_size(), ranks);
+            assert_eq!(topo.device_count(), ranks);
+            assert_eq!(topo.logical_rank_count(), ranks);
+            assert_eq!(topo.expected_tp_size(), 1);
+            assert_eq!(topo.expected_ep_size(), ranks);
+            assert!(topo.uses_ep_expert_bundles());
+            assert!(!topo.uses_tensor_replicated_moe());
+            assert_eq!(topo.ep_local_experts(), local);
+            assert_eq!(format!("ep{ranks}").parse::<Glm52MoeTopo>().unwrap(), topo);
+        }
+    }
 }
 
 /// Host-tier KV offload knobs. One `PegaEngine` (one pinned pool) backs all
@@ -271,22 +341,12 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         kv_offload,
         moe_topo,
         dump_graph_png,
+        rank_hosts,
     } = options;
     if let Some(path) = &dump_graph_png {
         openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
     }
     match moe_topo {
-        Glm52MoeTopo::Ep8 | Glm52MoeTopo::Ep4 | Glm52MoeTopo::Tp8 => {
-            ensure!(
-                tp_size == 1,
-                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
-            );
-            let expected_dp = moe_topo.default_dp_size();
-            ensure!(
-                dp_size == expected_dp,
-                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
-            );
-        }
         Glm52MoeTopo::Tp4 => {
             ensure!(
                 tp_size == 4,
@@ -295,6 +355,17 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             ensure!(
                 dp_size == 1,
                 "GLM5.2 TP4 requires --dp-size=1 (or omitted), got {dp_size}"
+            );
+        }
+        _ => {
+            ensure!(
+                tp_size == 1,
+                "GLM5.2 {moe_topo:?} requires --tp-size=1, got {tp_size}"
+            );
+            let expected_dp = moe_topo.default_dp_size();
+            ensure!(
+                dp_size == expected_dp,
+                "GLM5.2 {moe_topo:?} requires --dp-size={expected_dp} (or omitted), got {dp_size}"
             );
         }
     }
@@ -314,13 +385,35 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
         "GLM5.2 --kv-offload requires the EP8 topology (tp8 replicates KV on all ranks; \
          a host-tier restore would land on one)"
     );
+    let remote_ranks: usize = rank_hosts.iter().map(|host| host.ranks).sum();
+    if remote_ranks > 0 {
+        ensure!(
+            moe_topo.uses_ep_expert_bundles(),
+            "GLM5.2 --rank-hosts requires an EP topology (tensor-replicated MoE \
+             rendezvouses device pointers in-process)"
+        );
+        ensure!(
+            remote_ranks < moe_topo.device_count(),
+            "GLM5.2 --rank-hosts claims {remote_ranks} ranks but {moe_topo:?} has only {} \
+             (the coordinator keeps at least rank 0 local)",
+            moe_topo.device_count()
+        );
+        // Remote arenas hold device pointers that cannot cross the wire; the
+        // host tier would need a per-node offload host + the Event facts
+        // plane (cross-node-scaling.md) — not built yet.
+        ensure!(
+            kv_offload.is_none(),
+            "GLM5.2 --kv-offload is not supported with --rank-hosts yet"
+        );
+    }
     start_engine(
         model_path,
         &Glm52LoadOptions {
-            device_ordinals: (0..moe_topo.device_count()).collect(),
+            device_ordinals: (0..moe_topo.device_count() - remote_ranks).collect(),
             tp_size,
             dp_size,
             ep_size: moe_topo.expected_ep_size(),
+            rank_hosts,
         },
         dspark_draft_model_path.as_deref(),
         max_model_len,
@@ -462,15 +555,19 @@ fn derive_max_model_len(
 
 #[derive(Clone, Debug)]
 struct Glm52LoadOptions {
+    /// Ordinals for the LOCAL ranks (`0..local_count`); remote ranks live on
+    /// their rank-hosts' own devices.
     device_ordinals: Vec<usize>,
     tp_size: usize,
     dp_size: usize,
     ep_size: usize,
+    rank_hosts: Vec<Glm52RankHostSpec>,
 }
 
 #[derive(Debug)]
 struct StartupValidation {
     device_ordinals: Vec<usize>,
+    rank_hosts: Vec<Glm52RankHostSpec>,
     rank_bundles: Vec<Glm52RankLoadBundle>,
     rank_tensor_counts: Vec<usize>,
     rank_expert_ranges: Vec<std::ops::Range<usize>>,
@@ -485,7 +582,7 @@ struct GpuWeightLoadReport {
 }
 
 struct LoadedGlm52Runtime {
-    workers: Vec<Glm52RankWorker>,
+    workers: Vec<Glm52Worker>,
     report: GpuWeightLoadReport,
 }
 
@@ -659,7 +756,7 @@ fn start_engine(
 
 /// Load the DSpark drafter on every rank (rank-local, ~3.8 GB bf16 each —
 /// the draft's embed/lm_head reuse the target's, so they are never loaded).
-fn load_dspark_drafters(workers: &[Glm52RankWorker], dspark_path: &Path) -> Result<()> {
+fn load_dspark_drafters(workers: &[Glm52Worker], dspark_path: &Path) -> Result<()> {
     let started = Instant::now();
     let responses = workers
         .iter()
@@ -684,10 +781,10 @@ fn load_dspark_drafters(workers: &[Glm52RankWorker], dspark_path: &Path) -> Resu
 /// graph instantiations and allocator slack need, fail the launch with the
 /// numbers — a reserve/ledger drift must crash here, not as a mid-serving
 /// OOM that tears the collective group down.
-fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
+fn ensure_post_build_headroom(workers: &[Glm52Worker]) -> Result<()> {
     let responses = workers
         .iter()
-        .map(Glm52RankWorker::free_vram_async)
+        .map(Glm52Worker::free_vram_async)
         .collect::<Result<Vec<_>>>()?;
     let mut per_rank = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {
@@ -717,7 +814,7 @@ fn ensure_post_build_headroom(workers: &[Glm52RankWorker]) -> Result<()> {
 /// no useful error. TP4 currently stops after the per-rank build, before
 /// entering any EP8/TP8 collective setup.
 fn build_rank_models(
-    workers: &[Glm52RankWorker],
+    workers: &[Glm52Worker],
     max_model_len: usize,
     moe_topo: Glm52MoeTopo,
     dspark_enabled: bool,
@@ -735,9 +832,12 @@ fn build_rank_models(
                 .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped its build response"))??,
         );
     }
-    let unique_id = match moe_topo {
-        Glm52MoeTopo::Ep4 => openinfer_kernels::ops::glm52_ep4_deepep_unique_id()?,
-        _ => openinfer_kernels::ops::glm52_deepep_unique_id()?,
+    let unique_id = if moe_topo.uses_ep_expert_bundles() {
+        openinfer_kernels::ops::glm52_ep_deepep_unique_id(moe_topo.expected_ep_size())?
+    } else {
+        // TP allreduce bootstrap just needs one NCCL unique id; ride the EP8
+        // shim's generator.
+        openinfer_kernels::ops::glm52_ep_deepep_unique_id(8)?
     };
     let tp_exchange = moe_topo
         .uses_tensor_replicated_moe()
@@ -872,9 +972,12 @@ fn validate_startup(
     probe_config_json(&json)?;
 
     let expected_devices = moe_topo.device_count();
+    let remote_ranks: usize = options.rank_hosts.iter().map(|host| host.ranks).sum();
     ensure!(
-        options.device_ordinals.len() == expected_devices,
-        "GLM5.2 {moe_topo:?} load requires {expected_devices} devices, got {:?}",
+        options.device_ordinals.len() + remote_ranks == expected_devices,
+        "GLM5.2 {moe_topo:?} load requires {expected_devices} ranks, got {} local ({:?}) + \
+         {remote_ranks} remote",
+        options.device_ordinals.len(),
         options.device_ordinals
     );
     ensure!(
@@ -923,6 +1026,7 @@ fn validate_startup(
 
     Ok(StartupValidation {
         device_ordinals: options.device_ordinals.clone(),
+        rank_hosts: options.rank_hosts.clone(),
         rank_bundles,
         rank_tensor_counts,
         rank_expert_ranges,
@@ -936,13 +1040,28 @@ fn load_rank_weights_to_gpu(
 ) -> Result<LoadedGlm52Runtime> {
     let spawn_started = Instant::now();
     log::info!(
-        "start spawn GLM5.2 rank workers: ranks={}",
-        startup.rank_bundles.len()
+        "start spawn GLM5.2 rank workers: ranks={} ({} local + {} remote nodes)",
+        startup.rank_bundles.len(),
+        startup.device_ordinals.len(),
+        startup.rank_hosts.len(),
     );
     let mut workers = Vec::with_capacity(startup.rank_bundles.len());
-    for (rank, bundle) in startup.rank_bundles.iter().enumerate() {
-        let placement = Glm52RankPlacement::new(rank, startup.device_ordinals[rank])?;
-        workers.push(Glm52RankWorker::spawn(placement, bundle.clone())?);
+    for (rank, &device_ordinal) in startup.device_ordinals.iter().enumerate() {
+        let placement = Glm52RankPlacement {
+            rank,
+            device_ordinal,
+        };
+        workers.push(Glm52Worker::Local(Glm52RankWorker::spawn(
+            placement,
+            startup.rank_bundles[rank].clone(),
+        )?));
+    }
+    let mut next_rank = startup.device_ordinals.len();
+    for host in &startup.rank_hosts {
+        let remote =
+            Glm52RemoteNode::connect(&host.addr, model_path, moe_topo, next_rank, host.ranks)?;
+        next_rank += host.ranks;
+        workers.extend(remote.into_iter().map(Glm52Worker::Remote));
     }
     log::info!(
         "spawn GLM5.2 rank workers cost {:.2}s: ranks={}",
