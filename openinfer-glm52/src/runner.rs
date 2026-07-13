@@ -155,6 +155,15 @@ enum Glm52RankCommand {
         proposals: Vec<(usize, u32, usize)>,
         resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
     },
+    /// Rank-local, vLLM-compat P/D only: deinterleave the RoPE dims of pages
+    /// just restored from a vLLM-written namespace (see
+    /// glm52_vllm_rope_fixup.cu). Sent after the pegaflow H2D completed and
+    /// before the pages become readable; command-queue FIFO plus same-stream
+    /// launch order the rewrite before any subsequent Step kernels.
+    VllmRopeFixup {
+        pages: Vec<i32>,
+        resp: Sender<Result<()>>,
+    },
     /// Rank-local inspection of an already pre-captured whole-step graph.
     /// This command stays on the worker so CUDA graph handles never cross the
     /// thread/context ownership boundary.
@@ -206,6 +215,20 @@ impl Glm52RankWorker {
             tx,
             handle: Some(handle),
         })
+    }
+
+    /// Deinterleave vLLM-restored RoPE dims at an idle step boundary.
+    pub(crate) fn vllm_rope_fixup(&self, pages: Vec<i32>) -> Result<()> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::VllmRopeFixup {
+                pages,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker dropped its fixup response"))?
     }
 
     pub(crate) fn load_weights_async(
@@ -863,6 +886,15 @@ impl Glm52RankThreadState {
         )
     }
 
+    fn vllm_rope_fixup(&mut self, pages: &[i32]) -> Result<()> {
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 vLLM rope fixup before build_model")?;
+        runtime.model.vllm_rope_fixup(&dev_ctx, pages)
+    }
+
     fn dump_decode_graph(
         &self,
         bucket: usize,
@@ -913,6 +945,9 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 resp,
             } => {
                 let _ = resp.send(state.step(&inputs, shape, &kv, flags, &sampling, seed));
+            }
+            Glm52RankCommand::VllmRopeFixup { pages, resp } => {
+                let _ = resp.send(state.vllm_rope_fixup(&pages));
             }
             Glm52RankCommand::DumpDecodeGraph {
                 bucket,

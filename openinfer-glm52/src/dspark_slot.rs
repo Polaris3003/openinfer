@@ -74,7 +74,7 @@ impl Glm52DsparkSlotState {
     pub(crate) fn append_captured_row(
         &mut self,
         ctx: &DeviceContext,
-        captured: &CudaSlice<half::bf16>,
+        captured: &CudaSlice<bf16>,
         row: usize,
     ) -> Result<()> {
         let required = self.pending_len + 1;
