@@ -5,7 +5,7 @@ use cudarc::driver::CudaSlice;
 use half::bf16;
 use log::info;
 use memmap2::Mmap;
-use safetensors::SafeTensors;
+use safetensors::{Dtype, SafeTensors};
 use std::collections::HashMap;
 use std::fs;
 
@@ -265,6 +265,72 @@ pub fn load_tensor_1d_f32(
         .clone_htod(slice)
         .map_err(|e| anyhow::anyhow!("H2D copy failed for '{}': {}", name, e))?;
     Ok(gpu_data)
+}
+
+/// Load a 1D I64 tensor into a host `Vec<i64>`.
+///
+/// For small integer lookup tables that live on the host (e.g. EAGLE-3's `d2t`
+/// draft→target vocab offset map), not weights destined for a GEMM.
+pub fn load_tensor_i64_host(
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<Vec<i64>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+
+    if tensor.dtype() != Dtype::I64 {
+        return Err(anyhow::anyhow!(
+            "I64 tensor '{}': expected dtype I64, got {:?}",
+            name,
+            tensor.dtype()
+        ));
+    }
+    if tensor.shape().len() != 1 {
+        return Err(anyhow::anyhow!(
+            "I64 tensor '{}': expected 1D, got shape {:?}",
+            name,
+            tensor.shape()
+        ));
+    }
+    let data = tensor.data();
+    if data.len() % 8 != 0 {
+        return Err(anyhow::anyhow!(
+            "I64 tensor '{}': data length {} not multiple of 8",
+            name,
+            data.len()
+        ));
+    }
+    Ok(data
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|&b| i64::from_le_bytes(b))
+        .collect())
+}
+
+/// Load a 1D BOOL tensor into a host `Vec<bool>` (safetensors stores BOOL as one
+/// byte per element, `0`/`1`). For mask tables like EAGLE-3's `t2d`.
+pub fn load_tensor_bool_host(
+    shards: &[SafeTensors],
+    weight_map: &HashMap<String, usize>,
+    name: &str,
+) -> Result<Vec<bool>> {
+    let tensor = find_tensor(shards, weight_map, name)?;
+    if tensor.dtype() != Dtype::BOOL {
+        return Err(anyhow::anyhow!(
+            "BOOL tensor '{}': expected dtype BOOL, got {:?}",
+            name,
+            tensor.dtype()
+        ));
+    }
+    if tensor.shape().len() != 1 {
+        return Err(anyhow::anyhow!(
+            "BOOL tensor '{}': expected 1D, got shape {:?}",
+            name,
+            tensor.shape()
+        ));
+    }
+    Ok(tensor.data().iter().map(|&b| b != 0).collect())
 }
 
 /// Load shard info with fixup for mismatched shard filenames in index.json.
