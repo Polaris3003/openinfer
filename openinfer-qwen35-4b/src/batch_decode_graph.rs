@@ -9,7 +9,7 @@ use openinfer_core::tensor::DeviceContext;
 use super::config::Config35;
 use super::config::TensorParallelConfig;
 use super::decode_buffers::BatchDecodeBuffers35;
-use super::recurrent_state::RecurrentState;
+use super::recurrent_state::{LinearStatePointerTables, RecurrentState};
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to nearest bucket.
 pub(crate) const BATCH_BUCKETS: &[usize] = &[1, 2, 4, 8, 16, 32, 64];
@@ -51,6 +51,7 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
 pub(crate) struct BatchDecodeGraphState {
     pub(crate) buffers: BatchDecodeBuffers35,
     pub(crate) slot_states: Vec<RecurrentState>,
+    pub(crate) linear_pointer_tables: LinearStatePointerTables,
     /// One `CudaGraphState` per BATCH_BUCKETS entry (indexed by position).
     pub(crate) graphs: Vec<CudaGraphState>,
 }
@@ -80,6 +81,16 @@ impl BatchDecodeGraphState {
         for _ in 0..max_batch {
             slot_states.push(RecurrentState::new(ctx, config)?);
         }
+        let linear_pointer_tables = {
+            let mut slot_refs: Vec<&mut RecurrentState> = slot_states.iter_mut().collect();
+            LinearStatePointerTables::from_recurrent_refs(
+                ctx,
+                config,
+                &mut slot_refs,
+                max_batch,
+                "Qwen3.5 graph",
+            )?
+        };
 
         let graphs = BATCH_BUCKETS
             .iter()
@@ -89,6 +100,7 @@ impl BatchDecodeGraphState {
         Ok(Self {
             buffers,
             slot_states,
+            linear_pointer_tables,
             graphs,
         })
     }
