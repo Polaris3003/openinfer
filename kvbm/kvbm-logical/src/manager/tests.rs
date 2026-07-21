@@ -3892,6 +3892,63 @@ mod reset_on_release_tests {
         );
     }
 
+    /// A non-retaining caller can own a duplicate rather than the canonical
+    /// primary. Marking the physical duplicate is insufficient because the
+    /// duplicate already resets unconditionally; the hidden primary held by
+    /// `_primary_keepalive` must receive the reset-on-release policy instead.
+    #[test]
+    fn duplicate_can_mark_canonical_primary_for_reset() {
+        let registry = crate::registry::BlockRegistry::builder()
+            .frequency_tracker(
+                crate::manager::FrequencyTrackingCapacity::default().create_tracker(),
+            )
+            .build();
+        let manager = BlockManager::<TestBlockData>::builder()
+            .block_count(4)
+            .block_size(4)
+            .registry(registry)
+            .with_lru_backend()
+            .duplication_policy(BlockDuplicationPolicy::Allow)
+            .build()
+            .expect("build manager");
+
+        let token = create_test_token_block_from_iota(50_041);
+        let hash = token.kvbm_sequence_hash();
+
+        let primary_mutable = manager
+            .allocate_blocks(1)
+            .expect("allocate primary")
+            .into_iter()
+            .next()
+            .unwrap();
+        let primary = manager.register_block(primary_mutable.complete(&token).unwrap());
+
+        let duplicate_mutable = manager
+            .allocate_blocks(1)
+            .expect("allocate duplicate")
+            .into_iter()
+            .next()
+            .unwrap();
+        let duplicate = manager.register_block(duplicate_mutable.complete(&token).unwrap());
+        assert_ne!(primary.block_id(), duplicate.block_id());
+
+        duplicate.set_primary_evict_on_reset(true);
+
+        let store = manager.store_for_test();
+        drop(primary);
+        assert_eq!(
+            store.reset_len(),
+            2,
+            "the duplicate must keep the primary active until its own drop"
+        );
+
+        drop(duplicate);
+
+        assert_eq!(store.inactive_len(), 0);
+        assert_eq!(store.reset_len(), 4);
+        assert!(!manager.block_registry().is_registered(hash));
+    }
+
     /// Pool gauges (`inflight_immutable`, `inactive_pool_size`,
     /// `reset_pool_size`) must stay coherent across the full lifecycle
     /// when the reset-on-release flag fires. Regression-protects the

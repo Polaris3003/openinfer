@@ -209,6 +209,29 @@ impl<T: BlockMetadata + Sync> ImmutableBlock<T> {
             .store_reset_on_release(self.inner.block_id, value);
     }
 
+    /// Set reset-on-release on the canonical primary for this block's hash.
+    ///
+    /// Unlike [`Self::set_evict_on_reset`], which addresses this physical
+    /// slot, this method follows a duplicate's primary keepalive. It is the
+    /// appropriate operation for a request-level retention policy: duplicate
+    /// slots already reset unconditionally, while their otherwise-hidden
+    /// primary would fall back to the inactive cache on its final drop.
+    ///
+    /// For a primary block this is equivalent to
+    /// `set_evict_on_reset(value)`. For a duplicate it updates the primary
+    /// pinned by that duplicate. Multiple callers use the same last-writer-wins
+    /// semantics as the physical-slot setter.
+    pub fn set_primary_evict_on_reset(&self, value: bool) {
+        let primary = self
+            .inner
+            ._primary_keepalive
+            .as_ref()
+            .unwrap_or(&self.inner);
+        primary
+            .store
+            .store_reset_on_release(primary.block_id, value);
+    }
+
     /// Type-erased lifecycle pin for cross-policy use.
     ///
     /// Returns an [`LifecyclePinRef`] that:
