@@ -11,9 +11,11 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
-};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
 
 mod common;
@@ -42,6 +44,7 @@ fn run_and_capture_cached(handle: &EngineHandle, prompt_tokens: Vec<u32>) -> usi
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

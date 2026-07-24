@@ -1,11 +1,15 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, FinishReason, GenerateRequest, LoadLoraAdapterRequest,
-    TokenEvent, TokenSink,
-};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::LoadLoraAdapterRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
 use openinfer_qwen3::lora_fixtures as fixtures;
 use serde::Deserialize;
@@ -93,6 +97,7 @@ fn generate_tokens(
 
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

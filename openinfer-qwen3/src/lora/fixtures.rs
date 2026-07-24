@@ -7,10 +7,14 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use half::{bf16, f16};
-use safetensors::{Dtype, View};
+use half::bf16;
+use half::f16;
+use safetensors::Dtype;
+use safetensors::View;
 
-use super::{ADAPTER_CONFIG_FILE, ADAPTER_WEIGHTS_FILE, tensor_name};
+use super::ADAPTER_CONFIG_FILE;
+use super::ADAPTER_WEIGHTS_FILE;
+use super::tensor_name;
 
 #[derive(Clone)]
 pub struct FixtureTensor {
@@ -20,7 +24,7 @@ pub struct FixtureTensor {
 }
 
 impl FixtureTensor {
-    pub fn filled(dtype: Dtype, shape: Vec<usize>, value: f32) -> Self {
+    pub(crate) fn filled(dtype: Dtype, shape: Vec<usize>, value: f32) -> Self {
         let elems = shape.iter().product::<usize>();
         let data = match dtype {
             Dtype::BF16 => bf16::from_f32(value).to_bits().to_le_bytes().repeat(elems),

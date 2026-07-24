@@ -5,12 +5,17 @@
 //! mirroring the block lifecycle state machine:
 //! `MutableBlock<T>` → `CompleteBlock<T>` → `ImmutableBlock<T>`.
 
-use crate::blocks::{BlockError, BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
-use crate::manager::BlockManager;
-use crate::{BlockId, SequenceHash};
 use dynamo_tokens::TokenBlock;
 
 use super::super::store::BlockStore;
+use crate::BlockId;
+use crate::SequenceHash;
+use crate::blocks::BlockError;
+use crate::blocks::BlockMetadata;
+use crate::blocks::CompleteBlock;
+use crate::blocks::ImmutableBlock;
+use crate::blocks::MutableBlock;
+use crate::manager::BlockManager;
 
 /// Error type for [`LogicalBlockAssignments`] operations.
 #[derive(Debug, thiserror::Error)]
@@ -115,16 +120,6 @@ impl<T: BlockMetadata> LogicalBlockAssignments<T> {
     /// Iterates over assigned blocks in positional order.
     pub fn assigned_iter(&self) -> impl Iterator<Item = (&BlockId, &ImmutableBlock<T>)> {
         self.store.assigned_iter()
-    }
-
-    /// Iterates over staged blocks in staging order.
-    pub fn staged_iter(&self) -> impl Iterator<Item = (&BlockId, &CompleteBlock<T>)> {
-        self.store.staged_iter()
-    }
-
-    /// Iterates over unassigned blocks in FIFO order.
-    pub fn unassigned_iter(&self) -> impl Iterator<Item = (&BlockId, &MutableBlock<T>)> {
-        self.store.unassigned_iter()
     }
 
     /// Iterates over all block IDs across all three collections in lifecycle
@@ -282,7 +277,8 @@ impl<T: BlockMetadata> std::fmt::Debug for LogicalBlockAssignments<T> {
 mod tests {
     use super::*;
     use crate::sequence::BlockSequence;
-    use crate::testing::{TestMeta, create_test_manager};
+    use crate::testing::TestMeta;
+    use crate::testing::create_test_manager;
 
     const BLOCK_SIZE: u32 = 4;
 

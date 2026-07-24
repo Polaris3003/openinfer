@@ -14,7 +14,7 @@
         feature = "deepseek-v2-lite",
         feature = "kimi-k2",
         feature = "qwen3",
-        feature = "qwen35-4b"
+        feature = "qwen35"
     )),
     allow(unused_imports, unused_variables, dead_code)
 )]
@@ -22,13 +22,16 @@
 use std::path::Path;
 use std::time::Instant;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
+use anyhow::Result;
 use clap::Parser;
 use log::debug;
 use openinfer::logging;
 use openinfer::scheduler::SchedulerHandle;
-use openinfer::server_engine::{ModelType, detect_model_type};
-use openinfer_core::engine::{EngineLoadOptions, EpBackend};
+use openinfer::server_engine::ModelType;
+use openinfer::server_engine::detect_model_type;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
 #[cfg(feature = "kimi-k2")]
 use openinfer_core::parallel::ParallelConfig;
 use openinfer_vllm_support::load_tokenizer as load_vllm_tokenizer;
@@ -45,13 +48,18 @@ mod render;
 mod report;
 mod runners;
 mod snapshot;
-use cli::{Cli, Command};
+use cli::Cli;
+use cli::CliQwen35SchedulerPolicy;
+use cli::Command;
+use exec::BenchModel;
 #[cfg(feature = "deepseek-v2-lite")]
 use exec::DeepSeekV2LiteBenchModel;
-use exec::{BenchModel, SchedulerBenchModel};
+use exec::SchedulerBenchModel;
 use metrics::dur_ms;
-use runners::{emit_report, run_command};
-use snapshot::{run_compare, run_snapshot};
+use runners::emit_report;
+use runners::run_command;
+use snapshot::run_compare;
+use snapshot::run_snapshot;
 
 fn command_seed(cli: &Cli) -> u64 {
     match &cli.command {
@@ -71,6 +79,38 @@ fn kimi_parallel_config(tp_size: usize, dp_size: usize) -> Result<ParallelConfig
     anyhow::ensure!(tp_size > 0, "--tp-size must be positive");
     anyhow::ensure!(dp_size > 0, "--dp-size must be positive");
     Ok(ParallelConfig::new(tp_size, dp_size))
+}
+
+fn validate_qwen35_scheduler_policy(
+    model_type: ModelType,
+    policy: CliQwen35SchedulerPolicy,
+) -> Result<()> {
+    #[cfg(feature = "qwen35")]
+    if matches!(model_type, ModelType::Qwen35) {
+        return Ok(());
+    }
+    #[cfg(not(feature = "qwen35"))]
+    let _ = model_type;
+    if policy == CliQwen35SchedulerPolicy::Off {
+        return Ok(());
+    }
+    anyhow::bail!("--qwen35-scheduler-policy=auto is supported only for Qwen3.5")
+}
+
+fn validate_qwen35_max_batch(model_type: ModelType, max_batch: usize) -> Result<()> {
+    anyhow::ensure!(max_batch > 0, "--max-batch must be > 0");
+    #[cfg(feature = "qwen35")]
+    if matches!(model_type, ModelType::Qwen35) {
+        anyhow::ensure!(
+            max_batch <= openinfer_qwen35::MAX_DECODE_BATCH,
+            "--max-batch must be <= {} for Qwen3.5",
+            openinfer_qwen35::MAX_DECODE_BATCH
+        );
+        return Ok(());
+    }
+    #[cfg(not(feature = "qwen35"))]
+    let _ = model_type;
+    Ok(())
 }
 
 fn dispatch(
@@ -118,6 +158,8 @@ fn main() -> Result<()> {
     let model_type = detect_model_type(&cli.model_path)
         .with_context(|| format!("failed to detect model type from {}", cli.model_path))?;
     debug!("Detected model type: {:?}", model_type);
+    validate_qwen35_scheduler_policy(model_type, cli.qwen35_scheduler_policy)?;
+    validate_qwen35_max_batch(model_type, cli.max_batch)?;
     let load_start = Instant::now();
 
     // Shared tail for every scheduler-backed model: load the tokenizer, stamp
@@ -199,23 +241,16 @@ fn main() -> Result<()> {
             )?;
             finish(handle, cli.cuda_graph)
         }
-        #[cfg(feature = "qwen35-4b")]
+        #[cfg(feature = "qwen35")]
         ModelType::Qwen35 => {
             // Chunked-prefill budget from --max-prefill-tokens (mirrors the Qwen3
             // path); omit for the model default. Concurrent capacity from
             // --max-batch (was hardcoded to 4; see issue #470).
-            anyhow::ensure!(cli.max_batch > 0, "--max-batch must be > 0");
-            anyhow::ensure!(
-                cli.max_batch <= openinfer_qwen35_4b::runtime::MAX_BATCH,
-                "--max-batch {} exceeds Qwen3.5 MAX_BATCH ({})",
-                cli.max_batch,
-                openinfer_qwen35_4b::runtime::MAX_BATCH
-            );
             let max_prefill_tokens = cli
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
-                .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = openinfer_qwen35_4b::start_engine(
+                .unwrap_or(openinfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS);
+            let handle = openinfer_qwen35::start_engine_with_capacity_and_policy(
                 Path::new(&cli.model_path),
                 EngineLoadOptions {
                     enable_cuda_graph: cli.cuda_graph,
@@ -226,6 +261,7 @@ fn main() -> Result<()> {
                 },
                 cli.max_batch,
                 max_prefill_tokens,
+                cli.qwen35_scheduler_policy.resolve(),
             )?;
             finish(handle, cli.cuda_graph)
         }
@@ -238,7 +274,10 @@ mod tests {
 
     use openinfer::sampler::SamplingParams;
 
-    use super::*;
+    use crate::exec::assert_dsv2_lite_sampling_contract;
+    use crate::exec::timings_from_dsv2_lite_attribution;
+    use crate::exec::timings_from_dsv2_lite_batched_generation;
+    use crate::runners::build_request_metrics;
 
     #[test]
     fn dsv2_lite_sampling_contract_accepts_bench_params() {

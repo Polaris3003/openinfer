@@ -1,17 +1,27 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-use half::{bf16, f16};
+use half::bf16;
+use half::f16;
 use openinfer_core::ops;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::HiddenStates;
+use safetensors::Dtype;
+use safetensors::SafeTensors;
 use safetensors::tensor::TensorView;
-use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
 
-use crate::config::{Config, TensorParallelConfig};
+use crate::config::Config;
+use crate::config::TensorParallelConfig;
 
 const ADAPTER_CONFIG_FILE: &str = "adapter_config.json";
 const ADAPTER_WEIGHTS_FILE: &str = "adapter_model.safetensors";
@@ -137,15 +147,15 @@ impl DeviceLoraLayer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct LoraTokenRange<'a> {
-    pub(crate) adapter: &'a str,
+    adapter: &'a str,
     pub(crate) token_offset: usize,
     pub(crate) token_len: usize,
 }
 
-pub(crate) struct LoraTokenGroup<'a> {
-    pub(crate) adapter: &'a str,
-    pub(crate) ranges: Vec<&'a LoraTokenRange<'a>>,
-    pub(crate) token_count: usize,
+struct LoraTokenGroup<'a> {
+    adapter: &'a str,
+    ranges: Vec<&'a LoraTokenRange<'a>>,
+    token_count: usize,
 }
 
 pub(crate) struct DeviceLoraTokenGroup<'a> {
@@ -183,9 +193,7 @@ pub(crate) fn build_lora_token_ranges<'a>(
     ranges
 }
 
-pub(crate) fn group_lora_token_ranges<'a>(
-    ranges: &'a [LoraTokenRange<'a>],
-) -> Vec<LoraTokenGroup<'a>> {
+fn group_lora_token_ranges<'a>(ranges: &'a [LoraTokenRange<'a>]) -> Vec<LoraTokenGroup<'a>> {
     let mut groups: Vec<LoraTokenGroup<'a>> = Vec::new();
     for range in ranges {
         if let Some(group) = groups
@@ -392,7 +400,7 @@ pub(crate) fn apply_lora_projection_delta_range(
     let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, token_len)?;
     ops::gemm_token_range_into_checked(ctx, &projection.a, input, token_offset, &mut rank_out)?;
     let mut delta = HiddenStates::zeros(ctx, projection.b.rows, token_len)?;
-    ops::gemm_into(ctx, &projection.b, &rank_out, &mut delta);
+    ops::gemm_into_checked(ctx, &projection.b, &rank_out, &mut delta)?;
     ops::scaled_add_rows_token_range_into(ctx, &delta, scale, out, row_offset, token_offset)
 }
 
@@ -411,11 +419,10 @@ pub(crate) fn apply_lora_projection_delta_indexed(
     }
     let mut compact_input = HiddenStates::zeros(ctx, input.hidden_dim, token_count)?;
     ops::gather_hidden_tokens_into(ctx, input, token_indices_d, token_count, &mut compact_input)?;
-
     let mut rank_out = HiddenStates::zeros(ctx, projection.a.rows, token_count)?;
     ops::gemm_into_checked(ctx, &projection.a, &compact_input, &mut rank_out)?;
     let mut delta = HiddenStates::zeros(ctx, projection.b.rows, token_count)?;
-    ops::gemm_into(ctx, &projection.b, &rank_out, &mut delta);
+    ops::gemm_into_checked(ctx, &projection.b, &rank_out, &mut delta)?;
     ops::scaled_add_rows_indexed_into(
         ctx,
         &delta,
@@ -769,7 +776,8 @@ fn shard_projection_for_tensor_parallel(
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::fixtures::{self, FixtureTensor};
+    use super::fixtures::FixtureTensor;
+    use super::fixtures::{self};
     use super::*;
 
     fn tiny_config() -> Config {

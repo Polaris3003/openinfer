@@ -1,7 +1,8 @@
 //! Split-KV decode chunking config: the chunk-size formula and the
 //! `split_kv_{chunk}x{max}` label/parse round-trip for the manifest variant sweep.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 /// One split-KV decode configuration: a per-chunk token floor and a per-request chunk cap.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -11,7 +12,7 @@ pub struct SplitKvConfig {
 }
 
 impl SplitKvConfig {
-    pub const fn new(chunk_tokens: usize, max_chunks_per_request: usize) -> Self {
+    pub(crate) const fn new(chunk_tokens: usize, max_chunks_per_request: usize) -> Self {
         // A zero `max_chunks_per_request` divides by zero in `actual_chunk_size` (and a zero
         // `chunk_tokens` does in `active_chunks` at kv_len==0); reject loud at construction
         // (compile-time for the const sites) rather than panic mid-decode.
@@ -36,7 +37,7 @@ impl SplitKvConfig {
         kv_len.div_ceil(self.actual_chunk_size(kv_len)).max(1)
     }
 
-    pub fn label(self) -> String {
+    pub(crate) fn label(self) -> String {
         format!(
             "split_kv_{}x{}",
             self.chunk_tokens, self.max_chunks_per_request

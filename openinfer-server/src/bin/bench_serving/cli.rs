@@ -1,6 +1,9 @@
 //! CLI surface: global options, subcommands, and per-command argument structs.
 
-use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use clap::Args as ClapArgs;
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
 use openinfer_core::engine::EpBackend;
 
 pub(crate) const DEFAULT_MODEL_PATH: &str =
@@ -75,6 +78,23 @@ impl From<CliEpBackend> for EpBackend {
         match value {
             CliEpBackend::Nccl => Self::Nccl,
             CliEpBackend::DeepEp => Self::DeepEp,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum, PartialEq, Eq)]
+pub(crate) enum CliQwen35SchedulerPolicy {
+    #[default]
+    Off,
+    Auto,
+}
+
+impl CliQwen35SchedulerPolicy {
+    #[cfg(feature = "qwen35")]
+    pub(crate) fn resolve(self) -> openinfer_qwen35::Qwen35SchedulerPolicy {
+        match self {
+            Self::Off => openinfer_qwen35::Qwen35SchedulerPolicy::Off,
+            Self::Auto => openinfer_qwen35::Qwen35SchedulerPolicy::Auto,
         }
     }
 }
@@ -161,6 +181,10 @@ pub(crate) struct Cli {
     /// is a valid starvation / negative-control cell.
     #[arg(long, default_value_t = 4)]
     pub(crate) max_batch: usize,
+
+    /// Qwen3.5 scheduler policy for prefill/decode balancing.
+    #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
+    pub(crate) qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
 
     #[command(subcommand)]
     pub(crate) command: Command,

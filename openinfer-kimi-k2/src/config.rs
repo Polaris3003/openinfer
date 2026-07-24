@@ -4,9 +4,13 @@
 // helpers are intentionally kept compiling in feature-off builds.
 #![cfg_attr(not(feature = "kimi-k2"), allow(dead_code))]
 
-use std::{fs, path::Path};
+use std::fs;
+use std::path::Path;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use serde_json::Value;
 
 pub(crate) const KIMI_K2_HIDDEN: usize = 7168;
@@ -373,7 +377,7 @@ impl KimiK2ParallelShape {
     }
 
     #[must_use]
-    pub(crate) fn new(tp_world: usize, dp_world: usize) -> Self {
+    fn new(tp_world: usize, dp_world: usize) -> Self {
         let ep_world = tp_world * dp_world;
         Self {
             tp_world,

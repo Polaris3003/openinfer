@@ -5,18 +5,26 @@
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{FinishReason, GenerateRequest, LoadSnapshot, TokenSink};
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::TokenSink;
 use openinfer_kv_cache::BlockPool;
 use openinfer_sample::SamplingParams;
 
-use crate::model::GLM52_MAX_BATCH_PER_RANK;
-
+use super::ActiveRequest;
+use super::PAGE;
+use super::RankSlots;
 use super::admission::lifetime_blocks;
+use super::admit_from_queue;
 use super::graph::graph_dump_bucket;
+use super::publish_load;
 use super::slot::GLM52_DSPARK_EP8_SPAN_DRAFTS;
-use super::slot::{Glm52SlotState, Glm52StepOutcome};
-use super::testkit::{EOS, request};
-use super::{ActiveRequest, PAGE, RankSlots, admit_from_queue, publish_load};
+use super::slot::Glm52SlotState;
+use super::slot::Glm52StepOutcome;
+use super::testkit::EOS;
+use super::testkit::request;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
 
 #[test]
 fn graph_dump_uses_a_serving_shape_for_each_topology() {
@@ -98,6 +106,7 @@ fn admission_never_moves_a_rank_bound_request() {
         false,
         false,
         false,
+        false,
         &mut pending_resets,
         &mut slots_changed,
     )
@@ -107,6 +116,43 @@ fn admission_never_moves_a_rank_bound_request() {
     assert!(slots[1][0].is_some());
     assert!(pending.iter().all(VecDeque::is_empty));
     assert!(slots_changed);
+}
+
+#[test]
+fn prefill_only_admits_one_request_per_tp_group() {
+    let pools = vec![BlockPool::new(PAGE, 16).expect("pool")];
+    let mut slots: Vec<RankSlots> = vec![std::array::from_fn(|_| None)];
+    let mut pending: Vec<VecDeque<GenerateRequest>> = vec![VecDeque::new()];
+    let mut token_receivers = Vec::new();
+    for token in [10, 20] {
+        let mut req = request(vec![token], SamplingParams::default(), 1);
+        let (token_tx, token_rx) = TokenSink::standalone();
+        req.token_tx = token_tx;
+        token_receivers.push(token_rx);
+        pending[0].push_back(req);
+    }
+    let mut pending_resets = vec![Vec::new()];
+    let mut slots_changed = false;
+
+    admit_from_queue(
+        &mut pending,
+        &mut slots,
+        &pools,
+        &[15],
+        None,
+        &mut None,
+        &[],
+        true,
+        true,
+        false,
+        true,
+        &mut pending_resets,
+        &mut slots_changed,
+    )
+    .expect("prefill-only admission");
+
+    assert_eq!(slots[0].iter().flatten().count(), 1);
+    assert_eq!(pending[0].len(), 1);
 }
 
 /// Drive one request end to end through the coordinator's exact

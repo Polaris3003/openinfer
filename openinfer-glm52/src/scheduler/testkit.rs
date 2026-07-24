@@ -1,10 +1,13 @@
 //! Shared fixtures for the scheduler module tests.
 
-use openinfer_core::engine::{FinishReason, GenerateRequest};
-use openinfer_kv_cache::{BlockPool, RequestKv};
+use openinfer_core::engine::FinishReason;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::RequestKv;
 
 use super::PAGE;
-use super::slot::{Glm52SlotState, Glm52StepOutcome};
+use super::slot::Glm52SlotState;
+use super::slot::Glm52StepOutcome;
 
 pub(super) const EOS: &[u32] = &[7];
 
@@ -40,6 +43,7 @@ pub(super) fn request(
 ) -> GenerateRequest {
     let (token_tx, _token_rx) = openinfer_core::engine::TokenSink::standalone();
     GenerateRequest {
+        trace_parent: None,
         request_id: None,
         queued_at_unix_s: None,
         data_parallel_rank: None,

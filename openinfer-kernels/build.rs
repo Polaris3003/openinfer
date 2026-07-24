@@ -1,7 +1,9 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
@@ -1408,7 +1410,7 @@ fn main() {
     let moe_enabled = cfg!(feature = "moe");
     let glm52_enabled = cfg!(feature = "glm52");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
-    let qwen35_enabled = cfg!(feature = "qwen35-4b");
+    let qwen35_enabled = cfg!(feature = "qwen35");
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
     }
@@ -1879,7 +1881,7 @@ fn main() {
         compile_triton_aot_kernels(&cuda_include, &out_dir, &sm_targets);
     } else {
         println!(
-            "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35-4b` feature to build them (needs Python + Triton at build time)"
+            "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35` feature to build them (needs Python + Triton at build time)"
         );
     }
 

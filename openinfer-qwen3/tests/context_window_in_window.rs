@@ -22,7 +22,10 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink};
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
 
 const MODEL_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../models/Qwen3-4B");
@@ -67,6 +70,7 @@ fn in_window_prompt_past_old_rope_table_is_served() {
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

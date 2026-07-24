@@ -8,14 +8,18 @@
 
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
+use anyhow::anyhow;
 use bytes::Bytes;
 use futures::Stream;
 use futures::StreamExt;
 use tokio::task::JoinHandle;
 
-use super::batcher::{BatchingConfig, EventBatcher};
-use super::protocol::{InstanceId, KvCacheEvent, KvbmCacheEvents};
+use super::batcher::BatchingConfig;
+use super::batcher::EventBatcher;
+use super::protocol::InstanceId;
+use super::protocol::KvCacheEvent;
+use super::protocol::KvbmCacheEvents;
 use crate::pubsub::Publisher;
 
 /// Builder for constructing a [`KvbmCacheEventsPublisher`].
@@ -198,11 +202,6 @@ impl KvbmCacheEventsPublisher {
             handle.abort();
         }
     }
-
-    /// Checks if the publisher task is finished.
-    pub fn is_finished(&self) -> bool {
-        self.handle.as_ref().is_none_or(|h| h.is_finished())
-    }
 }
 
 impl Drop for KvbmCacheEventsPublisher {
@@ -216,13 +215,15 @@ impl Drop for KvbmCacheEventsPublisher {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use dynamo_tokens::TokenBlockSequence;
+    use futures::future::BoxFuture;
+
     use super::*;
     use crate::KvbmSequenceHashProvider;
     use crate::pubsub::Publisher;
-    use dynamo_tokens::TokenBlockSequence;
-    use futures::future::BoxFuture;
-    use std::sync::Mutex;
-    use std::time::Duration;
 
     fn create_seq_hash_at_position(position: usize) -> crate::SequenceHash {
         let tokens_per_block = 4;

@@ -1,25 +1,31 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, GpuTensor, GpuWeight};
+use crate::tensor::DeviceContext;
+use crate::tensor::GpuTensor;
+use crate::tensor::GpuWeight;
 
-pub const KIMI_K2_ROUTER_HIDDEN: usize = 7168;
-pub const KIMI_K2_ROUTER_EXPERTS: usize = 384;
-pub const KIMI_K2_ROUTER_TOPK: usize = 8;
-pub const KIMI_K2_ROUTER_N_GROUP: usize = 1;
-pub const KIMI_K2_ROUTER_TOPK_GROUP: usize = 1;
+const KIMI_K2_ROUTER_HIDDEN: usize = 7168;
+const KIMI_K2_ROUTER_EXPERTS: usize = 384;
+const KIMI_K2_ROUTER_TOPK: usize = 8;
+const KIMI_K2_ROUTER_N_GROUP: usize = 1;
+const KIMI_K2_ROUTER_TOPK_GROUP: usize = 1;
 pub const KIMI_K2_ROUTER_SCALE: f32 = 2.827;
 const KIMI_K2_ROUTER_WEIGHT_SCALE: f32 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KimiRouterConfig {
-    pub hidden_dim: usize,
-    pub n_experts: usize,
-    pub topk: usize,
-    pub n_group: usize,
-    pub topk_group: usize,
-    pub route_scale: f32,
+    hidden_dim: usize,
+    n_experts: usize,
+    topk: usize,
+    n_group: usize,
+    topk_group: usize,
+    route_scale: f32,
 }
 
 impl KimiRouterConfig {
@@ -34,7 +40,7 @@ impl KimiRouterConfig {
         }
     }
 
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.hidden_dim > 0,
             "Kimi router hidden_dim must be positive"
@@ -75,7 +81,7 @@ pub struct KimiRouterBatch {
 }
 
 impl KimiRouterBatch {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.batch_size > 0,
             "Kimi router batch_size must be positive"
@@ -99,7 +105,7 @@ pub struct KimiRouterOutput<'a> {
     pub topk_idx: &'a mut CudaSlice<i32>,
 }
 
-pub fn validate_kimi_router_shapes<const DIM: usize>(
+fn validate_kimi_router_shapes<const DIM: usize>(
     config: KimiRouterConfig,
     batch: KimiRouterBatch,
     hidden: &GpuTensor<DIM>,

@@ -1,18 +1,26 @@
 //! comfy_table renderers for the text report format.
 
 use std::fmt::Write as _;
-use std::io::{IsTerminal, stdout};
+use std::io::IsTerminal;
+use std::io::stdout;
 use std::time::Duration;
 
+use comfy_table::Cell;
+use comfy_table::CellAlignment;
+use comfy_table::Table;
 use comfy_table::modifiers::UTF8_ROUND_CORNERS;
-use comfy_table::presets::{ASCII_FULL_CONDENSED, UTF8_FULL_CONDENSED};
-use comfy_table::{Cell, CellAlignment, Table};
+use comfy_table::presets::ASCII_FULL_CONDENSED;
+use comfy_table::presets::UTF8_FULL_CONDENSED;
 
 use crate::metrics::summarize_durations;
-use crate::report::{
-    CurveReport, DecodeReport, DurationStats, MatrixReport, MixedLoadReport, PrefillReport,
-    RequestReport, RunInfo,
-};
+use crate::report::CurveReport;
+use crate::report::DecodeReport;
+use crate::report::DurationStats;
+use crate::report::MatrixReport;
+use crate::report::MixedLoadReport;
+use crate::report::PrefillReport;
+use crate::report::RequestReport;
+use crate::report::RunInfo;
 use crate::snapshot::format_delta;
 
 pub(crate) fn new_table() -> Table {
@@ -506,6 +514,17 @@ pub(crate) fn render_mixed_text(report: &MixedLoadReport) -> String {
         0.0
     };
     let _ = writeln!(out, "stall gaps: {stalled}/{total} ({stall_pct:.1}%)");
+    let _ = writeln!(
+        out,
+        "background generated tokens: min={} max={} avg={:.2} runs={}",
+        report.background_generated_tokens.min,
+        report.background_generated_tokens.max,
+        report.background_generated_tokens.avg,
+        report.background_generated_tokens.samples
+    );
+    if let Some(trace) = report.background_generated_token_traces.first() {
+        let _ = writeln!(out, "background hash0: {} len={}", trace.hash, trace.len);
+    }
 
     let dur = |ms: f64| Duration::from_secs_f64(ms / 1000.0);
     let prefill_line = |label: &str, ms: &[Duration]| {
@@ -536,6 +555,25 @@ pub(crate) fn render_mixed_text(report: &MixedLoadReport) -> String {
             .collect();
         out.push_str(&prefill_line("injected prefill (cold)", &cold));
         out.push_str(&prefill_line("injected prefill (warm)", &warm));
+        if let Some(first) = report.injections.first() {
+            let min_generated = report
+                .injections
+                .iter()
+                .map(|r| r.generated_tokens)
+                .min()
+                .unwrap_or(0);
+            let max_generated = report
+                .injections
+                .iter()
+                .map(|r| r.generated_tokens)
+                .max()
+                .unwrap_or(0);
+            let _ = writeln!(
+                out,
+                "injection generated tokens: min={min_generated} max={max_generated} hash0={} len={}",
+                first.generated_token_trace.hash, first.generated_token_trace.len
+            );
+        }
     }
 
     let d = &report.decision_inputs;

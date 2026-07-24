@@ -1,7 +1,11 @@
 //! GLM5.2 tensor-parallel MoE launch surface shared by TP4 and TP8.
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
@@ -9,7 +13,7 @@ use crate::tensor::DeviceContext;
 
 pub const GLM52_TP_MAX_RANKS: usize = 8;
 pub const GLM52_TP_HIDDEN: usize = 6144;
-pub const GLM52_TP_TOPK: usize = 8;
+const GLM52_TP_TOPK: usize = 8;
 pub const GLM52_TP_BANK_EXPERTS: usize = 257;
 pub const GLM52_TP_TOKENS: usize = 8;
 pub const GLM52_TP_UNION_MAX: usize = GLM52_TP_TOKENS * (GLM52_TP_TOPK + 1);

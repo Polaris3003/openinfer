@@ -1,13 +1,17 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
 pub const GLM52_INDEXER_HEAD_DIM: usize = 128;
-pub const GLM52_INDEXER_QUANT_BLOCK_SIZE: usize = 128;
-pub const GLM52_INDEXER_SCALE_BYTES_PER_TOKEN: usize = 4;
+const GLM52_INDEXER_QUANT_BLOCK_SIZE: usize = 128;
+const GLM52_INDEXER_SCALE_BYTES_PER_TOKEN: usize = 4;
 pub const GLM52_INDEXER_TOPK: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,11 +22,11 @@ pub struct Glm52IndexerCacheLayout {
 }
 
 impl Glm52IndexerCacheLayout {
-    pub fn min_block_stride_bytes(self) -> usize {
+    fn min_block_stride_bytes(self) -> usize {
         self.cache_block_size * (GLM52_INDEXER_HEAD_DIM + GLM52_INDEXER_SCALE_BYTES_PER_TOKEN)
     }
 
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.cache_blocks > 0,
             "GLM5.2 indexer cache_blocks must be positive"
@@ -55,7 +59,7 @@ pub struct Glm52IndexerCacheInsert {
 }
 
 impl Glm52IndexerCacheInsert {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.tokens > 0,
             "GLM5.2 indexer cache insert tokens must be positive"
@@ -122,7 +126,7 @@ pub struct Glm52IndexerLocalTopKToSlots {
 }
 
 impl Glm52IndexerLocalTopKToSlots {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.num_tokens > 0,
             "GLM5.2 indexer local_topk_to_slots num_tokens must be positive"

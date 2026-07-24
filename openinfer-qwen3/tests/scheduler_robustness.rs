@@ -17,13 +17,16 @@
 use std::path::Path;
 use std::time::Duration;
 
-use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
-};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_kernels::ops::{
-    NumericPolicy, numeric_policy, pin_served, reset_numeric_policy_counters,
-};
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::numeric_policy;
+use openinfer_kernels::ops::pin_served;
+use openinfer_kernels::ops::reset_numeric_policy_counters;
 use vllm_text::tokenizer::DynTokenizer;
 
 mod common;
@@ -56,6 +59,7 @@ fn generate_text(
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -124,6 +128,7 @@ fn scheduler_survives_consumer_drop() {
     drop(rx);
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

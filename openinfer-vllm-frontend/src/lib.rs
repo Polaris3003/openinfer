@@ -4,28 +4,37 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use axum::Router;
 use log::warn;
+use openinfer_engine::engine::EngineHandle;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use vllm_engine_core_client::TransportMode;
-use vllm_server::{
-    ApiServerOptions, ChatTemplateContentFormatOption, Config, CoordinatorMode, CorsConfig,
-    DEFAULT_KEEP_ALIVE_TIMEOUT, HttpListenerMode, ParserSelection, RendererSelection,
-};
-
-use openinfer_engine::engine::EngineHandle;
+use vllm_server::ApiServerOptions;
+use vllm_server::ChatTemplateContentFormatOption;
+use vllm_server::Config;
+use vllm_server::CoordinatorMode;
+use vllm_server::CorsConfig;
+use vllm_server::DEFAULT_KEEP_ALIVE_TIMEOUT;
+use vllm_server::HttpListenerMode;
+use vllm_server::ParserSelection;
+use vllm_server::RendererSelection;
 
 mod bridge;
 mod lora;
+mod request_contract;
 mod wire;
 
-use bridge::{LocalEngineBridge, ipc_endpoint, local_ipc_namespace};
-use lora::{load_startup_lora_modules, lora_openai_routes, lora_routes};
-
+use bridge::LocalEngineBridge;
+use bridge::ipc_endpoint;
+use bridge::local_ipc_namespace;
 pub use lora::LoraModule;
+use lora::load_startup_lora_modules;
+use lora::lora_openai_routes;
+use lora::lora_routes;
 
 #[derive(Debug, Deserialize)]
 struct ModelLenConfig {
@@ -90,6 +99,31 @@ pub async fn serve_with_engine_count(
         resolve_max_model_len(model_path, max_model_len),
         engine_count,
         shutdown,
+    )
+    .await
+}
+
+/// Serve an endpoint that requires `max_tokens=1`.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_prefill_only_with_engine_count(
+    engine: impl Future<Output = Result<EngineHandle>> + Send + 'static,
+    model_path: &Path,
+    served_model_name: Vec<String>,
+    port: u16,
+    max_model_len: Option<u32>,
+    engine_count: usize,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    serve_model_on_host_with_router_extension(
+        engine,
+        model_path.to_string_lossy().into_owned(),
+        served_model_name,
+        "0.0.0.0".to_string(),
+        port,
+        resolve_max_model_len(model_path, max_model_len),
+        engine_count,
+        shutdown,
+        request_contract::prefill_only_routes,
     )
     .await
 }

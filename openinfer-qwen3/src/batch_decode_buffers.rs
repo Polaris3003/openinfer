@@ -1,16 +1,17 @@
 //! Pre-allocated GPU buffers for batched decode (multiple requests, 1 token each).
 
 use anyhow::Result;
-
 use cudarc::driver::CudaSlice;
 use log::info;
-
 use openinfer_core::cuda_graph::CudaGraphState;
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_kernels::ops::NumericPolicy;
+use openinfer_kernels::ops::gemm_lt_pin_warmup;
+use openinfer_kernels::ops::numeric_policy;
+use openinfer_kv_cache::KvView;
 
 use crate::split_kv::SplitKvConfig;
-use openinfer_kernels::ops::{NumericPolicy, gemm_lt_pin_warmup, numeric_policy};
-use openinfer_kv_cache::KvView;
 
 /// Bucket sizes for CUDA Graph capture. Actual batch is padded to the nearest bucket.
 /// Based on vLLM's cudagraph capture list up to 256; graphs are captured lazily per
@@ -40,7 +41,7 @@ const SPLIT_KV_MAX_CHUNKS_PER_REQUEST: usize = 256; // split-KV workspace/guard 
 const SPLIT_KV_MAX_BATCH_SIZE: usize = 32;
 
 /// The split-KV config for `policy`: 64-token floor + per-policy cap (Tuned 64, Pin/PerToken 256).
-pub(crate) const fn split_kv_config(policy: NumericPolicy) -> SplitKvConfig {
+const fn split_kv_config(policy: NumericPolicy) -> SplitKvConfig {
     let max_chunks = match policy {
         NumericPolicy::Tuned => SPLIT_KV_TUNED_MAX_CHUNKS,
         NumericPolicy::Pin | NumericPolicy::PerToken => SPLIT_KV_MAX_CHUNKS_PER_REQUEST,
@@ -200,7 +201,7 @@ pub(crate) fn bucket_for(bs: usize) -> usize {
 /// Uses `HiddenStates` (2D) instead of `DeviceVec` (1D) — the "seq_len" dimension
 /// is actually the batch dimension (one token per request).
 pub(crate) struct BatchDecodeBuffers {
-    pub(crate) max_batch_size: usize,
+    max_batch_size: usize,
 
     // Per-layer intermediates [dim, max_batch_size]
     pub(crate) normed: HiddenStates,
@@ -210,7 +211,7 @@ pub(crate) struct BatchDecodeBuffers {
     pub(crate) attn_out: HiddenStates,
     pub(crate) attn_proj: HiddenStates,
     /// Fused QKV projection output [q_dim + 2*kv_dim, bs]
-    pub(crate) qkv_out: HiddenStates,
+    qkv_out: HiddenStates,
     /// Split MLP gate projection output [intermediate_size, bs].
     pub(crate) gate_out: HiddenStates,
     /// Split MLP up projection output [intermediate_size, bs].
@@ -525,9 +526,11 @@ impl BatchDecodeBuffers {
 
 #[cfg(test)]
 mod tests {
-    use super::{BatchDecodeBuffers, build_split_kv_csr};
     use openinfer_core::tensor::DeviceContext;
     use openinfer_kv_cache::KvView;
+
+    use super::BatchDecodeBuffers;
+    use super::build_split_kv_csr;
 
     #[test]
     fn shared_prefix_views_are_counted_by_reference() {

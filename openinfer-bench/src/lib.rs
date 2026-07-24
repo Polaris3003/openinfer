@@ -8,21 +8,27 @@
 //! keeps only its own `measure_*` providers (which call into [`measure_loop`])
 //! and its own schedule walk (which feeds [`accumulate`]).
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
 use cudarc::driver::sys;
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, GpuWeight, KernelCall, TensorSpec};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::GpuWeight;
+use openinfer_kernels::tensor::KernelCall;
+use openinfer_kernels::tensor::TensorSpec;
 use serde::Serialize;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct LatencyStats {
-    pub iters: u64,
+    iters: u64,
     pub mean_us: f64,
-    pub stddev_us: f64,
-    pub min_us: f64,
-    pub p50_us: f64,
-    pub p95_us: f64,
+    stddev_us: f64,
+    min_us: f64,
+    p50_us: f64,
+    p95_us: f64,
     pub p99_us: f64,
-    pub max_us: f64,
+    max_us: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,7 +213,7 @@ pub struct RollupRow {
     pub op: String,
     pub calls: usize,
     pub total_us: f64,
-    pub total_p99_us: f64,
+    total_p99_us: f64,
     pub per_call_us: f64,
     pub stddev_us: f64,
     pub p99_us: f64,
@@ -224,7 +230,7 @@ pub struct CallSiteRow {
     pub stddev_us: f64,
     pub p99_us: f64,
     pub total_us: f64,
-    pub total_p99_us: f64,
+    total_p99_us: f64,
     pub pct: f64,
 }
 

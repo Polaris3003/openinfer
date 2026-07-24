@@ -1,9 +1,14 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use anyhow::{Result, ensure};
-use openinfer_engine::engine::{
-    EngineHandle, FinishReason, GenerateRequest, TokenEvent, TokenLogprob,
-};
+use anyhow::Result;
+use anyhow::ensure;
+use openinfer_engine::engine::EngineHandle;
+use openinfer_engine::engine::FinishReason;
+use openinfer_engine::engine::GenerateRequest;
+use openinfer_engine::engine::TokenEvent;
+use openinfer_engine::engine::TokenLogprob;
 use tokio::sync::mpsc;
 
 #[derive(Clone, Debug)]
@@ -203,6 +208,7 @@ mod tests {
 
         run_simulated_request(
             GenerateRequest {
+                trace_parent: None,
                 request_id: Some("req-scripted".to_string()),
                 queued_at_unix_s: Some(1.0),
                 data_parallel_rank: None,
@@ -249,6 +255,7 @@ mod tests {
 
         run_simulated_request(
             GenerateRequest {
+                trace_parent: None,
                 request_id: Some("req-trunc".to_string()),
                 queued_at_unix_s: Some(1.0),
                 data_parallel_rank: None,
@@ -301,6 +308,7 @@ mod tests {
 
         run_simulated_request(
             GenerateRequest {
+                trace_parent: None,
                 request_id: Some("req-1".to_string()),
                 queued_at_unix_s: Some(1.0),
                 data_parallel_rank: None,

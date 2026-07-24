@@ -4,32 +4,50 @@
 //! [`run_scheduler_stream`] instead of re-implementing submit/drain.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use log::info;
-
 use openinfer::sampler::SamplingParams;
 use openinfer::scheduler::SchedulerHandle;
 use openinfer::server_engine::ModelType;
 
-use crate::cli::{Cli, MixedArgs};
-use crate::exec::{BenchModel, run_scheduler_stream};
-use crate::metrics::{dur_ms, summarize_durations};
-use crate::prompt::{synthetic_prompt_tokens, synthetic_prompt_tokens_salted};
-use crate::report::{
-    BenchReport, DurationStats, InjectionRecord, MixedDecisionInputs, MixedLoadConfig,
-    MixedLoadItl, MixedLoadReport,
-};
+use crate::cli::Cli;
+use crate::cli::MixedArgs;
+use crate::exec::BenchModel;
+use crate::exec::run_scheduler_stream;
+use crate::metrics::dur_ms;
+use crate::metrics::generated_token_trace;
+use crate::metrics::summarize_counts;
+use crate::metrics::summarize_durations;
+use crate::prompt::synthetic_prompt_tokens;
+use crate::prompt::synthetic_prompt_tokens_salted;
+use crate::report::BenchReport;
+use crate::report::DurationStats;
+use crate::report::InjectionRecord;
+use crate::report::MixedDecisionInputs;
+use crate::report::MixedLoadConfig;
+use crate::report::MixedLoadItl;
+use crate::report::MixedLoadReport;
 use crate::runners::run_info;
-use crate::snapshot::{delta_pct, git_short_commit, gpu_name, today_date};
+use crate::snapshot::delta_pct;
+use crate::snapshot::git_short_commit;
+use crate::snapshot::gpu_name;
+use crate::snapshot::today_date;
 
 /// One background decode stream's record over a mixed-load (or baseline) phase.
 struct BgStream {
     /// Wall-clock instant of each emitted decode token.
     token_times: Vec<Instant>,
+    /// Generated token ids for output sanity/hash checks.
+    generated_tokens: Vec<u32>,
     /// True if the stream hit its `output_len` (Finished) before being stopped —
     /// signals that steady-state concurrency dropped mid-run.
     finished_early: bool,
@@ -73,14 +91,16 @@ fn spawn_background_streams(
             thread::spawn(move || -> Result<BgStream> {
                 let prompt = synthetic_prompt_tokens(bg_prompt_len);
                 let mut token_times = Vec::with_capacity(bg_output_len);
+                let mut generated_tokens = Vec::with_capacity(bg_output_len);
                 let outcome = run_scheduler_stream(
                     &handle,
                     Some(format!("mixed-bg-{idx}")),
                     prompt,
                     greedy_sampling(),
                     bg_output_len,
-                    |_id| {
+                    |id| {
                         token_times.push(Instant::now());
+                        generated_tokens.push(id);
                         counters[idx].fetch_add(1, Ordering::Relaxed);
                         !stop.load(Ordering::Acquire)
                     },
@@ -88,6 +108,7 @@ fn spawn_background_streams(
                 // Dropping the stream cancels the request if it is still active.
                 Ok(BgStream {
                     token_times,
+                    generated_tokens,
                     finished_early: outcome.finished,
                 })
             })
@@ -175,14 +196,16 @@ fn run_injector(
         let prompt = synthetic_prompt_tokens_salted(inj_prompt_len, salt);
         let slot_start = Instant::now();
         let mut last = slot_start;
+        let mut generated_tokens = Vec::with_capacity(inj_output_len);
         run_scheduler_stream(
             handle,
             Some(format!("mixed-inj-{index}")),
             prompt,
             greedy_sampling(),
             inj_output_len,
-            |_| {
+            |id| {
                 last = Instant::now();
+                generated_tokens.push(id);
                 true
             },
         )?;
@@ -192,6 +215,8 @@ fn run_injector(
             warm,
             prefill_ms: dur_ms(last - slot_start),
             arrival_offset_ms: dur_ms(slot_start - t0),
+            generated_tokens: generated_tokens.len(),
+            generated_token_trace: generated_token_trace(&generated_tokens),
         });
         let elapsed = slot_start.elapsed();
         if elapsed < period {
@@ -324,7 +349,7 @@ pub(crate) fn run_mixed_load(
     // other model lines ignore it and keep their own capacity, so comparing
     // `bg_concurrency` against `cli.max_batch` for them would be a false alarm.
     // `ModelType::Qwen35` only exists under the feature, so gate the whole check.
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     if matches!(model_type, ModelType::Qwen35) && args.bg_concurrency >= cli.max_batch {
         let msg = format!(
             "slot starvation: --bg-concurrency ({}) >= --max-batch ({}), \
@@ -455,6 +480,16 @@ pub(crate) fn run_mixed_load(
             max_batch: cli.max_batch,
             max_prefill_tokens: cli.max_prefill_tokens,
         },
+        background_generated_tokens: summarize_counts(
+            &streams
+                .iter()
+                .map(|stream| stream.generated_tokens.len())
+                .collect::<Vec<_>>(),
+        ),
+        background_generated_token_traces: streams
+            .iter()
+            .map(|stream| generated_token_trace(&stream.generated_tokens))
+            .collect(),
         baseline_itl,
         mixed_itl,
         injections: inj.records,

@@ -1,29 +1,41 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use memmap2::Mmap;
 use safetensors::Dtype;
 use serde_json::Value;
 
-use crate::config::{
-    GLM52_DENSE_INTERMEDIATE, GLM52_DENSE_LAYERS, GLM52_EXPERT_INTERMEDIATE, GLM52_HIDDEN,
-    GLM52_INDEX_HEAD_DIM, GLM52_INDEX_HEADS, GLM52_KV_A_OUT, GLM52_KV_B_OUT, GLM52_KV_LORA_RANK,
-    GLM52_LAYERS, GLM52_O_PROJ_IN, GLM52_Q_B_OUT, GLM52_Q_LORA_RANK, GLM52_ROUTED_EXPERTS,
-    GLM52_VOCAB,
-};
+use crate::config::GLM52_DENSE_INTERMEDIATE;
+use crate::config::GLM52_DENSE_LAYERS;
+use crate::config::GLM52_EXPERT_INTERMEDIATE;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_INDEX_HEADS;
+use crate::config::GLM52_KV_A_OUT;
+use crate::config::GLM52_KV_B_OUT;
+use crate::config::GLM52_KV_LORA_RANK;
+use crate::config::GLM52_LAYERS;
+use crate::config::GLM52_O_PROJ_IN;
+use crate::config::GLM52_Q_B_OUT;
+use crate::config::GLM52_Q_LORA_RANK;
+use crate::config::GLM52_ROUTED_EXPERTS;
+use crate::config::GLM52_VOCAB;
 
 mod context;
 mod load;
+mod staging;
 
 pub(crate) use context::Glm52RankGpuContext;
 pub(crate) use load::Glm52ExpertLayerRegions;
-pub(crate) use load::{Glm52RankGpuWeights, load_rank_weights_to_gpu};
+pub(crate) use load::Glm52RankGpuWeights;
+pub(crate) use load::load_rank_weights_to_gpu;
 
 const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
-pub(crate) const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
+const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
 /// The EP8 production partition (8 ranks × 32 experts). Serving-path code
 /// derives rank/expert counts from the launch topology
 /// (`Glm52MoeTopo::ep_local_experts`); these constants remain the manifest
@@ -62,7 +74,7 @@ pub(crate) enum Glm52ExpertRegionKind {
 }
 
 impl Glm52ExpertRegionKind {
-    pub(crate) const ALL: [Self; 4] = [
+    const ALL: [Self; 4] = [
         Self::W13Weight,
         Self::W13Scale,
         Self::W2Weight,
@@ -71,7 +83,7 @@ impl Glm52ExpertRegionKind {
 
     /// Total bytes of this region for one layer's rank-local experts
     /// (`local_experts` = 32 for EP8, 64 for EP4).
-    pub(crate) fn region_bytes(self, local_experts: usize) -> usize {
+    fn region_bytes(self, local_experts: usize) -> usize {
         local_experts * self.expert_stride()
     }
 
@@ -88,9 +100,9 @@ impl Glm52ExpertRegionKind {
 /// Destination of one routed-expert tensor inside its layer's packed regions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52ExpertPlacement {
-    pub(crate) layer: usize,
-    pub(crate) region: Glm52ExpertRegionKind,
-    pub(crate) offset: usize,
+    layer: usize,
+    region: Glm52ExpertRegionKind,
+    offset: usize,
 }
 
 /// Classify a tensor name: `Some(placement)` for routed-expert tensors (the
@@ -101,7 +113,10 @@ pub(crate) fn expert_placement(
     name: &str,
     rank_experts: &std::ops::Range<usize>,
 ) -> Result<Option<Glm52ExpertPlacement>> {
-    use Glm52ExpertRegionKind::{W2Scale, W2Weight, W13Scale, W13Weight};
+    use Glm52ExpertRegionKind::W2Scale;
+    use Glm52ExpertRegionKind::W2Weight;
+    use Glm52ExpertRegionKind::W13Scale;
+    use Glm52ExpertRegionKind::W13Weight;
 
     let Some((layer, rest)) = name
         .strip_prefix("model.layers.")
@@ -148,14 +163,14 @@ pub(crate) fn expert_placement(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52TensorLoadSpec {
-    pub(crate) name: String,
-    pub(crate) shard: String,
+    name: String,
+    shard: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52ShardLoadPlan {
-    pub(crate) shard: String,
-    pub(crate) tensors: Vec<Glm52TensorLoadSpec>,
+    shard: String,
+    tensors: Vec<Glm52TensorLoadSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,11 +183,11 @@ pub(crate) struct Glm52RankWeightPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52RankLoadBundle {
     pub(crate) plan: Glm52RankWeightPlan,
-    pub(crate) shards: Vec<Glm52ShardLoadPlan>,
+    shards: Vec<Glm52ShardLoadPlan>,
 }
 
 impl Glm52RankLoadBundle {
-    pub(crate) fn planned_total_bytes(&self) -> Result<usize> {
+    fn planned_total_bytes(&self) -> Result<usize> {
         self.shards
             .iter()
             .flat_map(|shard| shard.tensors.iter())
@@ -200,7 +215,7 @@ pub(crate) struct Glm52TensorContract {
 }
 
 impl Glm52TensorContract {
-    pub(crate) fn byte_len(&self) -> Result<usize> {
+    fn byte_len(&self) -> Result<usize> {
         let elements = self.shape.iter().try_fold(1usize, |total, dim| {
             total.checked_mul(*dim).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -659,6 +674,7 @@ pub(crate) fn mmap_file(path: &Path) -> Result<Mmap> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]

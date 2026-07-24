@@ -24,9 +24,9 @@
 //! target distribution; acceptance only decides how many ride one step.
 
 use anyhow::Result;
+use openinfer_core::sampler::SamplingParams;
 
 use crate::executor::RequestId;
-use openinfer_core::sampler::SamplingParams;
 
 /// One request's verify span: the current dangling token followed by the draft
 /// candidates (`token_ids[0]` is the confirmed last token, `token_ids[1..]` are
@@ -130,7 +130,7 @@ pub(crate) struct DraftResult {
 /// # Panics
 /// Panics (debug builds) if `target_argmax.len() != proposed.len() + 1`.
 #[must_use]
-pub(crate) fn accept_prefix_match(proposed: &[u32], target_tokens: &[u32]) -> Vec<u32> {
+fn accept_prefix_match(proposed: &[u32], target_tokens: &[u32]) -> Vec<u32> {
     debug_assert_eq!(
         target_tokens.len(),
         proposed.len() + 1,

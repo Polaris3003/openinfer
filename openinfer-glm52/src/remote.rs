@@ -18,25 +18,40 @@
 //! exactly like a dead worker thread today. No retry, no reconnect, no
 //! buffering.
 
-use std::{
-    collections::VecDeque,
-    io::{BufReader, BufWriter, Read, Write},
-    net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    thread,
-};
+use std::collections::VecDeque;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::ensure;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use crossbeam_channel::bounded;
+use crossbeam_channel::unbounded;
 use openinfer_kv_offload::KvArena;
 
 use crate::Glm52MoeTopo;
 use crate::dspark::GLM52_DSPARK_DRAFTS;
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52StepKv, Glm52StepShape};
-use crate::runner::{
-    Glm52RankPlacement, Glm52RankWeightLoadReport, Glm52RankWorker, Glm52RowSample, Glm52StepFlags,
-};
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::runner::Glm52RankPlacement;
+use crate::runner::Glm52RankWeightLoadReport;
+use crate::runner::Glm52RankWorker;
+use crate::runner::Glm52RowSample;
+use crate::runner::Glm52StepFlags;
 use crate::weights::Glm52WeightManifest;
 
 /// Bump on ANY wire-visible change. Both ends ship in one repo at one
@@ -110,6 +125,7 @@ enum WireRequest {
     LoadWeights {
         model_path: PathBuf,
         moe_topo: Glm52MoeTopo,
+        weight_staging: bool,
     },
     BuildModel {
         max_model_len: usize,
@@ -441,6 +457,7 @@ impl Glm52RemoteRankWorker {
         &self,
         model_path: &Path,
         moe_topo: Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (tx, rx) = bounded(1);
         self.node.shared.submit(
@@ -448,6 +465,7 @@ impl Glm52RemoteRankWorker {
             WireRequest::LoadWeights {
                 model_path: model_path.to_path_buf(),
                 moe_topo,
+                weight_staging,
             },
             PendingResp::LoadWeights(tx),
         )?;
@@ -747,6 +765,9 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
             "GLM5.2 rank-host teardown exceeded {deadline:?} (worker stuck in a \
              collective missing peers?); exiting for a clean restart"
         );
+        // EP rank-host watchdog: a stuck collective can never make progress, so
+        // dying here and letting the orchestrator restart the rank is the protocol.
+        #[allow(clippy::exit)]
         std::process::exit(2);
     }
     let _ = teardown.join();
@@ -804,7 +825,12 @@ fn host_demux_loop(
             WireRequest::LoadWeights {
                 model_path,
                 moe_topo,
-            } => HostPending::LoadWeights(worker.load_weights_async(&model_path, moe_topo)?),
+                weight_staging,
+            } => HostPending::LoadWeights(worker.load_weights_async(
+                &model_path,
+                moe_topo,
+                weight_staging,
+            )?),
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,

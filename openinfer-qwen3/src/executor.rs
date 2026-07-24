@@ -1,45 +1,72 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
 use std::thread;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use crossbeam_channel as channel;
-
-use crate::batch_decode::DecodeGraphUse;
-use crate::batch_decode_buffers::{BATCH_BUCKETS, BatchDecodeBuffers};
-use crate::config::{Config, TensorParallelConfig};
-use crate::weights::{KvBudget, ModelRuntimeConfig, Qwen3MemoryOptions, Qwen3Model};
-use crate::{Qwen3LoraOptions, Qwen3OffloadOptions};
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
-use openinfer_core::engine::{
-    LoadLoraAdapterRequest, TokenEvent, TokenLogprob, TokenSink, UnloadLoraAdapterRequest,
-    panic_message,
-};
+use openinfer_core::engine::LoadLoraAdapterRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenLogprob;
+use openinfer_core::engine::TokenSink;
+use openinfer_core::engine::UnloadLoraAdapterRequest;
+use openinfer_core::engine::panic_message;
 use openinfer_core::kv_pool::KvLayout;
 use openinfer_core::ops;
 use openinfer_core::sampler::SamplingParams;
-use openinfer_core::tensor::{DeviceContext, HiddenStates};
-use openinfer_kv_cache::{
-    KvBlockGuard, KvBuffer, KvCacheEvent, KvCacheManager, KvView, LoadReservation, PrefixProbe,
-    RegisteredBlock,
-};
-use openinfer_kv_offload::{LoadHandle, OffloadConfig, OffloadEngine};
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_core::weight_loader::WeightPrefetch;
+use openinfer_core::weight_loader::load_shard_info;
+use openinfer_kv_cache::KvBlockGuard;
+use openinfer_kv_cache::KvBuffer;
+use openinfer_kv_cache::KvCacheEvent;
+use openinfer_kv_cache::KvCacheManager;
+use openinfer_kv_cache::KvView;
+use openinfer_kv_cache::LoadReservation;
+use openinfer_kv_cache::PrefixProbe;
+use openinfer_kv_cache::RegisteredBlock;
+use openinfer_kv_offload::LoadHandle;
+use openinfer_kv_offload::OffloadConfig;
+use openinfer_kv_offload::OffloadEngine;
 use tokio::sync::broadcast;
+
+use crate::Qwen3LoraOptions;
+use crate::Qwen3OffloadOptions;
+use crate::batch_decode::DecodeGraphUse;
+use crate::batch_decode_buffers::BATCH_BUCKETS;
+use crate::batch_decode_buffers::BatchDecodeBuffers;
+use crate::config::Config;
+use crate::config::TensorParallelConfig;
+use crate::weights::KvBudget;
+use crate::weights::ModelRuntimeConfig;
+use crate::weights::Qwen3MemoryOptions;
+use crate::weights::Qwen3Model;
 
 mod dflash_lane;
 mod dflash_prefill;
 mod remote_fetch;
-use remote_fetch::{QueryView, RemoteFetchAction, remote_fetch_action};
+use remote_fetch::QueryView;
+use remote_fetch::RemoteFetchAction;
+use remote_fetch::remote_fetch_action;
 mod spec;
 
-use crate::dflash::DFlashDraftModel;
-use crate::speculative::{
-    DraftPlan, DraftResult, DraftStepItem, VerifyPlan, VerifyResult, VerifyStepItem,
-    build_verify_results,
-};
 use dflash_lane::DFlashLaneState;
-use dflash_prefill::{DFlashPrefillAction, dflash_prefill_action};
+use dflash_prefill::DFlashPrefillAction;
+use dflash_prefill::dflash_prefill_action;
 
+use crate::dflash::DFlashDraftModel;
+use crate::speculative::DraftPlan;
+use crate::speculative::DraftResult;
+use crate::speculative::DraftStepItem;
+use crate::speculative::VerifyPlan;
+use crate::speculative::VerifyResult;
+use crate::speculative::VerifyStepItem;
+use crate::speculative::build_verify_results;
 use crate::verify_graph::VerifyGraphBuffers;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -50,7 +77,7 @@ impl RequestId {
         Self(value)
     }
 
-    pub fn get(self) -> u64 {
+    pub(crate) fn get(self) -> u64 {
         self.0
     }
 }
@@ -483,11 +510,10 @@ fn execute_step_on_lane(
         } => {
             use openinfer_kernels::tensor::StreamOverrideGuard;
 
-            // If there's still an inflight prefill from a previous step, sync it
-            // now (shouldn't happen normally, but safety).
-            if lane.inflight_prefill.is_some() {
-                lane.resolve_inflight_prefill()?;
-            }
+            anyhow::ensure!(
+                lane.inflight_prefill.is_none(),
+                "SplitConcurrent dispatched with an unresolved in-flight prefill"
+            );
 
             let prefill_prompts: Vec<&[u32]> = prefill_requests
                 .iter()
@@ -503,76 +529,75 @@ fn execute_step_on_lane(
                 .map(|req| req.lora_adapter.as_deref())
                 .collect();
 
-            // Sync ctx.stream: ensures all prior stream-ordered allocs and
-            // H2D copies are complete before green streams touch them.
-            lane.model.device_ctx().sync()?;
-
-            // Launch prefill on prefill partition stream.
-            let (prefill_logits, _, _) = {
+            // Declared before the bin so that on any early return (`?` or panic)
+            // the bin drops first: its Drop synchronizes the prefill stream before
+            // `prefill_logits` and the parked temporaries the bin owns are freed.
+            let prefill_logits;
+            let mut prefill_temp_bin = crate::prefill::PrefillTempBin::armed(prefill_stream.0);
+            {
                 let _prefill_override = unsafe { StreamOverrideGuard::activate(prefill_stream.0) };
-                lane.execute_prefill(
+                let (logits, _, _) = lane.execute_prefill(
                     &prefill_prompts,
                     prefill_kv_views,
                     &prefill_lora_adapters,
                     false,
                     None,
-                )?
-            };
+                )?;
+                prefill_logits = logits;
+            }
+            // Close the prefill parking window before decode, so decode's own
+            // temporaries don't land in it.
+            prefill_temp_bin.close();
 
-            // Launch decode on the decode partition stream. CUDA graph stays
-            // enabled: batch_decode captures into the split graph cache keyed on
-            // the active stream override, so the replayed kernel nodes stay
-            // pinned to the decode SM partition (CUDA PG §4.6.5 — capture stream
-            // determines a node's execution context).
             {
+                let _decode_guard = DecodeStreamGuard {
+                    stream: decode_stream.0,
+                };
                 let _decode_override = unsafe { StreamOverrideGuard::activate(decode_stream.0) };
                 lane.execute_decode(&decode_tokens, decode_kv_views, &decode_lora_adapters)?;
             }
 
-            // Only sync decode stream — decode result is ready for sampling.
-            // Prefill continues async on GPU; polled later via event.
-            let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(decode_stream.0) };
-            if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                anyhow::bail!("cuStreamSynchronize(decode) failed: {r:?}");
+            let decode_result =
+                build_batch_decode_request_results(lane, decode_requests, *sample_seed)?;
+
+            let event = lane
+                .model
+                .device_ctx()
+                .ctx
+                .new_event(None)
+                .map_err(|e| anyhow::anyhow!("cuEventCreate(prefill poll) failed: {e}"))?;
+            unsafe {
+                // The prefill stream may be a Green Context stream; cuEventRecord
+                // needs the event and stream in one context, so record via the
+                // green context when the stream has one (stream mode has none).
+                let mut gctx: cudarc::driver::sys::CUgreenCtx = std::ptr::null_mut();
+                let get = cudarc::driver::sys::cuStreamGetGreenCtx(prefill_stream.0, &raw mut gctx);
+                let record = if get != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    get
+                } else if gctx.is_null() {
+                    cudarc::driver::sys::cuEventRecord(event.cu_event(), prefill_stream.0)
+                } else {
+                    cudarc::driver::sys::cuGreenCtxRecordEvent(gctx, event.cu_event())
+                };
+                anyhow::ensure!(
+                    record == cudarc::driver::sys::CUresult::CUDA_SUCCESS,
+                    "recording prefill poll event failed: {record:?}"
+                );
             }
 
-            if collect_result {
-                // Sample decode tokens immediately.
-                let decode_result =
-                    build_batch_decode_request_results(lane, decode_requests, *sample_seed)?;
+            lane.inflight_prefill = Some(InflightPrefillState {
+                temp_bin: prefill_temp_bin,
+                prefill_logits,
+                prefill_requests: prefill_requests.clone(),
+                sample_seed: *sample_seed,
+            });
 
-                // Record event on prefill stream for non-blocking poll.
-                let mut event: cudarc::driver::sys::CUevent = std::ptr::null_mut();
-                unsafe {
-                    cudarc::driver::sys::cuEventCreate(
-                        &raw mut event,
-                        cudarc::driver::sys::CUevent_flags_enum::CU_EVENT_DISABLE_TIMING as u32,
-                    );
-                    cudarc::driver::sys::cuEventRecord(event, prefill_stream.0);
-                }
-
-                // Store prefill state for deferred sync+sample.
-                lane.inflight_prefill = Some(InflightPrefillState {
-                    prefill_stream: prefill_stream.0,
-                    prefill_logits,
-                    prefill_requests: prefill_requests.clone(),
-                    sample_seed: *sample_seed,
-                });
-
-                Ok(WorkerStepOutcome::SplitDecodeReady {
-                    decode: DecodeResult {
-                        requests: decode_result,
-                    },
-                    prefill_event: SendEvent(event),
-                })
-            } else {
-                // Non-primary worker: still need to sync prefill before returning.
-                let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(prefill_stream.0) };
-                if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                    anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
-                }
-                Ok(WorkerStepOutcome::Ack)
-            }
+            Ok(WorkerStepOutcome::SplitDecodeReady {
+                decode: DecodeResult {
+                    requests: decode_result,
+                },
+                prefill_event: event,
+            })
         }
         StepCommand::SpeculativeVerify {
             requests,
@@ -636,7 +661,8 @@ fn tune_decode_gemm_algos(
     max_prefill_tokens: usize,
     run_envelope_check: bool,
 ) -> Result<()> {
-    use openinfer_kernels::ops::{NumericPolicy, numeric_policy};
+    use openinfer_kernels::ops::NumericPolicy;
+    use openinfer_kernels::ops::numeric_policy;
 
     let ctx = model.device_ctx();
     let hidden = model.config().hidden_size;
@@ -771,10 +797,10 @@ pub struct UnifiedPlan<'a> {
 
 #[derive(Clone, Debug)]
 pub struct PrefillRequestResult {
-    pub request_id: RequestId,
+    pub(crate) request_id: RequestId,
     pub first_token: u32,
     pub first_token_logprob: Option<TokenLogprob>,
-    pub prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
+    pub(crate) prompt_logprobs: Option<Vec<Option<TokenLogprob>>>,
     /// Prompt tokens served from the prefix cache (KV reused, not recomputed).
     pub cached_tokens: usize,
     /// Whether the prompt is fully prefilled. When false this step ran a
@@ -782,12 +808,12 @@ pub struct PrefillRequestResult {
     pub completed: bool,
     /// Prompt tokens with KV computed after this step (authoritative —
     /// includes prefix-cache hits the scheduler can't see).
-    pub prefill_pos: usize,
+    pub(crate) prefill_pos: usize,
 }
 
 #[derive(Clone, Debug)]
 pub struct DecodeRequestResult {
-    pub request_id: RequestId,
+    pub(crate) request_id: RequestId,
     pub token: u32,
     pub logprob: Option<TokenLogprob>,
 }
@@ -797,7 +823,7 @@ pub struct PrefillResult {
     /// Requests whose DFlash target context was captured this prefill step.
     /// Empty unless speculative decoding is enabled. The executor folds these
     /// into its `dflash_ready_requests` set once the prompt is fully prefilled.
-    pub dflash_context_captured_requests: Vec<RequestId>,
+    pub(crate) dflash_context_captured_requests: Vec<RequestId>,
 }
 
 pub struct DecodeResult {
@@ -995,12 +1021,11 @@ pub struct Qwen3Executor {
     /// registration tail, and self-saves are skipped (this node's kvbm keys
     /// would be unfindable in the vLLM-keyed content domain).
     vllm_compat: Option<VllmCompatState>,
-    /// Green Context SM partition for concurrent prefill/decode. `None` when
-    /// disabled (default) or when the GPU does not support Green Contexts.
+    /// Overlap streams (`--decode-overlap`); `None` when off.
     overlap: Option<crate::green_ctx::OverlapStreams>,
     /// In-flight async prefill state. Populated by the SplitConcurrent step,
     /// consumed by `poll_async_prefill`.
-    async_prefill: Option<AsyncPrefillState>,
+    async_prefill: Option<cudarc::driver::CudaEvent>,
     /// DFlash draft metadata; `Some` once a draft model is loaded into the
     /// primary lane. Speculative decoding is enabled iff this is set.
     speculative: Option<DFlashMeta>,
@@ -1030,21 +1055,6 @@ struct ExecutorKvEvents {
     /// [`Qwen3Executor::take_kv_store_events`].
     pending_dropped: Vec<Vec<RegisteredBlock>>,
 }
-
-/// State for an in-flight async prefill on the prefill overlap stream.
-struct AsyncPrefillState {
-    event: cudarc::driver::sys::CUevent,
-}
-
-// SAFETY: AsyncPrefillState is only accessed from the single executor/scheduler
-// thread that owns the GPU context. The raw CUevent pointer is not shared.
-unsafe impl Send for AsyncPrefillState {}
-
-/// Wrapper to send CUevent across the worker→executor channel boundary.
-/// SAFETY: The event is created on the worker thread's GPU context and consumed
-/// on the executor thread (same device, sequential access).
-struct SendEvent(cudarc::driver::sys::CUevent);
-unsafe impl Send for SendEvent {}
 
 /// One request's in-flight CPU-tier KV prefetch.
 ///
@@ -1120,7 +1130,7 @@ impl Qwen3Executor {
         self.primary.dump_decode_graph_png(png_path.to_path_buf())
     }
 
-    pub(crate) fn single(
+    fn single(
         model: Qwen3Model,
         offload_opts: &Qwen3OffloadOptions,
         max_prefill_tokens: usize,
@@ -1355,6 +1365,10 @@ impl Qwen3Executor {
 
         let world_size = device_ordinals.len();
         let mut models = Vec::with_capacity(world_size);
+        // TP ranks load sequentially and suppress per-rank prefetch, so keep one
+        // whole-checkpoint prefetch alive across the loop.
+        let (shard_paths, _) = load_shard_info(model_path)?;
+        let prefetch = WeightPrefetch::spawn(&shard_paths);
         for (rank, &device_ordinal) in device_ordinals.iter().enumerate() {
             models.push(Qwen3Model::from_safetensors_with_runtime(
                 model_path,
@@ -1367,6 +1381,7 @@ impl Qwen3Executor {
                 },
             )?);
         }
+        drop(prefetch);
         // Profile each rank independently and use the minimum shared block
         // count. The logical scheduler uses one block budget for all ranks, but
         // free memory and worker-thread runtime allocations are per device.
@@ -1568,22 +1583,6 @@ impl Qwen3Executor {
         })
     }
 
-    pub fn block_size(&self) -> usize {
-        <Self as ModelExecutor>::block_size(self)
-    }
-
-    pub fn max_request_blocks(&self) -> usize {
-        <Self as ModelExecutor>::max_request_blocks(self)
-    }
-
-    pub fn available_blocks(&self) -> usize {
-        <Self as ModelExecutor>::available_blocks(self)
-    }
-
-    pub fn is_stop_token(&self, token_id: u32) -> bool {
-        <Self as ModelExecutor>::is_stop_token(self, token_id)
-    }
-
     pub fn drop_request(&mut self, request_id: RequestId) -> Result<()> {
         <Self as ModelExecutor>::drop_request(self, request_id)
     }
@@ -1633,7 +1632,7 @@ impl Qwen3Executor {
     /// Configure two-stream prefill/decode overlap (see [`crate::DecodeOverlap`]).
     /// A no-op for [`crate::DecodeOverlap::Off`]; otherwise sets up the streams,
     /// returning an error if the GPU/driver cannot honor the requested mode.
-    pub fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
+    pub(crate) fn enable_decode_overlap(&mut self, overlap: crate::DecodeOverlap) -> Result<()> {
         // Pre-capture backstop: a runtime caller could set Pin then enable overlap here, bypassing the
         // engine-entry guard. launch_gemm_pin also bails on the resulting stream override, but only mid
         // graph-capture/replay (a hot-path failure) — rejecting here moves it to a safe point.
@@ -1663,11 +1662,6 @@ impl Qwen3Executor {
         Ok(())
     }
 
-    /// Whether prefill/decode overlap (two-stream or SM partition) is active.
-    pub fn decode_overlap_enabled(&self) -> bool {
-        self.overlap.is_some()
-    }
-
     /// vLLM-style `--no-prefix-cache`. Behaviour depends on whether offload is
     /// active:
     ///   * **No offload** — classic: disable prefix matching outright, so every
@@ -1681,7 +1675,7 @@ impl Qwen3Executor {
     /// A resident HBM block and its host-tier copy share one content hash, so
     /// the cache cannot be told to prefer L2 for a block still in HBM — the only
     /// way to force the bytes from L2 is to not keep the HBM copy around.
-    pub fn set_no_prefix_cache(&mut self, on: bool) {
+    pub(crate) fn set_no_prefix_cache(&mut self, on: bool) {
         if self.offload.is_some() {
             let retained_before = self.retains_completed_kv_blocks();
             self.l1_retention_disabled = on;
@@ -1698,7 +1692,7 @@ impl Qwen3Executor {
     /// is incompatible with KV offload. Disables the prefix cache: speculative
     /// capture needs clean, uncached target hidden states for every prompt
     /// token, and a prefix-cache hit skips the forward that would produce them.
-    pub fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
+    pub(crate) fn load_dflash_draft_model(&mut self, draft_path: &str) -> Result<()> {
         anyhow::ensure!(
             self.workers.is_empty(),
             "speculative decoding requires the single-GPU path (got {} extra ranks)",
@@ -2702,6 +2696,23 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn execute_unified(&mut self, plan: UnifiedPlan<'_>) -> Result<UnifiedResult> {
+        // The scheduler resolves any prior async prefill before this step; a
+        // pending one here is a broken contract. Checked before any KV commit.
+        anyhow::ensure!(
+            self.async_prefill.is_none(),
+            "async prefill invariant violated: a previous prefill is still pending at a new unified step"
+        );
+        // Low-level callers can bypass the startup guard; LoRA prefill scratch is
+        // unordered across ctx.stream and the overlap stream.
+        anyhow::ensure!(
+            self.overlap.is_none()
+                || plan
+                    .prefill_requests
+                    .iter()
+                    .all(|request| request.lora_adapter.is_none()),
+            "LoRA prefill does not support decode-overlap"
+        );
+
         // 1. Create RequestKvs for prefill requests (first chunk only), clamp
         // chunk budgets, schedule KV for this step's tokens
         let mut prefill_requests = plan.prefill_requests.to_vec();
@@ -2789,42 +2800,43 @@ impl ModelExecutor for Qwen3Executor {
             }
             WorkerStepOutcome::SplitDecodeReady {
                 decode: decode_result,
-                prefill_event: SendEvent(event),
+                prefill_event: event,
             } => {
-                // SM-partition path: decode done, prefill still in-flight.
-                // Apply decode immediately.
-                for req_result in &decode_result.requests {
-                    let rkv = self
-                        .request_kvs
-                        .get_mut(&req_result.request_id)
-                        .expect("request must exist after split decode");
-                    rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                // Prefill may still be in flight (the `event` signals completion),
+                // writing this step's KV pages. An error return releases those pages,
+                // so sync the event first; success leaves the prefill in flight.
+                let applied =
+                    decode_result
+                        .requests
+                        .iter()
+                        .try_for_each(|req_result| -> Result<()> {
+                            let rkv = self
+                                .request_kvs
+                                .get_mut(&req_result.request_id)
+                                .expect("request must exist after split decode");
+                            rkv.apply_decode(req_result.token, self.kv_mgr.pool())?;
+                            Ok(())
+                        });
+                if let Err(e) = applied {
+                    let sync = unsafe { cudarc::driver::sys::cuEventSynchronize(event.cu_event()) };
+                    if sync != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                        log::error!(
+                            "FATAL: cuEventSynchronize(prefill) failed on the decode-error \
+                             path ({sync:?}); aborting to avoid releasing KV pages the \
+                             prefill stream may still be writing"
+                        );
+                        std::process::abort();
+                    }
+                    let rx = self.primary.resolve_prefill()?;
+                    rx.recv().map_err(|_| {
+                        anyhow::anyhow!("worker dropped resolve_prefill on decode-error path")
+                    })??;
+                    return Err(e);
                 }
                 for req_result in &decode_result.requests {
                     self.save_sealed_blocks(req_result.request_id);
                 }
-                // Store event for non-blocking poll by scheduler.
-                // If a previous async prefill wasn't consumed, wait for it now.
-                if let Some(old) = self.async_prefill.take() {
-                    unsafe {
-                        cudarc::driver::sys::cuEventSynchronize(old.event);
-                    }
-                    unsafe {
-                        cudarc::driver::sys::cuEventDestroy_v2(old.event);
-                    }
-                    // Force resolve the worker's inflight prefill too
-                    if let Ok(rx) = self.primary.resolve_prefill() {
-                        if let Ok(Ok(result)) = rx.recv() {
-                            for req_result in &result.requests {
-                                let _ = self.apply_prefill_result(req_result);
-                            }
-                            for req_result in &result.requests {
-                                self.save_sealed_blocks(req_result.request_id);
-                            }
-                        }
-                    }
-                }
-                self.async_prefill = Some(AsyncPrefillState { event });
+                self.async_prefill = Some(event);
                 // Return a UnifiedResult with empty prefill — scheduler will
                 // get prefill results via poll_async_prefill.
                 Ok(UnifiedResult {
@@ -3029,30 +3041,42 @@ impl ModelExecutor for Qwen3Executor {
     }
 
     fn poll_async_prefill(&mut self) -> Option<PrefillResult> {
-        let state = self.async_prefill.as_ref()?;
-        // Non-blocking check: is the prefill stream done?
-        let status = unsafe { cudarc::driver::sys::cuEventQuery(state.event) };
-        if status != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            // Not ready yet (CUDA_ERROR_NOT_READY)
-            return None;
+        let status =
+            unsafe { cudarc::driver::sys::cuEventQuery(self.async_prefill.as_ref()?.cu_event()) };
+        match status {
+            cudarc::driver::sys::CUresult::CUDA_ERROR_NOT_READY => return None,
+            cudarc::driver::sys::CUresult::CUDA_SUCCESS => {}
+            other => {
+                log::error!(
+                    "FATAL: cuEventQuery(prefill poll) returned {other:?}; async prefill/context \
+                     state untrustworthy — aborting"
+                );
+                std::process::abort();
+            }
         }
-        // Prefill is done — resolve it via the worker.
-        let event = self.async_prefill.take().unwrap().event;
-        unsafe {
-            cudarc::driver::sys::cuEventDestroy_v2(event);
-        }
-
-        // Ask worker to sync + sample the prefill result.
-        let Ok(rx) = self.primary.resolve_prefill() else {
-            return None;
+        let _ = self.async_prefill.take();
+        let rx = self.primary.resolve_prefill().unwrap_or_else(|e| {
+            log::error!(
+                "FATAL: resolve_prefill failed after the async prefill completed ({e}); aborting"
+            );
+            std::process::abort();
+        });
+        let result = match rx.recv() {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
+                log::error!("FATAL: worker resolve_prefill errored ({e}); aborting");
+                std::process::abort();
+            }
+            Err(_) => {
+                log::error!("FATAL: worker dropped the resolve_prefill response; aborting");
+                std::process::abort();
+            }
         };
-        let Ok(Ok(result)) = rx.recv() else {
-            return None;
-        };
-
-        // Apply prefill results (KV commit)
         for req_result in &result.requests {
-            let _ = self.apply_prefill_result(req_result);
+            self.apply_prefill_result(req_result).unwrap_or_else(|e| {
+                log::error!("FATAL: apply_prefill_result failed ({e}); aborting");
+                std::process::abort();
+            });
         }
         for req_result in &result.requests {
             self.save_sealed_blocks(req_result.request_id);
@@ -3063,8 +3087,9 @@ impl ModelExecutor for Qwen3Executor {
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_lora_capacity;
     use std::collections::HashSet;
+
+    use super::ensure_lora_capacity;
 
     #[test]
     fn lora_capacity_rejects_new_adapter_at_limit() {
@@ -3156,7 +3181,8 @@ struct LocalQwen3Lane {
 
 /// Stored state for an async prefill that was launched but not yet synced.
 struct InflightPrefillState {
-    prefill_stream: cudarc::driver::sys::CUstream,
+    /// Field order is load-bearing: `temp_bin` must drop before `prefill_logits`.
+    temp_bin: crate::prefill::PrefillTempBin,
     prefill_logits: HiddenStates,
     prefill_requests: Vec<PrefillStepItem>,
     /// Per-step sampling seed captured when the prefill was launched, replayed
@@ -3167,6 +3193,25 @@ struct InflightPrefillState {
 // SAFETY: InflightPrefillState lives entirely within the worker thread that
 // owns the GPU context. It is never shared across threads.
 unsafe impl Send for InflightPrefillState {}
+
+/// Drains the decode stream on scope exit (success, `?`, or panic) before this
+/// step's KV pages can be released; a failed drain aborts (fail-closed).
+struct DecodeStreamGuard {
+    stream: cudarc::driver::sys::CUstream,
+}
+
+impl Drop for DecodeStreamGuard {
+    fn drop(&mut self) {
+        let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(self.stream) };
+        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            log::error!(
+                "FATAL: cuStreamSynchronize(decode) failed ({r:?}); aborting rather than \
+                 release KV pages the decode stream may still be reading"
+            );
+            std::process::abort();
+        }
+    }
+}
 
 impl LocalQwen3Lane {
     fn new(
@@ -3323,21 +3368,13 @@ impl LocalQwen3Lane {
     }
 
     /// Sync the in-flight prefill stream and sample prefill tokens.
-    /// Returns the prefill result. Panics if no inflight prefill exists.
     fn resolve_inflight_prefill(&mut self) -> Result<PrefillResult> {
-        let state = self
+        let mut state = self
             .inflight_prefill
             .take()
             .ok_or_else(|| anyhow::anyhow!("no inflight prefill to resolve"))?;
 
-        // Sync prefill stream
-        let r = unsafe { cudarc::driver::sys::cuStreamSynchronize(state.prefill_stream) };
-        if r != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-            anyhow::bail!("cuStreamSynchronize(prefill) failed: {r:?}");
-        }
-
-        // Now safe to drop deferred GPU buffers (prefill kernels are done).
-        crate::prefill::drain_deferred_drops();
+        state.temp_bin.synchronize();
 
         // Sample prefill tokens
         let params: Vec<&SamplingParams> =
@@ -3563,8 +3600,8 @@ enum StepCommand {
         decode_kv_views: Vec<KvView>,
         sample_seed: u64,
     },
-    /// Split-concurrent: prefill and decode launch on separate Green Context
-    /// streams (different SM partitions) for true GPU-level parallelism.
+    /// Split-concurrent: prefill and decode launch on separate overlap streams
+    /// (SM-partitioned under `green-ctx`, shared under `stream`) for concurrency.
     SplitConcurrent {
         prefill_requests: Vec<PrefillStepItem>,
         prefill_kv_views: Vec<KvView>,
@@ -3677,14 +3714,14 @@ enum WorkerStepOutcome {
     Prefill(PrefillResult),
     Decode(DecodeResult),
     Unified(UnifiedResult),
-    /// SM-partition split: decode result is ready; prefill is still in-flight
+    /// Split-concurrent: decode result is ready; prefill is still in-flight
     /// on the prefill stream. The executor must call a follow-up to sync+sample
     /// prefill before using prefill scratch buffers again.
     SplitDecodeReady {
         decode: DecodeResult,
         /// Event recorded on prefill stream after all prefill kernels;
         /// query this to check if prefill is done without blocking.
-        prefill_event: SendEvent,
+        prefill_event: cudarc::driver::CudaEvent,
     },
     SpeculativeVerify(VerifyResult),
     SpeculativeDraft(DraftResult),

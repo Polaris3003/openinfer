@@ -7,14 +7,19 @@
 //! `Vec<u8>` here — the caller (scheduler) derives them from kvbm sequence
 //! hashes, so this layer never depends on the logical-cache hashing scheme.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use cudarc::driver::CudaStream;
 use openinfer_kv_cache::KvBuffer;
-use pegaflow_core::{
-    EngineError, LayerSave, P2pTransferService, PegaEngine, PrefetchStatus, QueryLeaseId,
-    StorageConfig, TransferMode,
-};
+use pegaflow_core::EngineError;
+use pegaflow_core::LayerSave;
+use pegaflow_core::P2pTransferService;
+use pegaflow_core::PegaEngine;
+use pegaflow_core::PrefetchStatus;
+use pegaflow_core::QueryLeaseId;
+use pegaflow_core::StorageConfig;
+use pegaflow_core::TransferMode;
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -73,24 +78,24 @@ pub struct P2pConfig {
 pub struct OffloadConfig {
     /// Stable identifier shared across this engine's lifetime so prefix blocks
     /// saved by one request are query-visible to the next.
-    pub instance_id: String,
+    instance_id: String,
     /// Content-addressing domain shared with P2P peers: two engines see each
     /// other's blocks iff their namespaces match. Callers derive it from
     /// whatever makes KV layouts interchange-safe (model, dtype, block
     /// geometry). Single-node offload can use any constant.
-    pub namespace: String,
+    namespace: String,
     /// CUDA device ordinal whose KV buffer this engine offloads.
-    pub device_id: i32,
+    device_id: i32,
     /// Host pinned-memory pool size in bytes (the CPU KV tier capacity).
-    pub pinned_pool_bytes: usize,
+    pinned_pool_bytes: usize,
     /// Back the pinned pool with hugepages (see [`HostConfig::use_hugepages`]).
     pub use_hugepages: bool,
     /// Worker threads for the embedded runtime that drives pegaflow's async
     /// save/query. Two is plenty: save is fire-and-forget, query is a brief
     /// memory-cache lookup.
-    pub runtime_threads: usize,
+    runtime_threads: usize,
     /// `Some` joins the cross-instance P2P mesh (see [`P2pConfig`]).
-    pub p2p: Option<P2pConfig>,
+    p2p: Option<P2pConfig>,
 }
 
 impl OffloadConfig {
@@ -321,6 +326,7 @@ pub struct OffloadHost {
     runtime: Runtime,
     /// `Some` when P2P is on: resolves the P2P serving tasks (gRPC transfer
     /// service + transfer-lock GC) on drop.
+    #[allow(dead_code)]
     p2p_shutdown: Option<oneshot::Sender<()>>,
 }
 
@@ -441,10 +447,6 @@ impl OffloadHost {
             p2p_shutdown,
         }))
     }
-
-    pub fn p2p_enabled(&self) -> bool {
-        self.p2p_shutdown.is_some()
-    }
 }
 
 /// In-process bridge from one rank's GPU KV cache to pegaflow's offload
@@ -502,28 +504,13 @@ impl OffloadEngine {
         )
     }
 
-    /// Build the engine over explicit arenas instead of one fused
-    /// [`KvBuffer`] — for models whose per-layer caches are separate
-    /// allocations (GLM5.2: MLA latent + index-K per layer). Same contract as
-    /// [`Self::new`], plus: every arena's device allocation must stay live
-    /// and pointer-stable for the engine's lifetime (the registration bakes
-    /// raw device addresses), and all arenas must be indexed by the same pool
-    /// block ids.
-    pub fn with_arenas(config: OffloadConfig, arenas: &[KvArena]) -> Result<Self, EngineError> {
-        let host = OffloadHost::new(config.host())?;
-        Self::register(
-            host,
-            config.instance_id,
-            &config.namespace,
-            config.device_id,
-            Registration::from_arenas(arenas),
-            false,
-        )
-    }
-
-    /// [`Self::with_arenas`] onto an existing shared host: this rank becomes
+    /// Build the engine over explicit arenas (instead of one fused
+    /// [`KvBuffer`]) onto an existing shared host: this rank becomes
     /// one more pegaflow instance over the host's single pool. Ranks that
-    /// should see each other's blocks pass the same `namespace`.
+    /// should see each other's blocks pass the same `namespace`. Every
+    /// arena's device allocation must stay live and pointer-stable for the
+    /// engine's lifetime (the registration bakes raw device addresses), and
+    /// all arenas must be indexed by the same pool block ids.
     /// `page_first` must match how the namespace's writer stores blocks: the
     /// vLLM connector stores MLA-model blocks page-first (all layers of a
     /// block concatenated into one host page, offsets by lexicographic layer
@@ -776,11 +763,6 @@ impl OffloadEngine {
         Ok(LoadHandle { rx })
     }
 
-    /// Whether this engine participates in the cross-instance P2P mesh.
-    pub fn p2p_enabled(&self) -> bool {
-        self.host.p2p_enabled()
-    }
-
     /// Release a query lease without loading it.
     ///
     /// [`Self::query`] pins its hit blocks behind a lease until [`Self::load`]
@@ -868,13 +850,6 @@ impl OffloadEngine {
             let _ = done_tx.send(());
             then();
         });
-    }
-
-    /// Drop all resident CPU-tier blocks (test/eviction helper). Saved data in
-    /// a backing store would survive; the dense v1 path has none, so this
-    /// empties the CPU tier.
-    pub fn evict_all(&self) {
-        self.host.engine.cleanup_memory_cache();
     }
 }
 

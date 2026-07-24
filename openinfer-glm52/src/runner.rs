@@ -1,29 +1,41 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    thread,
-};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use std::time::Instant;
 
-use anyhow::{Context as _, Result, ensure};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use crossbeam_channel::bounded;
+use crossbeam_channel::unbounded;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_kv_offload::KvArena;
 
-use crate::dspark::{
-    GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch, Glm52DsparkSlotState,
-};
-
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
-use crate::moe_ep_wo::{Glm52MoeEpState, Glm52MoeEpWoState};
+use crate::dspark::GLM52_DSPARK_DRAFTS;
+use crate::dspark::Glm52DsparkModel;
+use crate::dspark::Glm52DsparkScratch;
+use crate::dspark::Glm52DsparkSlotState;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::Glm52RankModel;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::moe_ep_wo::Glm52MoeEpState;
+use crate::moe_ep_wo::Glm52MoeEpWoState;
 use crate::moe_ep8::Glm52MoeEp8State;
-use crate::moe_tp::{
-    Glm52MoeTpRank, Glm52MoeTpSliceBank, Glm52MoeTpState, Glm52TpExchange, load_tp_slice_layer,
-};
-use crate::weights::{
-    Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle, Glm52WeightManifest,
-    load_rank_weights_to_gpu,
-};
+use crate::moe_tp::Glm52MoeTpRank;
+use crate::moe_tp::Glm52MoeTpSliceBank;
+use crate::moe_tp::Glm52MoeTpState;
+use crate::moe_tp::Glm52TpExchange;
+use crate::moe_tp::load_tp_slice_layer;
+use crate::weights::Glm52RankGpuContext;
+use crate::weights::Glm52RankGpuWeights;
+use crate::weights::Glm52RankLoadBundle;
+use crate::weights::Glm52WeightManifest;
+use crate::weights::load_rank_weights_to_gpu;
 
 /// Global rank + local CUDA device of one worker. Rank bounds are enforced
 /// where placements are built, against the launch topology's real width —
@@ -39,7 +51,7 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) rank: usize,
     pub(crate) loaded_tensor_count: usize,
     pub(crate) loaded_total_bytes: usize,
-    pub(crate) resident_raw_bytes: usize,
+    resident_raw_bytes: usize,
     pub(crate) loaded_to_gpu: bool,
     /// This rank's device free VRAM right after the weights landed — the
     /// launch-time context-cap probe takes the fleet minimum.
@@ -57,6 +69,8 @@ pub(crate) struct Glm52StepFlags {
     /// advanced by its own argmax — every rank MUST enqueue that next
     /// replay launch-ahead (see `Glm52RankModel::decode_step`).
     pub(crate) lease: bool,
+    /// Bypass CUDA graph capture and replay.
+    pub(crate) eager: bool,
 }
 
 impl Glm52StepFlags {
@@ -65,6 +79,7 @@ impl Glm52StepFlags {
         Self {
             consume: false,
             lease: false,
+            eager: false,
         }
     }
 }
@@ -87,6 +102,7 @@ enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
         resp: Sender<Result<Glm52RankWeightLoadReport>>,
     },
     /// Non-collective: adopt the resident weights into the rank's model.
@@ -235,12 +251,14 @@ impl Glm52RankWorker {
         &self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::LoadWeights {
                 model_path: model_path.to_path_buf(),
                 moe_topo,
+                weight_staging,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -346,7 +364,7 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn dump_decode_graph_async(
+    fn dump_decode_graph_async(
         &self,
         bucket: usize,
         png_path: PathBuf,
@@ -364,7 +382,7 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn shutdown(&mut self) -> Result<()> {
+    fn shutdown(&mut self) -> Result<()> {
         self.request_shutdown()?;
         self.join()
     }
@@ -407,10 +425,11 @@ impl Glm52Worker {
         &self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         match self {
-            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo),
-            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo),
+            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
+            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
         }
     }
 
@@ -576,15 +595,21 @@ impl Glm52RankThreadState {
         &mut self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Glm52RankWeightLoadReport> {
-        let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle)?;
+        let rank_load_started = Instant::now();
+        let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle, weight_staging)?;
+        let resident_load_secs = rank_load_started.elapsed().as_secs_f64();
         if moe_topo.uses_tensor_replicated_moe() {
             // Tensor-replicated topology: the bundle carried no routed experts;
             // gather this rank's 1/TP intermediate slice of ALL experts for
             // every MoE layer instead.
             let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
             let dev_ctx = self.ctx.device_context()?;
+            let tp_slices_started = Instant::now();
+            let mut slowest_layer = None::<(usize, f64)>;
             for layer in crate::config::GLM52_DENSE_LAYERS..crate::config::GLM52_LAYERS {
+                let layer_started = Instant::now();
                 let bank = load_tp_slice_layer(
                     &dev_ctx,
                     model_path,
@@ -594,7 +619,24 @@ impl Glm52RankThreadState {
                     layer,
                 )?;
                 self.tp_slices.insert(layer, bank);
+                let elapsed = layer_started.elapsed().as_secs_f64();
+                if slowest_layer.is_none_or(|(_, slowest)| elapsed > slowest) {
+                    slowest_layer = Some((layer, elapsed));
+                }
             }
+            let (slowest_layer, slowest_secs) =
+                slowest_layer.expect("tensor-replicated topology has MoE layers");
+            log::info!(
+                "GLM5.2 rank {} TP slice-bank load profile: layers={}, total={:.2}s, \
+                 mean={:.2}s/layer, slowest_layer={} {:.2}s; this second pass re-reads and \
+                 host-gathers every routed expert independently on each TP rank",
+                self.placement.rank,
+                self.tp_slices.len(),
+                tp_slices_started.elapsed().as_secs_f64(),
+                tp_slices_started.elapsed().as_secs_f64() / self.tp_slices.len() as f64,
+                slowest_layer,
+                slowest_secs,
+            );
         }
         ensure!(
             loaded.loaded_total_bytes == loaded.weights.total_bytes,
@@ -613,6 +655,13 @@ impl Glm52RankThreadState {
             free_vram_bytes,
         };
         self.loaded = Some(loaded.weights);
+        log::info!(
+            "GLM5.2 rank {} complete weight residency: base_plan={resident_load_secs:.2}s, \
+             tp_slice_second_pass={:.2}s, total={:.2}s",
+            self.placement.rank,
+            (rank_load_started.elapsed().as_secs_f64() - resident_load_secs).max(0.0),
+            rank_load_started.elapsed().as_secs_f64(),
+        );
         Ok(report)
     }
 
@@ -915,9 +964,10 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::LoadWeights {
                 model_path,
                 moe_topo,
+                weight_staging,
                 resp,
             } => {
-                let _ = resp.send(state.load_weights(&model_path, moe_topo));
+                let _ = resp.send(state.load_weights(&model_path, moe_topo, weight_staging));
             }
             Glm52RankCommand::BuildModel {
                 max_model_len,

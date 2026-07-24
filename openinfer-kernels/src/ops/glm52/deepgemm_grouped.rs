@@ -5,15 +5,19 @@
 //! aligned slots `decode_combine` addresses. See
 //! `csrc/glm52/glm52_deepgemm_grouped.cu`.
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_DEEPGEMM_GROUPED_W13_KIND: i32 = 1;
-pub const GLM52_DEEPGEMM_GROUPED_W2_KIND: i32 = 2;
+const GLM52_DEEPGEMM_GROUPED_W13_KIND: i32 = 1;
+const GLM52_DEEPGEMM_GROUPED_W2_KIND: i32 = 2;
 /// Per-expert row alignment of the DeepEP recv segment layout (a fixed design
 /// constant shared with the vendored shim).
 pub const GLM52_DEEPGEMM_GROUPED_EXPERT_ALIGNMENT: usize = 64;

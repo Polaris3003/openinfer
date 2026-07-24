@@ -3,17 +3,20 @@ mod config;
 use std::time::Instant;
 
 use anyhow::Context;
-use clap::{CommandFactory, FromArgMatches};
+use clap::CommandFactory;
+use clap::FromArgMatches;
+use config::Args;
 use log::info;
 use openinfer::logging;
-use openinfer::server_engine::{ModelType, detect_model_type};
+use openinfer::server_engine::ModelType;
+use openinfer::server_engine::detect_model_type;
 use openinfer_core::engine::EngineHandle;
-#[cfg(feature = "qwen35-4b")]
-use openinfer_core::engine::EngineLoadOptions;
 #[cfg(feature = "qwen3")]
-use openinfer_qwen3::{Qwen3LaunchOptions, Qwen3LoraOptions, Qwen3OffloadOptions};
-
-use config::Args;
+use openinfer_qwen3::Qwen3LaunchOptions;
+#[cfg(feature = "qwen3")]
+use openinfer_qwen3::Qwen3LoraOptions;
+#[cfg(feature = "qwen3")]
+use openinfer_qwen3::Qwen3OffloadOptions;
 
 #[cfg(not(target_env = "msvc"))]
 #[global_allocator]
@@ -22,6 +25,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     logging::init_default();
+    openinfer_core::tracing::init();
 
     let matches = Args::command().get_matches();
     let args =
@@ -70,6 +74,10 @@ async fn main() -> anyhow::Result<()> {
     let port = args.port;
     let frontend_engine_count = 1;
     #[cfg(feature = "glm52")]
+    let glm52_prefill_only = model_type == ModelType::Glm52 && args.glm52_prefill_only;
+    #[cfg(not(feature = "glm52"))]
+    let glm52_prefill_only = false;
+    #[cfg(feature = "glm52")]
     let frontend_engine_count = if model_type == ModelType::Glm52 {
         args.moe_topo
             .parse::<openinfer_glm52::Glm52MoeTopo>()
@@ -82,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
         load_engine(&args, model_type)
     });
 
-    if enable_lora {
+    let serve_result = if enable_lora {
         // LoRA routes need the engine handle when the router is built, so this
         // path stays sequential.
         let handle = engine_load
@@ -117,18 +125,37 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::Ok(handle)
             }
         };
-        openinfer::vllm_frontend::serve_with_engine_count(
-            engine,
-            &model_path,
-            served_model_name.into_iter().collect(),
-            port,
-            None,
-            frontend_engine_count,
-            shutdown,
-        )
-        .await
+        if glm52_prefill_only {
+            openinfer::vllm_frontend::serve_prefill_only_with_engine_count(
+                engine,
+                &model_path,
+                served_model_name.into_iter().collect(),
+                port,
+                None,
+                frontend_engine_count,
+                shutdown,
+            )
+            .await
+        } else {
+            openinfer::vllm_frontend::serve_with_engine_count(
+                engine,
+                &model_path,
+                served_model_name.into_iter().collect(),
+                port,
+                None,
+                frontend_engine_count,
+                shutdown,
+            )
+            .await
+        }
     }
-    .context("vLLM frontend server failed")?;
+    .context("vLLM frontend server failed");
+
+    // Export the final batch of request spans before the runtime tears down.
+    // Flush before propagating an error too — a failed server is exactly where
+    // the last buffered spans matter. No-op when tracing was never enabled.
+    openinfer_core::tracing::flush();
+    serve_result?;
 
     Ok(())
 }
@@ -154,6 +181,11 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     dp_size: args.dp_size.unwrap_or_else(|| moe_topo.default_dp_size()),
                     dspark_draft_model_path: args.dflash_draft_model_path.clone(),
                     max_model_len: args.max_model_len,
+                    prefill_only: args.glm52_prefill_only.then_some(
+                        openinfer_glm52::Glm52PrefillOnlyOptions {
+                            chunk_size: args.glm52_prefill_chunk_size,
+                        },
+                    ),
                     no_prefix_cache: args.no_prefix_cache,
                     kv_offload: args
                         .kv_offload
@@ -189,6 +221,7 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                             }),
                         }),
                     moe_topo,
+                    weight_staging: args.glm52_weight_staging,
                     dump_graph_png: args.dump_graph_png.clone(),
                     rank_hosts: args
                         .rank_hosts
@@ -302,20 +335,19 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
             )
             .context("failed to start Qwen3 engine")?
         }
-        #[cfg(feature = "qwen35-4b")]
-        ModelType::Qwen35 => openinfer_qwen35_4b::launch_with_options(
+        #[cfg(feature = "qwen35")]
+        ModelType::Qwen35 => openinfer_qwen35::launch_with_options_and_policy(
             &args.model_path,
-            openinfer_qwen35_4b::Qwen35LaunchOptions {
+            openinfer_qwen35::Qwen35LaunchOptions {
                 device_ordinal: args.device_ordinal,
                 tp_size: args.tp_size,
                 cuda_graph: args.cuda_graph,
-                max_batch: args
-                    .max_batch
-                    .unwrap_or(openinfer_qwen35_4b::runtime::MAX_BATCH),
+                max_batch: args.max_batch.unwrap_or(openinfer_qwen35::MAX_DECODE_BATCH),
                 max_prefill_tokens: args
                     .max_prefill_tokens
-                    .unwrap_or(openinfer_qwen35_4b::DEFAULT_MAX_PREFILL_TOKENS),
+                    .unwrap_or(openinfer_qwen35::DEFAULT_MAX_PREFILL_TOKENS),
             },
+            args.qwen35_scheduler_policy.resolve(),
         )
         .context("failed to start Qwen3.5 engine")?,
     };

@@ -1,9 +1,9 @@
 [package]
-name = "openinfer-glm52"
-license = "Apache-2.0"
-version = "0.1.0"
-edition = "2024"
 autobenches = false
+edition = "2024"
+license = "Apache-2.0"
+name = "openinfer-glm52"
+version = "0.1.0"
 
 [dependencies]
 anyhow = { workspace = true }
@@ -19,6 +19,7 @@ openinfer-kernels = { workspace = true, features = ["glm52"] }
 openinfer-kv-cache = { workspace = true }
 openinfer-kv-offload = { workspace = true }
 openinfer-sample = { workspace = true }
+rayon = { workspace = true }
 safetensors = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

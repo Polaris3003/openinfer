@@ -1,8 +1,11 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
-use clap::{CommandFactory, Parser, ValueEnum};
+use anyhow::Result;
+use anyhow::bail;
+use clap::CommandFactory;
+use clap::Parser;
+use clap::ValueEnum;
 use openinfer::server_engine::ModelType;
 use openinfer::vllm_frontend::LoraModule;
 use openinfer_core::engine::EpBackend;
@@ -182,15 +185,29 @@ pub(crate) struct Args {
     #[arg(long)]
     pub max_prefill_tokens: Option<usize>,
 
-    /// Decode-batch capacity, one of 1/2/4/8/16/32/64; lower it to fit
-    /// reduced-memory GPUs. Qwen3.5 only; defaults to 64.
+    /// Decode-batch capacity, 1..=64. Qwen3.5 internally rounds allocation to
+    /// the next graph bucket but admits only this many scheduler slots; defaults
+    /// to 64.
     #[arg(long)]
     pub max_batch: Option<usize>,
+
+    /// Qwen3.5 prefill/decode scheduler policy. Defaults to `off`; `auto` is
+    /// opt-in and currently single-GPU only.
+    #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
+    pub qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
 
     /// Per-request context cap: prompt + max_tokens - 1 must fit. GLM5.2 only;
     /// when omitted, GLM5.2 sizes it from post-weight-load free VRAM.
     #[arg(long)]
     pub max_model_len: Option<usize>,
+
+    /// Run GLM5.2 TP4 with prefix caching and no decode.
+    #[arg(long, default_value_t = false)]
+    pub glm52_prefill_only: bool,
+
+    /// Token rows per prefill chunk. Must be a multiple of 64.
+    #[arg(long, default_value_t = 16_384)]
+    pub glm52_prefill_chunk_size: usize,
 
     /// GLM5.2 launch-time MoE sharding topology: `ep8` (default) is the
     /// high-throughput configuration (32 whole experts per rank, DeepEP
@@ -202,6 +219,12 @@ pub(crate) struct Args {
     /// `tp4` is the GB300 four-GPU low-latency topology.
     #[arg(long, default_value = "ep8")]
     pub moe_topo: String,
+
+    /// Stage GLM5.2 checkpoint bytes through pinned double buffers. This can
+    /// substantially accelerate warm-page-cache loads; leave off for cold
+    /// network-filesystem starts.
+    #[arg(long)]
+    pub glm52_weight_staging: bool,
 
     /// GLM5.2 remote rank-host nodes for cross-node EP, comma-separated
     /// `host:port=ranks` (e.g. `10.13.84.7:19000=4`). Each node contributes
@@ -299,6 +322,26 @@ impl CliDecodeOverlap {
     }
 }
 
+/// CLI selector for the Qwen3.5 adaptive scheduler policy.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub(crate) enum CliQwen35SchedulerPolicy {
+    /// Fixed chunked-prefill behavior.
+    #[default]
+    Off,
+    /// Runtime-state adaptive policy.
+    Auto,
+}
+
+impl CliQwen35SchedulerPolicy {
+    #[cfg(feature = "qwen35")]
+    pub(crate) fn resolve(self) -> openinfer_qwen35::Qwen35SchedulerPolicy {
+        match self {
+            Self::Off => openinfer_qwen35::Qwen35SchedulerPolicy::Off,
+            Self::Auto => openinfer_qwen35::Qwen35SchedulerPolicy::Auto,
+        }
+    }
+}
+
 /// Flags accepted for every model line regardless of detected type.
 const CORE_ARGS: &[&str] = &["model_path", "served_model_name", "port"];
 
@@ -314,6 +357,8 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "dp_size",
             "dflash_draft_model_path",
             "max_model_len",
+            "glm52_prefill_only",
+            "glm52_prefill_chunk_size",
             "no_prefix_cache",
             "kv_offload",
             "kv_offload_host_gib",
@@ -326,6 +371,7 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "kv_pd_miss_wait_ms",
             "kv_pd_allow_local_prefill",
             "moe_topo",
+            "glm52_weight_staging",
             "dump_graph_png",
             "rank_hosts",
         ],
@@ -361,13 +407,14 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "batch_invariant",
             "dflash_draft_model_path",
         ],
-        #[cfg(feature = "qwen35-4b")]
+        #[cfg(feature = "qwen35")]
         ModelType::Qwen35 => &[
             "device_ordinal",
             "tp_size",
             "cuda_graph",
             "max_prefill_tokens",
             "max_batch",
+            "qwen35_scheduler_policy",
         ],
     }
 }
@@ -475,6 +522,24 @@ impl Args {
         if !matches!(self.decode_overlap, CliDecodeOverlap::Off) && self.tp_size > 1 {
             bail!("--decode-overlap is single-GPU only; tp_size>1 has no prefill/decode overlap");
         }
+        #[cfg(feature = "qwen35")]
+        if matches!(model_type, ModelType::Qwen35) {
+            if let Some(max_batch) = self.max_batch {
+                if !(1..=openinfer_qwen35::MAX_DECODE_BATCH).contains(&max_batch) {
+                    bail!(
+                        "--max-batch must be in 1..={} for Qwen3.5, got {max_batch}",
+                        openinfer_qwen35::MAX_DECODE_BATCH
+                    );
+                }
+            }
+            if self.tp_size > 1
+                && matches!(self.qwen35_scheduler_policy, CliQwen35SchedulerPolicy::Auto)
+            {
+                bail!(
+                    "--qwen35-scheduler-policy=auto is single-GPU only; Qwen3.5 TP uses the fixed off policy"
+                );
+            }
+        }
         #[cfg(feature = "glm52")]
         if matches!(model_type, ModelType::Glm52) {
             // Parse the topology here so an invalid --moe-topo string fails
@@ -500,6 +565,38 @@ impl Args {
                     "GLM5.2 --moe-topo={} requires --tp-size={expected_tp_size}, got {}",
                     self.moe_topo,
                     self.tp_size
+                );
+            }
+            if self.glm52_prefill_only {
+                if !matches!(moe_topo, openinfer_glm52::Glm52MoeTopo::Tp4) {
+                    bail!("--glm52-prefill-only requires --moe-topo=tp4");
+                }
+                if self.no_prefix_cache {
+                    bail!("--glm52-prefill-only requires prefix caching; drop --no-prefix-cache");
+                }
+                if self.dflash_draft_model_path.is_some() {
+                    bail!("--glm52-prefill-only is incompatible with the DSpark drafter");
+                }
+                if self.kv_offload || self.kv_pd_vllm_seed.is_some() {
+                    bail!(
+                        "--glm52-prefill-only does not support KV offload or an external P/D peer"
+                    );
+                }
+                if self.dump_graph_png.is_some() {
+                    bail!("--glm52-prefill-only does not expose a decode CUDA graph");
+                }
+            } else if provided.contains("glm52_prefill_chunk_size") {
+                bail!("--glm52-prefill-chunk-size requires --glm52-prefill-only");
+            }
+            if self.glm52_prefill_chunk_size == 0
+                || !self
+                    .glm52_prefill_chunk_size
+                    .is_multiple_of(openinfer_glm52::GLM52_PREFILL_CHUNK_ALIGN)
+            {
+                bail!(
+                    "--glm52-prefill-chunk-size must be a positive multiple of {}, got {}",
+                    openinfer_glm52::GLM52_PREFILL_CHUNK_ALIGN,
+                    self.glm52_prefill_chunk_size
                 );
             }
         }
@@ -630,7 +727,7 @@ fn parse_lora_module_fields(name: &str, path: &str) -> Result<LoraModule, String
 mod tests {
     use super::*;
 
-    #[cfg(any(feature = "glm52", feature = "qwen3", feature = "qwen35-4b"))]
+    #[cfg(any(feature = "glm52", feature = "qwen3", feature = "qwen35"))]
     fn parse_with_provided(argv: &[&str]) -> (Args, BTreeSet<String>) {
         use clap::FromArgMatches;
         let matches = Args::command()
@@ -650,7 +747,7 @@ mod tests {
             ModelType::KimiK2,
             #[cfg(feature = "qwen3")]
             ModelType::Qwen3,
-            #[cfg(feature = "qwen35-4b")]
+            #[cfg(feature = "qwen35")]
             ModelType::Qwen35,
         ]
         .to_vec()
@@ -675,13 +772,79 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "qwen35-4b")]
+    #[cfg(feature = "qwen35")]
     #[test]
     fn qwen35_accepts_tp_size() {
         let (args, provided) =
             parse_with_provided(&["openinfer", "--tp-size", "2", "--cuda-graph=false"]);
         args.validate(ModelType::Qwen35, &provided)
             .expect("Qwen3.5 should accept --tp-size for eager TP startup");
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_defaults_scheduler_policy_off() {
+        let (args, provided) = parse_with_provided(&["openinfer"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept default scheduler-policy off");
+        assert!(matches!(
+            args.qwen35_scheduler_policy,
+            CliQwen35SchedulerPolicy::Off
+        ));
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_accepts_scheduler_policy_off() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--qwen35-scheduler-policy", "off"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept explicit scheduler-policy off");
+        assert!(matches!(
+            args.qwen35_scheduler_policy,
+            CliQwen35SchedulerPolicy::Off
+        ));
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_rejects_tp_auto_scheduler_policy() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--tp-size",
+            "2",
+            "--cuda-graph=false",
+            "--qwen35-scheduler-policy",
+            "auto",
+        ]);
+        let err = args
+            .validate(ModelType::Qwen35, &provided)
+            .expect_err("Qwen3.5 TP should reject auto scheduler-policy")
+            .to_string();
+        assert!(err.contains("single-GPU only"));
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_accepts_non_bucket_scheduler_max_batch() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--max-batch", "5"]);
+        args.validate(ModelType::Qwen35, &provided)
+            .expect("Qwen3.5 should accept scheduler max_batch between decode buckets");
+        assert_eq!(args.max_batch, Some(5));
+    }
+
+    #[cfg(feature = "qwen35")]
+    #[test]
+    fn qwen35_rejects_zero_scheduler_max_batch() {
+        let (args, provided) = parse_with_provided(&["openinfer", "--max-batch", "0"]);
+        let err = args
+            .validate(ModelType::Qwen35, &provided)
+            .expect_err("Qwen3.5 should reject zero scheduler max_batch")
+            .to_string();
+        assert!(
+            err.contains("--max-batch must be in 1..="),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -885,5 +1048,73 @@ mod tests {
             .validate(ModelType::Glm52, &provided)
             .expect_err("GLM5.2 EP4 should reject explicit non-DP4");
         assert!(error.to_string().contains("--dp-size=4"));
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_prefill_only_accepts_tp4_defaults() {
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--moe-topo",
+            "tp4",
+            "--tp-size",
+            "4",
+            "--glm52-prefill-only",
+        ]);
+        args.validate(ModelType::Glm52, &provided)
+            .expect("TP4 prefill-only defaults should validate");
+        assert_eq!(
+            args.glm52_prefill_chunk_size,
+            openinfer_glm52::GLM52_DEFAULT_PREFILL_CHUNK_SIZE
+        );
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_prefill_only_rejects_decode_features() {
+        for extra in [
+            vec!["--no-prefix-cache"],
+            vec!["--dflash-draft-model-path", "/tmp/dspark"],
+            vec!["--dump-graph-png", "/tmp/decode.png"],
+        ] {
+            let mut argv = vec![
+                "openinfer",
+                "--moe-topo",
+                "tp4",
+                "--tp-size",
+                "4",
+                "--glm52-prefill-only",
+            ];
+            argv.extend(extra);
+            let (args, provided) = parse_with_provided(&argv);
+            args.validate(ModelType::Glm52, &provided)
+                .expect_err("prefill-only must reject decode-only features");
+        }
+    }
+
+    #[cfg(feature = "glm52")]
+    #[test]
+    fn glm52_prefill_chunk_requires_mode_and_page_alignment() {
+        let (args, provided) =
+            parse_with_provided(&["openinfer", "--glm52-prefill-chunk-size", "16384"]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("an inert chunk size must be rejected");
+        assert!(error.to_string().contains("requires --glm52-prefill-only"));
+
+        let (args, provided) = parse_with_provided(&[
+            "openinfer",
+            "--moe-topo",
+            "tp4",
+            "--tp-size",
+            "4",
+            "--glm52-prefill-only",
+            "--glm52-prefill-chunk-size",
+            "16001",
+        ]);
+        let error = args
+            .validate(ModelType::Glm52, &provided)
+            .expect_err("unaligned chunk must be rejected");
+        assert!(error.to_string().contains("positive multiple of 64"));
     }
 }

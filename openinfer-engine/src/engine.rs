@@ -1,16 +1,17 @@
-use std::{
-    any::Any,
-    error::Error,
-    fmt,
-    path::PathBuf,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU8, Ordering},
-    },
-    thread::{self, JoinHandle},
-};
+use std::any::Any;
+use std::error::Error;
+use std::fmt;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
+use std::thread::{self};
 
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use crate::parallel::ParallelConfig;
 use crate::sampler::SamplingParams;
@@ -67,6 +68,14 @@ pub enum FinishReason {
 pub struct GenerateRequest {
     pub request_id: Option<String>,
     pub queued_at_unix_s: Option<f64>,
+    /// Trace context of the caller's request span, when tracing is on. The
+    /// model scheduler opens its queue/prefill/decode spans as children of this
+    /// so the host-side phase breakdown attaches to the same trace the frontend
+    /// started. `None` when tracing is disabled — the scheduler then skips span
+    /// work entirely. `SpanContext` is `Copy`, so it rides through the
+    /// scheduler's `Clone` request state without holding a live (non-`Clone`)
+    /// `Span`.
+    pub trace_parent: Option<fastrace::collector::SpanContext>,
     /// Logical data-parallel rank selected by the frontend. `None` leaves
     /// placement to the model scheduler (the direct `EngineHandle` path).
     pub data_parallel_rank: Option<usize>,
@@ -661,10 +670,9 @@ impl Drop for EngineInner {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
 
     use super::*;
 

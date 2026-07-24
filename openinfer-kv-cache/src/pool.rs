@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
 use dynamo_kv_hashing::compute_salt_hash;
-use kvbm_logical::blocks::{ImmutableBlock, MutableBlock};
-use kvbm_logical::events::{EventsManager, KvCacheEvent};
-use kvbm_logical::integrations::{DecodeOutcome, SchedulableSequence, ScheduleError};
+use kvbm_logical::KvbmSequenceHashProvider;
+use kvbm_logical::SequenceHash;
+use kvbm_logical::blocks::ImmutableBlock;
+use kvbm_logical::blocks::MutableBlock;
+use kvbm_logical::events::EventsManager;
+use kvbm_logical::events::KvCacheEvent;
+use kvbm_logical::integrations::DecodeOutcome;
+use kvbm_logical::integrations::SchedulableSequence;
+use kvbm_logical::integrations::ScheduleError;
 use kvbm_logical::manager::BlockManager;
 use kvbm_logical::pools::BlockDuplicationPolicy;
 use kvbm_logical::registry::BlockRegistry;
-use kvbm_logical::{KvbmSequenceHashProvider, SequenceHash};
 use tokio::sync::broadcast;
 
 use crate::view::KvView;
@@ -42,7 +47,7 @@ impl BlockPool {
     /// hash in each `Remove` back to the router's `sequence_hash`. OFF by
     /// default: plain single-machine serving uses [`new`](Self::new) and pays
     /// neither the per-block event attachment nor the channel.
-    pub fn with_events(
+    pub(crate) fn with_events(
         block_size: usize,
         num_blocks: usize,
     ) -> anyhow::Result<(Self, broadcast::Receiver<KvCacheEvent>)> {
@@ -94,10 +99,6 @@ impl BlockPool {
             block_size,
             padding_block_id,
         })
-    }
-
-    pub fn block_manager(&self) -> &BlockManager<()> {
-        &self.block_manager
     }
 
     pub fn block_size(&self) -> usize {
@@ -286,13 +287,10 @@ impl LoadReservation {
     }
 
     /// Number of reserved destination blocks.
+    // `is_empty` was dead code (hawk sweep, #743); `len` stands alone.
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.blocks.len()
-    }
-
-    /// True when no destinations were reserved.
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
     }
 }
 
@@ -471,10 +469,6 @@ impl RequestKv {
         self.seq.kv_position()
     }
 
-    pub fn assigned_blocks(&self) -> usize {
-        self.seq.assigned_blocks()
-    }
-
     pub fn is_complete(&self) -> bool {
         self.seq.is_complete()
     }
@@ -483,14 +477,10 @@ impl RequestKv {
         self.seq.generated_tokens()
     }
 
-    pub fn block_size(&self) -> usize {
-        self.seq.block_size()
-    }
-
     /// Physical page IDs assigned to this request, in sequence order.
     /// Includes every block the request currently holds — which can be one
     /// more than the KV tokens need (see `step_page_indices`).
-    pub fn page_indices(&self) -> Vec<i32> {
+    fn page_indices(&self) -> Vec<i32> {
         self.seq
             .inner()
             .assignments()
@@ -523,7 +513,8 @@ impl RequestKv {
     /// They are kvbm's lineage-based [`SequenceHash`], which is exactly that:
     /// position + content + parent fragment, so block `i` of prompt `P` hashes
     /// the same no matter which request computed it.
-    pub fn prompt_block_hashes(&self) -> Vec<[u8; 16]> {
+    #[cfg(test)]
+    fn prompt_block_hashes(&self) -> Vec<[u8; 16]> {
         self.seq
             .inner()
             .sequence()

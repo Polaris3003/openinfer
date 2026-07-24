@@ -1,5 +1,3 @@
-pub mod kernel_plan;
-
 mod batch_decode;
 mod batch_decode_buffers;
 mod batch_decode_dag;
@@ -22,18 +20,20 @@ mod unified_forward;
 mod verify_graph;
 mod weights;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Result;
-use log::{info, warn};
-use openinfer_core::engine::{EngineHandle, EngineLoadOptions, EpBackend, ModelInfo};
-
-pub use kernel_plan::kernel_plan;
+use log::info;
+use log::warn;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::EpBackend;
 pub use scheduler::DEFAULT_MAX_PREFILL_TOKENS;
-pub use weights::{
-    DEFAULT_GPU_MEMORY_UTILIZATION, DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES, DEFAULT_KV_PAGE_SIZE,
-    Qwen3MemoryOptions,
-};
+pub use weights::DEFAULT_GPU_MEMORY_UTILIZATION;
+pub use weights::DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES;
+pub use weights::DEFAULT_KV_PAGE_SIZE;
+pub use weights::Qwen3MemoryOptions;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Qwen3LoraOptions {
@@ -44,9 +44,9 @@ pub struct Qwen3LoraOptions {
 impl Qwen3LoraOptions {
     pub const DEFAULT_MAX_LORAS: usize = 1;
     pub const DEFAULT_MAX_LORA_RANK: usize = 64;
-    pub const SUPPORTED_MAX_LORA_RANKS: [usize; 9] = [1, 8, 16, 32, 64, 128, 256, 320, 512];
+    const SUPPORTED_MAX_LORA_RANKS: [usize; 9] = [1, 8, 16, 32, 64, 128, 256, 320, 512];
 
-    pub fn validate(self) -> Result<Self> {
+    fn validate(self) -> Result<Self> {
         anyhow::ensure!(self.max_loras > 0, "max_loras must be >= 1");
         anyhow::ensure!(
             Self::is_supported_max_lora_rank(self.max_lora_rank),
@@ -91,19 +91,19 @@ pub use green_ctx::DecodeOverlap;
 /// single-GPU topology is supported (tensor parallel shards KV per rank).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Qwen3OffloadOptions {
-    pub enabled: bool,
+    enabled: bool,
     /// Host pinned-memory pool size (the CPU KV-tier capacity), in bytes.
-    pub pinned_pool_bytes: usize,
+    pinned_pool_bytes: usize,
     /// Back the pool with 2 MiB hugepages (the box must hold a reservation).
     pub use_hugepages: bool,
     /// `Some` joins the cross-instance P2P mesh: block hashes register with a
     /// MetaServer, peers pull missing prefixes over RDMA, and this engine
     /// serves theirs. The P/D disaggregation data plane.
-    pub p2p: Option<Qwen3P2pOptions>,
+    p2p: Option<Qwen3P2pOptions>,
     /// `Some` when the P/D prefill peer is vLLM (pegaflow connector): offload
     /// query keys switch from kvbm lineage hashes to vLLM's prefix-cache hash
     /// scheme so this decode node can find the blocks vLLM registered.
-    pub vllm_compat: Option<Qwen3VllmCompatOptions>,
+    vllm_compat: Option<Qwen3VllmCompatOptions>,
 }
 
 /// Cross-instance P2P KV sharing (see `openinfer_kv_offload::P2pConfig`).
@@ -151,9 +151,6 @@ pub struct Qwen3VllmCompatOptions {
 }
 
 impl Qwen3OffloadOptions {
-    /// 8 GiB host tier — a few thousand dense Qwen3-4B blocks.
-    pub const DEFAULT_PINNED_POOL_BYTES: usize = 8 << 30;
-
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -199,34 +196,18 @@ impl Default for Qwen3OffloadOptions {
 /// model-local benchmarks. The root server should use `start_engine` instead.
 pub mod runtime {
     pub use crate::batch_decode_buffers::split_chunk_size_for;
-    pub use crate::executor::{
-        DecodePlan, DecodeRequestResult, DecodeResult, DecodeStepItem, PrefillPlan,
-        PrefillRequestResult, PrefillResult, PrefillStepItem, Qwen3Executor, RequestId,
-        UnifiedPlan, UnifiedResult,
-    };
-}
-
-pub fn probe_model(model_path: &Path) -> Result<Option<ModelInfo>> {
-    let config_path = model_path.join("config.json");
-    let content = match std::fs::read_to_string(&config_path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    let json: serde_json::Value = serde_json::from_str(&content)?;
-    if json.get("text_config").is_some() {
-        return Ok(None);
-    }
-
-    Ok(Some(ModelInfo {
-        id: "qwen3",
-        display_name: "Qwen3-4B".to_string(),
-        model_path: model_path.to_path_buf(),
-        max_model_len: json
-            .get("max_position_embeddings")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| u32::try_from(value).ok()),
-    }))
+    pub use crate::executor::DecodePlan;
+    pub use crate::executor::DecodeRequestResult;
+    pub use crate::executor::DecodeResult;
+    pub use crate::executor::DecodeStepItem;
+    pub use crate::executor::PrefillPlan;
+    pub use crate::executor::PrefillRequestResult;
+    pub use crate::executor::PrefillResult;
+    pub use crate::executor::PrefillStepItem;
+    pub use crate::executor::Qwen3Executor;
+    pub use crate::executor::RequestId;
+    pub use crate::executor::UnifiedPlan;
+    pub use crate::executor::UnifiedResult;
 }
 
 /// Server-facing launch knobs for the Qwen3 engine.
@@ -506,6 +487,10 @@ pub fn start_engine_with_lora_control(
              unverified"
         );
     }
+    anyhow::ensure!(
+        matches!(decode_overlap, DecodeOverlap::Off),
+        "LoRA serving does not support --decode-overlap"
+    );
     apply_batch_invariant_policy(batch_invariant);
     scheduler::start_qwen3_with_lora_control(
         model_path,
@@ -517,12 +502,12 @@ pub fn start_engine_with_lora_control(
         no_prefix_cache,
         max_prefill_tokens,
         memory_options,
-        decode_overlap,
     )
 }
 
 fn apply_batch_invariant_policy(batch_invariant: bool) {
-    use openinfer_kernels::ops::{NumericPolicy, set_numeric_policy};
+    use openinfer_kernels::ops::NumericPolicy;
+    use openinfer_kernels::ops::set_numeric_policy;
     let policy = if batch_invariant {
         NumericPolicy::Pin
     } else {

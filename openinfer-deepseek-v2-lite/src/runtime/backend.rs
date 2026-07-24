@@ -1,6 +1,8 @@
 use std::env;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use openinfer_core::tensor::DeviceContext;
 
 use crate::nccl_backend::NaiveNcclEp2Backend;
@@ -15,7 +17,7 @@ pub(super) enum EpBackendKind {
 }
 
 impl EpBackendKind {
-    pub(super) fn from_env() -> Result<Self> {
+    fn from_env() -> Result<Self> {
         let raw = env::var(EP_BACKEND_ENV).ok();
         parse_backend(raw.as_deref())
     }

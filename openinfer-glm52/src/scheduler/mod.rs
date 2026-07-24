@@ -45,25 +45,41 @@ mod testkit;
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{GenerateRequest, LoadSnapshot, TokenEvent};
-use openinfer_kv_cache::{BlockPool, RequestKv};
-use openinfer_kv_offload::OffloadEngine;
-use openinfer_sample::mix_seed;
-use tokio::sync::{mpsc, watch};
-
-use crate::model::{
-    GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv, Glm52StepShape,
-    glm52_pool_blocks, glm52_table_width,
-};
-use crate::runner::{Glm52StepFlags, Glm52Worker};
-
-use admission::{admit_from_queue, intake};
-use graph::{GraphDumpRequest, dump_rank0_decode_graph, precapture_step_graphs};
-use load::{pending_is_empty, publish_load, running_counts};
+use admission::admit_from_queue;
+use admission::intake;
+use graph::GraphDumpRequest;
+use graph::dump_rank0_decode_graph;
+use graph::precapture_step_graphs;
+use load::pending_is_empty;
+use load::publish_load;
+use load::running_counts;
 pub(crate) use offload::REMOTE_FETCH_DEADLINE;
 use offload::VllmPdState;
-use plan::{collect_sampling_rows, feed_wants, launch_ahead_flags, plan_step_shapes};
-use slot::{GLM52_PADDING_STEP, Glm52SlotState, Glm52StepOutcome};
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::TokenEvent;
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::RequestKv;
+use openinfer_kv_offload::OffloadEngine;
+use openinfer_sample::mix_seed;
+use plan::collect_sampling_rows;
+use plan::feed_wants;
+use plan::launch_ahead_flags;
+use plan::plan_step_shapes;
+use slot::GLM52_PADDING_STEP;
+use slot::Glm52SlotState;
+use slot::Glm52StepOutcome;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::model::glm52_pool_blocks;
+use crate::model::glm52_table_width;
+use crate::runner::Glm52StepFlags;
+use crate::runner::Glm52Worker;
 
 /// The KV page size (== the FlashMLA page / index-K block / model-len
 /// alignment — one 64 everywhere).
@@ -115,6 +131,7 @@ pub(crate) fn run_dp8_coordinator(
     workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
     dspark_enabled: bool,
+    prefill_only: bool,
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
@@ -211,7 +228,10 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket) {
+    if !prefill_only
+        && let Err(err) =
+            precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket)
+    {
         if let Some((_, response)) = graph_dump_request {
             let _ = response.send(Err(anyhow::anyhow!("{err:#}")));
         }
@@ -253,13 +273,25 @@ pub(crate) fn run_dp8_coordinator(
         if channel_open && all_idle(&slots) && pending_is_empty(&pending) {
             publish_load(&load_txs, &pools, &slots, &pending);
             match submit_rx.blocking_recv() {
-                Some(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
+                Some(req) => intake(
+                    req,
+                    &mut pending,
+                    &running_counts(&slots),
+                    max_model_len,
+                    prefill_only,
+                ),
                 None => channel_open = false,
             }
         }
         while channel_open {
             match submit_rx.try_recv() {
-                Ok(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
+                Ok(req) => intake(
+                    req,
+                    &mut pending,
+                    &running_counts(&slots),
+                    max_model_len,
+                    prefill_only,
+                ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
@@ -282,6 +314,7 @@ pub(crate) fn run_dp8_coordinator(
             mirrored,
             prefix_cache_enabled,
             dspark_enabled,
+            prefill_only,
             &mut pending_resets,
             &mut slots_changed,
         ) {
@@ -298,22 +331,41 @@ pub(crate) fn run_dp8_coordinator(
             }
             continue;
         }
+        if prefill_only
+            && slots
+                .iter()
+                .flat_map(|rank| rank.iter().flatten())
+                .any(|active| !active.state.mid_prefill())
+        {
+            fail_step(
+                &mut slots,
+                &anyhow::anyhow!("GLM5.2 prefill-only invariant failed: a request reached decode"),
+            );
+            break 'serve;
+        }
 
         // One lock-step step: every rank forwards the SAME bucket — each
         // active slot's span of consecutive next tokens, padding rows on the
         // free slots — and all responses are joined before any output is
         // interpreted.
         let shapes = plan_step_shapes(&feed_wants(&slots), full_bucket);
-        let flags = launch_ahead_flags(
-            &shapes,
-            leased_shapes.as_deref(),
-            slots_changed,
-            pending_is_empty(&pending),
-            dspark_enabled,
-            offload.is_some(),
-            &slots,
-            max_model_len,
-        );
+        let flags = if prefill_only {
+            Glm52StepFlags {
+                eager: true,
+                ..Glm52StepFlags::plain()
+            }
+        } else {
+            launch_ahead_flags(
+                &shapes,
+                leased_shapes.as_deref(),
+                slots_changed,
+                pending_is_empty(&pending),
+                dspark_enabled,
+                offload.is_some(),
+                &slots,
+                max_model_len,
+            )
+        };
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
         sample_step += 1;
@@ -404,7 +456,7 @@ pub(crate) fn run_dp8_coordinator(
 
     // Drain in-flight release saves and drop the offload engines BEFORE the
     // workers drop the models: the registered arenas' device memory must
-    // outlive every D2H copy (the `with_arenas` contract), and pegaflow's
+    // outlive every D2H copy (the `with_arenas_on` contract), and pegaflow's
     // save worker cannot cancel a copy already handed to it. `flush_saves`
     // is deadline-bounded, so a stuck host tier cannot hang teardown.
     if let Some(offload) = offload {

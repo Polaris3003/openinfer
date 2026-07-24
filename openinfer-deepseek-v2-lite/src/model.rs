@@ -1,22 +1,28 @@
-use std::{
-    collections::HashMap,
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
+use std::path::Path;
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Result, bail, ensure};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use half::bf16;
 use log::info;
-use openinfer_core::{
-    ops,
-    tensor::{DeviceContext, DeviceMatrix, HiddenStates, HiddenStatesRef},
-    weight_loader::{
-        deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, mmap_shards,
-    },
-};
+use openinfer_core::ops;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::HiddenStates;
+use openinfer_core::tensor::HiddenStatesRef;
+use openinfer_core::weight_loader::deserialize_shards;
+use openinfer_core::weight_loader::load_shard_info;
+use openinfer_core::weight_loader::load_tensor_1d;
+use openinfer_core::weight_loader::load_tensor_2d;
+use openinfer_core::weight_loader::mmap_shards;
 use safetensors::Dtype;
 
-use crate::{Config, device::activate, ep::ExpertParallelLayout};
+use crate::Config;
+use crate::device::activate;
+use crate::ep::ExpertParallelLayout;
 
 pub(crate) struct DriverRankModel {
     pub(crate) ctx: DeviceContext,
@@ -31,7 +37,7 @@ pub(crate) struct DriverRankModel {
 pub(crate) struct ExpertRankModel {
     pub(crate) ctx: DeviceContext,
     pub(crate) layout: ExpertParallelLayout,
-    pub(crate) gate_devices: Vec<Option<DeviceMatrix>>,
+    gate_devices: Vec<Option<DeviceMatrix>>,
     layers: Vec<Option<Vec<ExpertMlp>>>,
 }
 
@@ -85,11 +91,11 @@ pub(crate) struct MoeMlp {
     // oracle path keeps using `gate_host` for host-side routing.
     pub(crate) gate_device: DeviceMatrix,
     pub(crate) shared: DenseMlp,
-    pub(crate) experts: Vec<ExpertMlp>,
+    experts: Vec<ExpertMlp>,
 }
 
 pub(crate) struct ExpertMlp {
-    pub(crate) global_expert: usize,
+    global_expert: usize,
     pub(crate) dense: DenseMlp,
 }
 

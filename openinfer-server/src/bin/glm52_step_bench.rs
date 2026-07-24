@@ -21,14 +21,20 @@
 
 use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use clap::Parser;
-
 use openinfer::logging;
 use openinfer::sampler::SamplingParams;
-use openinfer::scheduler::{SchedulerHandle, SchedulerRequest, TokenEvent, TokenSink};
+use openinfer::scheduler::SchedulerHandle;
+use openinfer::scheduler::SchedulerRequest;
+use openinfer::scheduler::TokenEvent;
+use openinfer::scheduler::TokenSink;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -108,9 +114,11 @@ fn main() -> Result<()> {
             dp_size,
             dspark_draft_model_path: None,
             max_model_len: cli.max_model_len,
+            prefill_only: None,
             no_prefix_cache: false,
             kv_offload: None,
             moe_topo,
+            weight_staging: false,
             dump_graph_png: None,
             rank_hosts: cli
                 .rank_hosts
@@ -251,6 +259,7 @@ fn run_stream(
     let (token_tx, mut token_rx) = TokenSink::standalone();
     handle
         .submit(SchedulerRequest {
+            trace_parent: None,
             request_id: Some(request_id),
             queued_at_unix_s: None,
             data_parallel_rank: None,

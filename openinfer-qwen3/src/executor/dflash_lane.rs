@@ -9,19 +9,26 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use openinfer_core::sampler::SamplingParams;
+use openinfer_core::tensor::DeviceContext;
 use openinfer_core::tensor::HiddenStates;
 
-use super::dflash_prefill::{dflash_prefill_can_capture, should_capture_dflash_prefill_context};
-use super::{LocalQwen3Lane, PrefillStepItem, RequestId};
-use crate::dflash::{DFlashBatchScratch, DFlashDraftModel, DFlashRequestState};
-use crate::speculative::{
-    DraftRequestResult, DraftResult, DraftStepItem, VerifyRequestResult, VerifyStepItem,
-};
-use openinfer_core::tensor::DeviceContext;
+use super::LocalQwen3Lane;
+use super::PrefillStepItem;
+use super::RequestId;
+use super::dflash_prefill::dflash_prefill_can_capture;
+use super::dflash_prefill::should_capture_dflash_prefill_context;
+use crate::dflash::DFlashBatchScratch;
+use crate::dflash::DFlashDraftModel;
+use crate::dflash::DFlashRequestState;
+use crate::speculative::DraftRequestResult;
+use crate::speculative::DraftResult;
+use crate::speculative::DraftStepItem;
+use crate::speculative::VerifyRequestResult;
+use crate::speculative::VerifyStepItem;
 
 pub(super) struct DFlashLaneState {
     pub(super) model: DFlashDraftModel,
-    pub(super) requests: HashMap<RequestId, DFlashRequestState>,
+    requests: HashMap<RequestId, DFlashRequestState>,
     /// Lane-level batched draft scratch, allocated once for the whole decode
     /// batch so the dense draft ops run once instead of once per request.
     scratch: DFlashBatchScratch,

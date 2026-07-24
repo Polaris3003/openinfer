@@ -13,14 +13,22 @@
 //! offsets (exclusive form). Combine never applies router weights — the
 //! caller weights expert outputs before `decode_combine`.
 
-use std::ffi::{CStr, c_char, c_int, c_void};
+use std::ffi::CStr;
+use std::ffi::c_char;
+use std::ffi::c_int;
+use std::ffi::c_void;
 use std::ptr::NonNull;
 
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
-use crate::ffi::{self, DeepEpInfo};
+use crate::ffi::DeepEpInfo;
+use crate::ffi::{self};
 use crate::tensor::DeviceContext;
 
 /// The C table of one shim instantiation. Every method forwards to the
@@ -431,11 +439,11 @@ fn deepep_unique_id_for<A: DeepEpAbi>() -> Result<[u8; 128]> {
 /// Dispatch-side scratch, allocated once per rank and reused every layer.
 pub struct DeepEpDispatchScratch {
     /// Deterministic-prologue per-SM rank counters.
-    pub rank_count: CudaSlice<i32>,
+    rank_count: CudaSlice<i32>,
     /// Per-(token, topk) destination slot indices.
-    pub dst_slot: CudaSlice<i32>,
+    dst_slot: CudaSlice<i32>,
     /// Received-token prefix sum per source rank (the combine handle).
-    pub psum_rank: CudaSlice<i32>,
+    psum_rank: CudaSlice<i32>,
     /// Received-token aligned offsets per local expert (exclusive form,
     /// `num_local_experts + 1` entries; the kernel uses the first
     /// `num_local_experts` as atomic counters in expanded mode).
@@ -474,7 +482,7 @@ impl DeepEpDispatchScratch {
     }
 
     /// Prefill-path scratch sized from an explicit shim config.
-    pub fn new_prefill_with(ctx: &DeviceContext, info: &DeepEpInfo) -> Result<Self> {
+    fn new_prefill_with(ctx: &DeviceContext, info: &DeepEpInfo) -> Result<Self> {
         Self::new(ctx, info, info.prefill_max_tokens_per_rank as usize)
     }
 }
@@ -527,11 +535,6 @@ impl<A: DeepEpAbi> DeepEpBase<A> {
             ctx: NonNull::new(ctx).ok_or_else(|| anyhow!("deepep_ctx_create returned null"))?,
             info: A::info(),
         })
-    }
-
-    /// The baked capacities of this instance's shim config.
-    pub fn info(&self) -> &DeepEpInfo {
-        &self.info
     }
 
     /// Decode dispatch: deterministic prologue + dispatch + copy epilogue in
