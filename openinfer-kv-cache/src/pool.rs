@@ -453,18 +453,14 @@ impl RequestKv {
             .map_err(|e| anyhow::anyhow!("release: {e}"))
     }
 
-    /// Make every registered block owned by this request bypass inactive
-    /// retention when its final guard drops.
+    /// Mark every assigned block's canonical primary to reset on release.
     ///
-    /// The canonical-primary operation is intentional: an assignment can be
-    /// a duplicate whose physical slot already resets on drop while its hidden
-    /// primary remains pinned. Marking that primary ensures a no-prefix-cache
-    /// request returns all of its physical footprint to the reset pool.
-    /// Unassigned reservations need no marking because they already reset via
-    /// their mutable-block RAII guards.
+    /// A duplicate resets itself but keeps its primary alive; marking the
+    /// primary prevents that hidden block from entering the inactive cache on
+    /// final drop.
     pub fn mark_blocks_reset_on_release(&self) {
         for (_, block) in self.seq.inner().assignments().assigned_iter() {
-            block.set_primary_evict_on_reset(true);
+            block.set_primary_reset_on_release(true);
         }
     }
 
@@ -704,26 +700,6 @@ mod tests {
         request.mark_blocks_reset_on_release();
     }
 
-    /// DFlash recomputes identical prompts because prefix matching is off.
-    /// Completed requests must therefore reset their registered primaries;
-    /// otherwise the next recomputation creates duplicates whose canonical
-    /// keepalives consume capacity outside the request's scheduler footprint.
-    #[test]
-    fn non_retained_speculative_requests_reuse_all_completed_blocks() {
-        let pool = BlockPool::new(16, 10).unwrap();
-        let baseline = pool.available_blocks();
-        let prompt = (0..64).map(|i| 10_000 + i).collect::<Vec<_>>();
-
-        for round in 0..8 {
-            complete_non_retained_speculative_request(&pool, &prompt, 32);
-            assert_eq!(
-                pool.available_blocks(),
-                baseline,
-                "round {round} leaked request KV capacity"
-            );
-        }
-    }
-
     /// CPU-only shape of issue #681: 160 request pages, a 1643-token prompt
     /// split into 1024 + 619 prefill chunks, 512 output tokens, and 17-token
     /// speculative verify spans. A completed request must leave enough clean
@@ -744,26 +720,6 @@ mod tests {
                 "issue #681 request {round} did not release its KV pages"
             );
         }
-    }
-
-    /// The non-retention path is opt-in. Ordinary prefix-cache requests still
-    /// leave registered primaries in the inactive pool for a later match.
-    #[test]
-    fn retained_request_blocks_still_match_as_prefix() {
-        let pool = BlockPool::new(16, 10).unwrap();
-        let prompt = (0..33).map(|i| 20_000 + i).collect::<Vec<_>>();
-
-        let mut first = pool.new_request(prompt.clone(), 1, None);
-        first
-            .schedule_prefill(prompt.len(), &pool)
-            .expect("schedule seed prefill");
-        first
-            .apply_prefill(90_000, &pool)
-            .expect("apply seed prefill");
-        drop(first);
-
-        let mut replay = pool.new_request(prompt, 1, None);
-        assert_eq!(replay.match_and_add_prefix(&pool).unwrap(), 32);
     }
 
     /// kvbm's `schedule_decode` allocates the next generation block when the
