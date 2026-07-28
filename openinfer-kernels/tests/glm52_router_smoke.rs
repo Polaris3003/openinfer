@@ -11,9 +11,10 @@
 #![cfg(feature = "glm52")]
 
 use half::bf16;
-use openinfer_kernels::ops::{
-    Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput, glm52_router_noaux_tc_launch,
-};
+use openinfer_kernels::ops::Glm52RouterBatch;
+use openinfer_kernels::ops::Glm52RouterConfig;
+use openinfer_kernels::ops::Glm52RouterOutput;
+use openinfer_kernels::ops::glm52_router_noaux_tc_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
 const HIDDEN: usize = 6144;
@@ -93,9 +94,8 @@ fn router_gemv_and_select_match_host_reference() {
         .map(|_| bf16::from_f32(rng.unit_f32() * 0.05))
         .collect();
     let bias: Vec<f32> = (0..EXPERTS).map(|_| rng.unit_f32() * 0.01).collect();
-    let gate_bytes = as_bytes(&gate).to_vec();
     let bias_bytes = as_bytes(&bias).to_vec();
-    let gate_dev = ctx.stream.clone_htod(&gate_bytes).expect("gate H2D");
+    let gate_dev = ctx.stream.clone_htod(&gate).expect("gate H2D");
     let bias_dev = ctx.stream.clone_htod(&bias_bytes).expect("bias H2D");
 
     // Every instantiation the runtime switch dispatches, with active < padded

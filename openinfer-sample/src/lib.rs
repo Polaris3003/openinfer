@@ -9,9 +9,8 @@
 //!   off the fused fast path, seeded rows as single-row replayable calls).
 //!   There is no per-row escape hatch, so a caller cannot regress to
 //!   `for i { sample(i) }`.
-//! * [`token_logprob_from_row`] — host-side log-softmax + top-k over one logits
-//!   row into a [`TokenLogprob`]. Generic over the row element so a caller can
-//!   feed `f32` (Qwen) or `bf16` (Kimi) without a widening copy.
+//! * [`token_logprobs_batch`] — batched device logprob extraction;
+//!   [`token_logprob_from_row`] is its host single-row reference.
 //!
 //! Layering: the `.cu`/FFI and the low-level batch primitives live in
 //! `openinfer-kernels` (the CUDA build owner); this crate owns the policy
@@ -25,20 +24,31 @@
 //! through the re-exported [`gpu_sample_batch_into`] and its logprobs through
 //! [`token_logprob_from_row`].
 
-use anyhow::{Result, anyhow, ensure};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-
+use cudarc::driver::PinnedHostSlice;
 use openinfer_engine::engine::TokenLogprob;
-use openinfer_kernels::ops::{
-    argmax_batch_bf16_split_indexed_into, argmax_batch_bf16_split_partials_len,
-};
-use openinfer_kernels::tensor::{DeviceContext, HiddenStates};
-
 pub use openinfer_engine::sampler::SamplingParams;
 /// Low-level batched sampling, re-exported so a model that must drive its own
 /// greedy path still reaches the single sampler entry rather than dipping into
 /// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
-pub use openinfer_kernels::ops::{BatchSamplingRow, BatchSamplingScratch, gpu_sample_batch_into};
+pub use openinfer_kernels::ops::BatchSamplingRow;
+/// Low-level batched sampling, re-exported so a model that must drive its own
+/// greedy path still reaches the single sampler entry rather than dipping into
+/// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
+pub use openinfer_kernels::ops::BatchSamplingScratch;
+use openinfer_kernels::ops::argmax_batch_bf16_split_indexed_into;
+use openinfer_kernels::ops::argmax_batch_bf16_split_partials_len;
+/// Low-level batched sampling, re-exported so a model that must drive its own
+/// greedy path still reaches the single sampler entry rather than dipping into
+/// `openinfer-kernels` directly — e.g. Kimi-K2 (see the module docs).
+pub use openinfer_kernels::ops::gpu_sample_batch_into;
+use openinfer_kernels::ops::logprob_topk_batch_bf16_into;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::HiddenStates;
+use openinfer_kernels::tensor::has_stream_override;
 
 /// Allocate-once device buffers for [`select_batch`], sized for `max_rows` × `vocab`.
 ///
@@ -55,6 +65,13 @@ pub struct SampleScratch {
     top1_values: CudaSlice<half::bf16>,
     /// One token id per greedy row, in `row_indices` order.
     argmax_out: CudaSlice<i32>,
+    /// Pinned host landing buffer for `argmax_out`. A pageable readback here
+    /// has synchronous-copy semantics, so the step thread queues behind any
+    /// concurrent bulk copy traffic — a P/D KV-restore flood turned this
+    /// sub-ms call into a flat 23.6 ms and froze token delivery for every
+    /// active stream (#704). Pinned keeps the D2H async; the reader blocks
+    /// only on the copy's own event.
+    argmax_host: PinnedHostSlice<i32>,
     sampling: BatchSamplingScratch,
     /// Vocab width every buffer above was sized for; `select_batch` rejects a
     /// logits arena whose `hidden_dim` differs, since the sizes are baked in.
@@ -86,6 +103,12 @@ impl SampleScratch {
                 .alloc_zeros(max_rows)
                 .map_err(|e| anyhow!("SampleScratch alloc failed: {e}"))?,
             argmax_out: alloc_i32(max_rows)?,
+            // Read only after a D2H lands in it (write-combined pages start
+            // uninitialized). cudarc's alloc_pinned hardcodes write-combined
+            // memory, whose CPU reads are uncached — fine for max_rows i32s,
+            // but don't grow this buffer into anything read in a hot loop.
+            argmax_host: unsafe { ctx.ctx.alloc_pinned::<i32>(max_rows) }
+                .map_err(|e| anyhow!("SampleScratch pinned alloc failed: {e}"))?,
             sampling: BatchSamplingScratch::new(ctx, max_rows, vocab)?,
             vocab,
             max_rows,
@@ -179,11 +202,16 @@ pub fn select_batch(
             &mut scratch.top1_values,
             &mut scratch.argmax_out,
         )?;
-        let out = ctx
-            .stream
-            .clone_dtoh(&scratch.argmax_out)
+        ctx.stream
+            .memcpy_dtoh(&scratch.argmax_out, &mut scratch.argmax_host)
             .map_err(|e| anyhow!("select_batch D2H greedy tokens failed: {e}"))?;
-        ctx.sync()?;
+        // Blocks on this copy's own event — which transitively covers the
+        // argmax kernel queued before it on the same stream, so the wait is
+        // equivalent to the old full-stream sync for this path.
+        let out = scratch
+            .argmax_host
+            .as_slice()
+            .map_err(|e| anyhow!("select_batch greedy D2H sync failed: {e}"))?;
         for (k, &row) in greedy.iter().enumerate() {
             tokens[row as usize] = out[k] as u32;
         }
@@ -304,20 +332,21 @@ where
     }
     let log_sum_exp = max + sum.ln() as f32;
 
-    // Top-K by insertion into a K-sized buffer (K <= 32, V ~ 160k). Ties keep
-    // ascending token-id order.
+    // Rank before subtracting LSE so f32 rounding cannot change raw-logit order.
     let k = top_k.min(row.len());
     let mut top: Vec<(u32, f32)> = Vec::with_capacity(k + 1);
     if k > 0 {
         for (id, &v) in row.iter().enumerate() {
             let val: f32 = v.into();
-            let lp = val - log_sum_exp;
-            if top.len() == k && lp <= top[k - 1].1 {
+            if top.len() == k && val <= top[k - 1].1 {
                 continue;
             }
-            let pos = top.partition_point(|&(_, kept)| kept >= lp);
-            top.insert(pos, (id as u32, lp));
+            let pos = top.partition_point(|&(_, kept)| kept >= val);
+            top.insert(pos, (id as u32, val));
             top.truncate(k);
+        }
+        for entry in &mut top {
+            entry.1 -= log_sum_exp;
         }
     }
 
@@ -328,10 +357,130 @@ where
     })
 }
 
+/// One row of a [`token_logprobs_batch`] call: the logprob of `picked` plus
+/// the arena row's `top_k` entries.
+#[derive(Clone, Copy, Debug)]
+pub struct LogprobRequest {
+    pub row: usize,
+    pub picked: u32,
+    pub top_k: usize,
+}
+
+/// Batched device twin of [`token_logprob_from_row`]: one launch and a
+/// compact O(rows x (top_k + 1)) readback per call.
+pub fn token_logprobs_batch(
+    ctx: &DeviceContext,
+    logits: &HiddenStates,
+    requests: &[LogprobRequest],
+) -> Result<Vec<TokenLogprob>> {
+    if requests.is_empty() {
+        return Ok(Vec::new());
+    }
+    ensure!(
+        !has_stream_override(),
+        "token_logprobs_batch: cannot run under a stream override — buffer \
+         traffic is ordered on the primary stream"
+    );
+    let vocab = logits.hidden_dim;
+    ensure!(vocab > 0, "token_logprobs_batch: empty vocab");
+    let mut rows = Vec::with_capacity(requests.len());
+    let mut picked = Vec::with_capacity(requests.len());
+    let mut ks = Vec::with_capacity(requests.len());
+    let mut k_max = 0usize;
+    for r in requests {
+        ensure!(
+            r.row < logits.seq_len,
+            "token_logprobs_batch: row {} out of bounds for arena of {} rows",
+            r.row,
+            logits.seq_len
+        );
+        ensure!(
+            (r.picked as usize) < vocab,
+            "token_logprobs_batch: picked token {} out of bounds for vocab {vocab}",
+            r.picked
+        );
+        let k = r.top_k.min(vocab);
+        k_max = k_max.max(k);
+        rows.push(i32::try_from(r.row)?);
+        picked.push(i32::try_from(r.picked)?);
+        ks.push(i32::try_from(k)?);
+    }
+
+    let htod = |data: &[i32]| -> Result<CudaSlice<i32>> {
+        ctx.stream
+            .clone_htod(data)
+            .map_err(|e| anyhow!("token_logprobs_batch H2D failed: {e}"))
+    };
+    let rows_gpu = htod(&rows)?;
+    let picked_gpu = htod(&picked)?;
+    let ks_gpu = htod(&ks)?;
+    let mut picked_lp_gpu: CudaSlice<f32> = ctx
+        .stream
+        .alloc_zeros(requests.len())
+        .map_err(|e| anyhow!("token_logprobs_batch alloc failed: {e}"))?;
+    let topk_len = requests
+        .len()
+        .checked_mul(k_max)
+        .ok_or_else(|| anyhow!("token_logprobs_batch: rows * k_max overflows"))?
+        .max(1);
+    let mut vals_gpu: CudaSlice<f32> = ctx
+        .stream
+        .alloc_zeros(topk_len)
+        .map_err(|e| anyhow!("token_logprobs_batch alloc failed: {e}"))?;
+    let mut ids_gpu: CudaSlice<i32> = ctx
+        .stream
+        .alloc_zeros(topk_len)
+        .map_err(|e| anyhow!("token_logprobs_batch alloc failed: {e}"))?;
+
+    // Indices validated and stream override rejected above.
+    unsafe {
+        logprob_topk_batch_bf16_into(
+            ctx,
+            logits.as_ref(),
+            &rows_gpu,
+            &picked_gpu,
+            &ks_gpu,
+            requests.len(),
+            k_max,
+            &mut picked_lp_gpu,
+            &mut vals_gpu,
+            &mut ids_gpu,
+        )?;
+    }
+
+    let picked_lp = ctx
+        .stream
+        .clone_dtoh(&picked_lp_gpu)
+        .map_err(|e| anyhow!("token_logprobs_batch D2H failed: {e}"))?;
+    let vals = ctx
+        .stream
+        .clone_dtoh(&vals_gpu)
+        .map_err(|e| anyhow!("token_logprobs_batch D2H failed: {e}"))?;
+    let ids = ctx
+        .stream
+        .clone_dtoh(&ids_gpu)
+        .map_err(|e| anyhow!("token_logprobs_batch D2H failed: {e}"))?;
+    ctx.sync()?;
+
+    Ok((0..requests.len())
+        .map(|i| {
+            let k = ks[i] as usize;
+            let base = i * k_max;
+            TokenLogprob {
+                logprob: picked_lp[i],
+                top_logprobs: (0..k)
+                    .map(|j| (ids[base + j] as u32, vals[base + j]))
+                    .collect(),
+            }
+        })
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::token_logprob_from_row;
     use half::bf16;
+
+    use super::token_logprob_from_row;
 
     #[test]
     fn token_logprob_matches_exact_log_softmax() {

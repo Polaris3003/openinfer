@@ -2,21 +2,29 @@
 //! weights (MLA + indexer + dense/MoE MLP + layernorms) from the resident
 //! tensor map.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use half::bf16;
-use openinfer_kernels::tensor::{DeviceContext, DeviceVec};
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceVec;
 
-use crate::config::{
-    GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_HEAD_DIM, glm52_layer_has_full_indexer,
-};
+use crate::config::GLM52_DENSE_LAYERS;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::glm52_layer_has_full_indexer;
 use crate::dense::Glm52DenseMlpWeights;
 use crate::fp8::ProjWeight;
 use crate::indexer::Glm52IndexerLayerWeights;
-use crate::layer::{Glm52DecoderLayerWeights, Glm52LayerIndexer, Glm52LayerMlp};
+use crate::layer::Glm52DecoderLayerWeights;
+use crate::layer::Glm52LayerIndexer;
+use crate::layer::Glm52LayerMlp;
 use crate::mla_front::Glm52MlaLayerWeights;
-use crate::moe_decode::{Glm52MoeExpertBank, Glm52MoeRouterWeights, Glm52MoeSharedExpert};
+use crate::moe_decode::Glm52MoeExpertBank;
+use crate::moe_decode::Glm52MoeRouterWeights;
+use crate::moe_decode::Glm52MoeSharedExpert;
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
-use crate::weights::{Glm52RankGpuWeights, retype_owned};
+use crate::weights::Glm52RankGpuWeights;
+use crate::weights::retype_owned;
 
 /// Take one fp8 projection (weight + scale) out of the resident tensor map.
 pub(super) fn take_proj(
@@ -141,12 +149,14 @@ pub(super) fn build_decoder_layer(
         // Tensor-replicated topology keeps routed and shared experts in the
         // rank slice bank; the resident first pass carries only the router.
         Glm52LayerMlp::MoeTp(Box::new(Glm52MoeRouterWeights::new(
+            ctx,
             w.take_tensor(&format!("{mp}.gate.weight"))?,
             w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
         )?))
     } else {
         Glm52LayerMlp::MoeEp8(Box::new(Glm52MoeEp8LayerWeights {
             router: Glm52MoeRouterWeights::new(
+                ctx,
                 w.take_tensor(&format!("{mp}.gate.weight"))?,
                 w.take_tensor(&format!("{mp}.gate.e_score_correction_bias"))?,
             )?,

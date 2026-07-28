@@ -9,7 +9,9 @@
 
 use std::sync::atomic::Ordering;
 
-use openinfer_engine::engine::{FinishReason, RequestAbortReason, TokenLogprob};
+use openinfer_engine::engine::FinishReason;
+use openinfer_engine::engine::RequestAbortReason;
+use openinfer_engine::engine::TokenLogprob;
 
 use super::*;
 
@@ -44,7 +46,7 @@ impl Demux {
         let abort_reason = Arc::new(AtomicU8::new(RequestAbortReason::None as u8));
         self.streams.insert(
             Arc::clone(&tag),
-            RequestStreamState::new(Arc::clone(&abort_reason)),
+            RequestStreamState::new(Arc::clone(&abort_reason), fastrace::Span::noop()),
         );
         abort_reason
     }

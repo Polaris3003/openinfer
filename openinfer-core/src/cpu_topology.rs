@@ -1,10 +1,13 @@
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    ffi::{CStr, c_char},
-};
+use std::collections::BTreeMap;
+use std::collections::HashSet;
+use std::ffi::CStr;
+use std::ffi::c_char;
 
-use anyhow::{Context, Result, ensure};
-use cudarc::driver::{result as cuda_driver_result, sys as cuda_driver_sys};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::result as cuda_driver_result;
+use cudarc::driver::sys as cuda_driver_sys;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CpuId(u16);
@@ -16,11 +19,12 @@ impl CpuId {
         Ok(Self(cpu))
     }
 
-    pub fn as_u16(self) -> u16 {
+    #[cfg(test)]
+    fn as_u16(self) -> u16 {
         self.0
     }
 
-    pub fn as_usize(self) -> usize {
+    fn as_usize(self) -> usize {
         usize::from(self.0)
     }
 }
@@ -33,8 +37,8 @@ impl std::fmt::Display for CpuId {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NumaCpuPool {
-    pub node: usize,
-    pub cpus: Vec<CpuId>,
+    node: usize,
+    cpus: Vec<CpuId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,11 +50,11 @@ pub struct RankNumaNode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RankCpuSlice {
     pub rank: usize,
-    pub numa_node: usize,
+    numa_node: usize,
     pub cpus: Vec<CpuId>,
 }
 
-pub fn parse_cpu_list(cpulist: &str) -> Result<Vec<CpuId>> {
+fn parse_cpu_list(cpulist: &str) -> Result<Vec<CpuId>> {
     let mut cpus = Vec::new();
     for part in cpulist.trim().split(',').filter(|part| !part.is_empty()) {
         if let Some((start, end)) = part.split_once('-') {
@@ -76,7 +80,8 @@ pub fn parse_cpu_list(cpulist: &str) -> Result<Vec<CpuId>> {
     Ok(cpus)
 }
 
-pub fn format_cpu_list(cpus: &[CpuId]) -> String {
+#[cfg(test)]
+fn format_cpu_list(cpus: &[CpuId]) -> String {
     if cpus.is_empty() {
         return "[]".to_string();
     }
@@ -100,6 +105,7 @@ pub fn format_cpu_list(cpus: &[CpuId]) -> String {
     ranges.join(",")
 }
 
+#[cfg(test)]
 fn push_cpu_range(ranges: &mut Vec<String>, start: u16, end: u16) {
     if start == end {
         ranges.push(start.to_string());
@@ -145,7 +151,7 @@ pub fn pin_current_thread_to_cpu(cpu: CpuId) -> Result<()> {
     }
 }
 
-pub fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
+fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
     let mut buf = [c_char::default(); 32];
     cuda_driver_result::init().map_err(|err| anyhow::anyhow!("{err:?}"))?;
     let device = cuda_driver_result::device::get(device_ordinal as i32)
@@ -161,7 +167,7 @@ pub fn cuda_device_pci_bus_id(device_ordinal: usize) -> Result<String> {
     }
 }
 
-pub fn pci_numa_node(pci_bus_id: &str) -> Result<usize> {
+fn pci_numa_node(pci_bus_id: &str) -> Result<usize> {
     let raw = std::fs::read_to_string(format!("/sys/bus/pci/devices/{pci_bus_id}/numa_node"))
         .with_context(|| format!("read NUMA node for PCI device {pci_bus_id}"))?;
     let node = raw
@@ -256,107 +262,6 @@ pub fn split_rank_cpu_slices(
 
 fn errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
-}
-
-const SYSTEM_RESERVED_CPU: usize = 0;
-const SCHEDULER_CPU: usize = 1;
-
-#[derive(Clone, Debug)]
-pub struct RankThreadPlacement {
-    pub rank: usize,
-    pub device_ordinal: usize,
-    pub numa_node: usize,
-    pub cpu_slice: Vec<CpuId>,
-    pub rank_worker_cpu: CpuId,
-}
-
-impl RankThreadPlacement {
-    pub fn role_cpu(&self, offset: usize, role: &str) -> Result<CpuId> {
-        self.cpu_slice.get(offset).copied().with_context(|| {
-            format!(
-                "rank {} CPU slice {} is too small for {role} at offset {offset}",
-                self.rank,
-                format_cpu_list(&self.cpu_slice)
-            )
-        })
-    }
-
-    pub fn cpu_slice_display(&self) -> String {
-        format_cpu_list(&self.cpu_slice)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RankThreadPlacementPlan {
-    scheduler_cpu: Option<CpuId>,
-    ranks: Vec<RankThreadPlacement>,
-}
-
-impl RankThreadPlacementPlan {
-    pub fn for_devices(devices: &[usize]) -> Result<Self> {
-        let scheduler_cpu = {
-            let cpu = CpuId::new(SCHEDULER_CPU)?;
-            let allowed = current_allowed_cpus()?;
-            allowed.contains(&cpu).then_some(cpu)
-        };
-        let allowed_cpus = current_allowed_cpus()?;
-        let reserved_cpus = [CpuId::new(SYSTEM_RESERVED_CPU)?, CpuId::new(SCHEDULER_CPU)?];
-
-        let mut rank_nodes = Vec::with_capacity(devices.len());
-        let mut numa_nodes = BTreeSet::new();
-        for (rank, &device_ordinal) in devices.iter().enumerate() {
-            let numa_node = cuda_device_numa_node(device_ordinal)
-                .with_context(|| format!("read NUMA node for rank {rank} cuda:{device_ordinal}"))?;
-            rank_nodes.push(RankNumaNode { rank, numa_node });
-            numa_nodes.insert(numa_node);
-        }
-
-        let pools = numa_nodes
-            .iter()
-            .map(|&node| read_numa_cpu_pool(node))
-            .collect::<Result<Vec<_>>>()?;
-        let slices = split_rank_cpu_slices(&pools, &rank_nodes, &allowed_cpus, &reserved_cpus)?;
-        ensure!(
-            slices.len() == devices.len(),
-            "built {} CPU slices for {} devices",
-            slices.len(),
-            devices.len()
-        );
-
-        let mut ranks = Vec::with_capacity(devices.len());
-        for (rank, &device_ordinal) in devices.iter().enumerate() {
-            let slice = slices
-                .iter()
-                .find(|slice| slice.rank == rank)
-                .with_context(|| format!("missing CPU slice for rank {rank}"))?;
-            let rank_worker_cpu = *slice
-                .cpus
-                .first()
-                .with_context(|| format!("rank {rank} has empty CPU slice"))?;
-            ranks.push(RankThreadPlacement {
-                rank: slice.rank,
-                device_ordinal,
-                numa_node: slice.numa_node,
-                cpu_slice: slice.cpus.clone(),
-                rank_worker_cpu,
-            });
-        }
-        Ok(Self {
-            scheduler_cpu,
-            ranks,
-        })
-    }
-
-    pub fn scheduler_cpu(&self) -> Option<CpuId> {
-        self.scheduler_cpu
-    }
-
-    pub fn rank(&self, rank: usize) -> Result<RankThreadPlacement> {
-        self.ranks
-            .get(rank)
-            .cloned()
-            .with_context(|| format!("missing thread placement for rank {rank}"))
-    }
 }
 
 #[cfg(test)]

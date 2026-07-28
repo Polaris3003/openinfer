@@ -6,22 +6,22 @@
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use crate::metrics::{BlockPoolMetrics, MetricsAggregator, short_type_name};
-use crate::tinylfu::TinyLFUTracker;
-
-use crate::{
-    blocks::BlockMetadata,
-    pools::{
-        BlockDuplicationPolicy, BlockStore, InactiveIndex,
-        backends::{
-            FifoReusePolicy, HashMapBackend, LeafPolicy, LineageBackend, LruBackend,
-            MultiLruBackend,
-        },
-    },
-    registry::BlockRegistry,
-};
-
 use super::BlockManager;
+use crate::blocks::BlockMetadata;
+use crate::metrics::BlockPoolMetrics;
+use crate::metrics::MetricsAggregator;
+use crate::metrics::short_type_name;
+use crate::pools::BlockDuplicationPolicy;
+use crate::pools::BlockStore;
+use crate::pools::InactiveIndex;
+use crate::pools::backends::FifoReusePolicy;
+use crate::pools::backends::HashMapBackend;
+use crate::pools::backends::LeafPolicy;
+use crate::pools::backends::LineageBackend;
+use crate::pools::backends::LruBackend;
+use crate::pools::backends::MultiLruBackend;
+use crate::registry::BlockRegistry;
+use crate::tinylfu::TinyLFUTracker;
 
 /// Capacity settings for the TinyLFU frequency tracker used by
 /// [`BlockRegistry`] and the multi-level LRU backend.
@@ -163,11 +163,6 @@ impl<T: BlockMetadata> Default for BlockManagerConfigBuilder<T> {
 }
 
 impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
-    /// Create a new builder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Set the number of blocks in the pool.
     pub fn block_count(mut self, count: usize) -> Self {
         self.block_count = Some(count);
@@ -274,12 +269,6 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
         self
     }
 
-    /// Use HashMap backend with FIFO reuse order.
-    pub fn with_hashmap_backend(mut self) -> Self {
-        self.inactive_backend = Some(InactiveBackendConfig::HashMap);
-        self
-    }
-
     /// Use the lineage backend with the default ([`Tick`](LineageEviction::Tick))
     /// leaf-eviction policy.
     pub fn with_lineage_backend(mut self) -> Self {
@@ -292,14 +281,6 @@ impl<T: BlockMetadata> BlockManagerConfigBuilder<T> {
     /// Use the lineage backend with an explicit leaf-eviction policy.
     pub fn with_lineage_backend_eviction(mut self, eviction: LineageEviction) -> Self {
         self.inactive_backend = Some(InactiveBackendConfig::Lineage { eviction });
-        self
-    }
-
-    /// Set a metrics aggregator for prometheus export.
-    ///
-    /// The aggregator will automatically receive this manager's metrics source.
-    pub fn aggregator(mut self, aggregator: MetricsAggregator) -> Self {
-        self.aggregator = Some(aggregator);
         self
     }
 

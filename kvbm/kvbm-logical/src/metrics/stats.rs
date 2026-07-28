@@ -7,11 +7,15 @@
 //! This `StatsCollector` is the optional layer that computes derived statistics.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
-use super::pool_metrics::{BlockPoolMetrics, MetricsSnapshot};
+use super::pool_metrics::BlockPoolMetrics;
+use super::pool_metrics::MetricsSnapshot;
 
 /// Configuration for the stats collector.
 #[derive(Debug, Clone)]
@@ -181,20 +185,6 @@ impl StatsCollector {
             .into_iter()
             .rev()
             .collect()
-    }
-
-    /// Spawn a tokio task that periodically calls `sample()`.
-    /// Returns a `JoinHandle` that can be used to abort the task.
-    pub fn spawn(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
-        let this = Arc::clone(self);
-        let interval = this.config.sample_interval;
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(interval);
-            loop {
-                ticker.tick().await;
-                this.sample();
-            }
-        })
     }
 }
 

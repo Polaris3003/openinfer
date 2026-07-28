@@ -1,7 +1,8 @@
-use super::Half;
-#[cfg(feature = "qwen35-4b")]
+#[cfg(feature = "qwen35")]
 use cudarc::driver::sys::CUresult;
 use cudarc::driver::sys::CUstream;
+
+use super::Half;
 
 // Qwen3.5-4B private kernels (hybrid linear + HD256 full attention).
 // Sources: csrc/qwen35/*.cu; the *_hd256 paged variants live in csrc/shared/paged_attention.cu.
@@ -73,6 +74,22 @@ unsafe extern "C" {
         stream: CUstream,
     );
 
+    pub fn gated_delta_rule_decode_batch_cuda(
+        qkv_batch: *const Half,
+        b_proj_batch: *const Half,
+        a_proj_batch: *const Half,
+        dt_bias: *const Half,
+        A_log: *const f32,
+        state_ptrs: *const u64,
+        output_batch: *mut Half,
+        batch_size: i32,
+        num_key_heads: i32,
+        num_value_heads: i32,
+        key_dim: i32,
+        val_dim: i32,
+        stream: CUstream,
+    );
+
     // Causal depthwise conv1d prefill (parallel over sequence)
     pub fn conv1d_prefill_cuda(
         x_seq: *const Half,
@@ -84,12 +101,23 @@ unsafe extern "C" {
         kernel_size: i32,
         stream: CUstream,
     );
+
+    pub fn conv1d_decode_batch_cuda(
+        x_batch: *const Half,
+        conv_weight: *const Half,
+        conv_state_ptrs: *const u64,
+        out_batch: *mut Half,
+        num_channels: i32,
+        batch_size: i32,
+        kernel_size: i32,
+        stream: CUstream,
+    );
 }
 
 // Chunk-wise GDR prefill kernels, Triton AOT-generated at build time. The
-// `qwen35-4b` feature is what pulls Python + Triton into the build; without it
+// `qwen35` feature is what pulls Python + Triton into the build; without it
 // these symbols don't exist.
-#[cfg(feature = "qwen35-4b")]
+#[cfg(feature = "qwen35")]
 unsafe extern "C" {
     pub fn gated_delta_rule_prefill_chunk_prepare_cuda(
         qkv: *const Half,

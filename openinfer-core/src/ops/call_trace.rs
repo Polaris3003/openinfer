@@ -1,5 +1,7 @@
-use std::cell::{Cell, RefCell};
-use std::sync::{Mutex, OnceLock};
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use anyhow::Result;
 use openinfer_kernels::tensor::KernelCall;
@@ -76,15 +78,6 @@ pub fn record_call(call: KernelCall) {
     {
         calls.push(call);
     }
-}
-
-pub fn with_label<T>(label: impl Into<String>, f: impl FnOnce() -> T) -> T {
-    LABEL_STACK.with(|stack| stack.borrow_mut().push(label.into()));
-    let result = f();
-    LABEL_STACK.with(|stack| {
-        stack.borrow_mut().pop();
-    });
-    result
 }
 
 pub fn current_label(default_op: &str) -> String {

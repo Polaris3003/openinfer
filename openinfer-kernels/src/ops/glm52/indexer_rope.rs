@@ -1,14 +1,16 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
+use super::indexer::GLM52_INDEXER_HEAD_DIM;
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-use super::indexer::GLM52_INDEXER_HEAD_DIM;
-
-pub const GLM52_INDEXER_ROPE_DIM: usize = 64;
-pub const GLM52_INDEXER_ROPE_HALF: usize = 32;
+const GLM52_INDEXER_ROPE_HALF: usize = 32;
 
 /// Non-interleaved (half-split / NeoX-style) RoPE for the DSA indexer
 /// q `[n_heads, head_dim]` and k `[head_dim]` (in-place). Applies RoPE

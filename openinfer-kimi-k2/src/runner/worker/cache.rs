@@ -1,4 +1,6 @@
-use super::{load::*, runtime::*, *};
+use super::load::*;
+use super::runtime::*;
+use super::*;
 
 impl KimiOneTokenForwardCache {
     pub(super) fn from_gpu_weights(
@@ -467,7 +469,7 @@ pub(super) fn build_slot_page_table(
 }
 
 impl KimiWorkerDecodeScratch {
-    pub(super) fn new(
+    fn new(
         ctx: &DeviceContext,
         batch_size: usize,
         dims: &crate::config::KimiLocalDims,

@@ -12,17 +12,24 @@ mod builder;
 #[cfg(test)]
 mod tests;
 
-pub use builder::{
-    BlockManagerBuilderError, BlockManagerConfigBuilder, BlockManagerResetError,
-    FrequencyTrackingCapacity, InactiveBackendConfig, LineageEviction,
-};
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blocks::{BlockMetadata, CompleteBlock, ImmutableBlock, MutableBlock};
+pub use builder::BlockManagerBuilderError;
+pub use builder::BlockManagerConfigBuilder;
+pub use builder::BlockManagerResetError;
+pub use builder::FrequencyTrackingCapacity;
+pub use builder::InactiveBackendConfig;
+pub use builder::LineageEviction;
+
+use crate::blocks::BlockMetadata;
+use crate::blocks::CompleteBlock;
+use crate::blocks::ImmutableBlock;
+use crate::blocks::MutableBlock;
 use crate::metrics::BlockPoolMetrics;
-use crate::pools::{BlockDuplicationPolicy, BlockStore, SequenceHash};
+use crate::pools::BlockDuplicationPolicy;
+use crate::pools::BlockStore;
+use crate::pools::SequenceHash;
 use crate::registry::BlockRegistry;
 
 /// Manages the full block lifecycle over the unified [`BlockStore`].
@@ -41,18 +48,6 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// Create a new builder for `BlockManager`.
     pub fn builder() -> BlockManagerConfigBuilder<T> {
         BlockManagerConfigBuilder::default()
-    }
-
-    /// Stable, process-unique identifier for this manager's underlying
-    /// [`BlockStore`](crate::pools::BlockStore). See [`crate::ManagerId`].
-    /// Cheap (one field load via the store).
-    ///
-    /// Together with a [`BlockId`](crate::BlockId) this names a specific
-    /// physical pool slot — the disambiguating runtime address that
-    /// downstream consumers need after the policy parameter `T` has been
-    /// type-erased through [`crate::LifecyclePinRef`].
-    pub fn id(&self) -> crate::ManagerId {
-        self.store.id()
     }
 
     /// Allocate `count` mutable blocks, drawing first from the reset pool
@@ -234,11 +229,6 @@ impl<T: BlockMetadata + Sync> BlockManager<T> {
     /// Tokens per block (constant after construction).
     pub fn block_size(&self) -> usize {
         self.block_size
-    }
-
-    /// Current duplication policy.
-    pub fn duplication_policy(&self) -> &BlockDuplicationPolicy {
-        &self.duplication_policy
     }
 
     /// Reference to the shared block registry.

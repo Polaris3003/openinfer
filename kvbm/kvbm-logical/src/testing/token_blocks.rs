@@ -3,7 +3,8 @@
 
 //! Token block creation helpers for tests.
 
-use dynamo_tokens::{TokenBlock, TokenBlockSequence};
+use dynamo_tokens::TokenBlock;
+use dynamo_tokens::TokenBlockSequence;
 
 use super::TEST_SALT;
 
@@ -27,11 +28,6 @@ pub fn create_test_token_block(tokens: &[u32], block_size: u32) -> TokenBlock {
 pub fn create_iota_token_block(start: u32, block_size: u32) -> TokenBlock {
     let tokens: Vec<u32> = (start..start + block_size).collect();
     create_test_token_block(&tokens, block_size)
-}
-
-/// Generate a vector of sequential tokens.
-pub fn sequential_tokens(start: u32, count: usize) -> Vec<u32> {
-    (start..start + count as u32).collect()
 }
 
 /// Generate tokens for a given block ID (for unique but deterministic test data).

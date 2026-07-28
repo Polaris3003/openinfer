@@ -1,16 +1,19 @@
-use anyhow::{Result, bail, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
-use crate::{
-    ffi,
-    tensor::{DeviceContext, GpuTensor, NormWeight},
-};
+use crate::ffi;
+use crate::tensor::DeviceContext;
+use crate::tensor::GpuTensor;
+use crate::tensor::NormWeight;
 
 pub const KIMI_K2_MLA_LOCAL_HEADS_TP8: usize = 8;
 pub const KIMI_K2_MLA_Q_HEAD_DIM: usize = 192;
 pub const KIMI_K2_MLA_V_HEAD_DIM: usize = 128;
 pub const KIMI_K2_MLA_ROPE_DIM: usize = KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_V_HEAD_DIM;
-pub const KIMI_K2_MLA_NOPE_DIM: usize = KIMI_K2_MLA_Q_HEAD_DIM - KIMI_K2_MLA_ROPE_DIM;
 const KIMI_K2_MLA_Q_LORA_RANK: usize = 1536;
 pub const KIMI_K2_MLA_KV_LORA_RANK: usize = 512;
 pub const KIMI_K2_MLA_KV_A_OUT: usize = 576;
@@ -25,13 +28,13 @@ pub const KIMI_K2_MLA_Q_PE_LOCAL_OUT_TP8: usize =
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiMlaPagedKvLayout {
-    pub max_pages: usize,
-    pub page_size: usize,
-    pub batch_size: usize,
-    pub ckv_stride_page: usize,
-    pub ckv_stride_n: usize,
-    pub kpe_stride_page: usize,
-    pub kpe_stride_n: usize,
+    max_pages: usize,
+    pub(crate) page_size: usize,
+    pub(crate) batch_size: usize,
+    pub(crate) ckv_stride_page: usize,
+    pub(crate) ckv_stride_n: usize,
+    pub(crate) kpe_stride_page: usize,
+    pub(crate) kpe_stride_n: usize,
 }
 
 impl KimiMlaPagedKvLayout {

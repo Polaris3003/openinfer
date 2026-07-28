@@ -1,46 +1,52 @@
-use anyhow::{Context, Result};
-use cudarc::nccl::safe::{Comm, ReduceOp};
-use log::{debug, info};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::path::Path;
-use std::time::Instant;
 
-use super::config::{Config, TensorParallelConfig};
-use std::collections::HashMap;
-
-use crate::lora::{
-    DeviceLoraAdapter, DeviceLoraLayer, DeviceLoraProjection, DeviceLoraTokenGroup,
-    LoraProjectionKind, apply_lora_projection_delta_indexed, apply_lora_projection_delta_range,
-};
+use anyhow::Context;
+use anyhow::Result;
+use cudarc::nccl::safe::Comm;
+use cudarc::nccl::safe::ReduceOp;
 use half::bf16;
-use openinfer_core::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use openinfer_core::weight_loader::{
-    deserialize_shards, load_shard_info, load_tensor_1d, load_tensor_2d, load_tensor_2d_col_shard,
-    load_tensor_2d_row_shard, mmap_shards, precompute_rope,
-};
+use log::debug;
+use openinfer_core::tensor::DeviceContext;
+use openinfer_core::tensor::DeviceMatrix;
+use openinfer_core::tensor::DeviceVec;
+use openinfer_core::tensor::HiddenStates;
 use openinfer_kv_cache::KvBuffer;
 
+use super::config::Config;
+use super::config::TensorParallelConfig;
 use crate::batch_decode_buffers::BatchDecodeBuffers;
+use crate::lora::DeviceLoraAdapter;
+use crate::lora::DeviceLoraLayer;
+use crate::lora::DeviceLoraProjection;
+use crate::lora::DeviceLoraTokenGroup;
+use crate::lora::LoraProjectionKind;
+use crate::lora::apply_lora_projection_delta_indexed;
+use crate::lora::apply_lora_projection_delta_range;
+
+mod load;
+pub(crate) use load::ModelRuntimeConfig;
 
 pub const DEFAULT_GPU_MEMORY_UTILIZATION: f64 = 0.90;
 pub const DEFAULT_KV_CACHE_MEMORY_MARGIN_BYTES: usize = 150 * 1024 * 1024;
 /// Default KV cache page (block) size in tokens.
 pub const DEFAULT_KV_PAGE_SIZE: usize = 16;
 /// Page sizes FlashInfer's paged attention kernels accept (see #545).
-pub(crate) const VALID_KV_PAGE_SIZES: &[usize] = &[16, 64];
+const VALID_KV_PAGE_SIZES: &[usize] = &[16, 64];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Qwen3MemoryOptions {
     /// Mirrors vLLM's `gpu_memory_utilization`: the KV pool gets what remains
     /// inside this requested budget after weights, profiled non-KV runtime
     /// memory, and a small safety margin are accounted for.
-    pub gpu_memory_utilization: f64,
+    gpu_memory_utilization: f64,
     /// Extra bytes held back after the profile result to cover allocator
     /// fragmentation and small unprofiled runtime drift.
-    pub kv_cache_memory_margin_bytes: usize,
+    pub(crate) kv_cache_memory_margin_bytes: usize,
     /// KV cache page (block) size in tokens (`--kv-page-size`). FlashInfer
     /// constrains this to [`VALID_KV_PAGE_SIZES`]; 16 by default.
-    pub page_size: usize,
+    page_size: usize,
 }
 
 impl Qwen3MemoryOptions {
@@ -91,27 +97,6 @@ pub(crate) struct KvBudget {
     pub(crate) num_blocks: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct ModelRuntimeConfig {
-    pub(crate) enable_cuda_graph: bool,
-    pub(crate) tensor_parallel: Option<TensorParallelConfig>,
-    pub(crate) device_ordinal: usize,
-    pub(crate) max_loras: usize,
-    pub(crate) max_lora_rank: usize,
-}
-
-impl Default for ModelRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            enable_cuda_graph: true,
-            tensor_parallel: None,
-            device_ordinal: 0,
-            max_loras: crate::Qwen3LoraOptions::DEFAULT_MAX_LORAS,
-            max_lora_rank: crate::Qwen3LoraOptions::DEFAULT_MAX_LORA_RANK,
-        }
-    }
-}
-
 /// Attention layer weights.
 /// QKV stored as a single concatenated matrix [q_dim + 2*kv_dim, hidden_size].
 /// Individual projections accessed via row offsets (zero extra memory).
@@ -149,7 +134,7 @@ pub(crate) struct PackedLoraProjection {
     pub(crate) max_loras: usize,
     pub(crate) max_rank: usize,
     pub(crate) rank: usize,
-    pub(crate) in_dim: usize,
+    in_dim: usize,
     pub(crate) out_dim: usize,
     slot_ranks: Vec<usize>,
 }
@@ -272,7 +257,7 @@ impl PackedLoraProjection {
 }
 
 pub(crate) struct PackedLoraLayer {
-    pub(crate) projections: Vec<Option<PackedLoraProjection>>,
+    projections: Vec<Option<PackedLoraProjection>>,
 }
 
 impl PackedLoraLayer {
@@ -284,7 +269,7 @@ impl PackedLoraLayer {
         }
     }
 
-    pub(crate) fn projection(&self, kind: LoraProjectionKind) -> Option<&PackedLoraProjection> {
+    fn projection(&self, kind: LoraProjectionKind) -> Option<&PackedLoraProjection> {
         self.projections
             .get(kind.index())
             .and_then(Option::as_ref)
@@ -307,11 +292,11 @@ impl PackedLoraRegistry {
         }
     }
 
-    pub(crate) fn slot_for(&self, name: &str) -> Option<usize> {
+    fn slot_for(&self, name: &str) -> Option<usize> {
         self.slots_by_name.get(name).copied()
     }
 
-    pub(crate) fn layer(&self, layer_idx: usize) -> Option<&PackedLoraLayer> {
+    fn layer(&self, layer_idx: usize) -> Option<&PackedLoraLayer> {
         self.packed_layers.get(layer_idx)
     }
 
@@ -348,18 +333,18 @@ pub(crate) struct Qwen3Model {
     pub(super) ctx: DeviceContext,
     pub(super) config: Config,
     pub(super) embed_tokens: DeviceMatrix,
-    pub(super) lm_head: Option<DeviceMatrix>,
+    lm_head: Option<DeviceMatrix>,
     pub(super) layers: Vec<TransformerBlock>,
     pub(super) norm: DeviceVec,
     pub(super) cos_cache: DeviceVec,
     pub(super) sin_cache: DeviceVec,
     pub(super) enable_cuda_graph: bool,
     pub(super) tensor_parallel: TensorParallelConfig,
-    pub(super) tp_comm: Option<Comm>,
-    pub(super) lora_adapters: HashMap<String, DeviceLoraAdapter>,
-    pub(super) packed_lora: PackedLoraRegistry,
-    pub(super) max_loras: usize,
-    pub(super) max_lora_rank: usize,
+    tp_comm: Option<Comm>,
+    lora_adapters: HashMap<String, DeviceLoraAdapter>,
+    packed_lora: PackedLoraRegistry,
+    max_loras: usize,
+    max_lora_rank: usize,
 }
 
 // SAFETY: Each model instance is pinned to a single CUDA device and is only
@@ -369,267 +354,6 @@ unsafe impl Send for Qwen3Model {}
 unsafe impl Sync for Qwen3Model {}
 
 impl Qwen3Model {
-    pub(crate) fn from_safetensors_with_runtime(
-        model_path: &str,
-        runtime: ModelRuntimeConfig,
-    ) -> Result<Self> {
-        info!("Loading model from: {}", model_path);
-        debug!("Initializing GPU device {}", runtime.device_ordinal);
-        let ctx = DeviceContext::new_with_device(runtime.device_ordinal)?;
-
-        let config = Config::from_file(model_path)?;
-        let tensor_parallel = runtime.tensor_parallel.unwrap_or_default();
-        tensor_parallel.validate_for(&config)?;
-
-        let (shard_paths, weight_map) = load_shard_info(model_path)?;
-        debug!("Loading {} safetensor shard(s)", shard_paths.len());
-        let mmaps = mmap_shards(&shard_paths)?;
-        let shards = deserialize_shards(&mmaps)?;
-
-        let t_gpu = Instant::now();
-        debug!("Loading embeddings to GPU");
-        let embed_tokens = load_tensor_2d(&ctx, &shards, &weight_map, "model.embed_tokens.weight")?;
-        let lm_head = if config.tie_word_embeddings {
-            debug!("Using tied input/output embeddings");
-            None
-        } else {
-            debug!("Loading untied LM head to GPU");
-            Some(load_tensor_2d(
-                &ctx,
-                &shards,
-                &weight_map,
-                config.lm_head_tensor_name(),
-            )?)
-        };
-
-        debug!(
-            "Loading layers to GPU: num_layers={}, tp_rank={}, tp_world_size={}",
-            config.num_hidden_layers, tensor_parallel.rank, tensor_parallel.world_size,
-        );
-        let mut layers = Vec::with_capacity(config.num_hidden_layers);
-        let (q_row_offset, q_rows) =
-            tensor_parallel.shard_range(config.num_attention_heads * config.head_dim);
-        let (kv_row_offset, kv_rows) =
-            tensor_parallel.shard_range(config.num_key_value_heads * config.head_dim);
-        let (inter_row_offset, inter_rows) = tensor_parallel.shard_range(config.intermediate_size);
-        for i in 0..config.num_hidden_layers {
-            let prefix = format!("model.layers.{}", i);
-
-            let q_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.q_proj.weight", prefix),
-                    q_row_offset,
-                    q_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.q_proj.weight", prefix),
-                )?
-            };
-            let k_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.k_proj.weight", prefix),
-                    kv_row_offset,
-                    kv_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.k_proj.weight", prefix),
-                )?
-            };
-            let v_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.v_proj.weight", prefix),
-                    kv_row_offset,
-                    kv_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.self_attn.v_proj.weight", prefix),
-                )?
-            };
-            let q_dim = q_proj.rows;
-            let kv_dim = k_proj.rows;
-            let qkv_proj = DeviceMatrix::vstack(&ctx, &[&q_proj, &k_proj, &v_proj])?;
-            drop(q_proj);
-            drop(k_proj);
-            drop(v_proj);
-
-            let gate_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.gate_proj.weight", prefix),
-                    inter_row_offset,
-                    inter_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.gate_proj.weight", prefix),
-                )?
-            };
-            let up_proj = if tensor_parallel.is_sharded() {
-                load_tensor_2d_row_shard(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.up_proj.weight", prefix),
-                    inter_row_offset,
-                    inter_rows,
-                )?
-            } else {
-                load_tensor_2d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.mlp.up_proj.weight", prefix),
-                )?
-            };
-            let gate_up_proj = DeviceMatrix::vstack(&ctx, &[&gate_proj, &up_proj])?;
-            drop(gate_proj);
-            drop(up_proj);
-
-            let block = TransformerBlock {
-                input_layernorm: load_tensor_1d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.input_layernorm.weight", prefix),
-                )?,
-                attention: Attention {
-                    qkv_proj,
-                    o_proj: if tensor_parallel.is_sharded() {
-                        load_tensor_2d_col_shard(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.self_attn.o_proj.weight", prefix),
-                            q_row_offset,
-                            q_rows,
-                        )?
-                    } else {
-                        load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.self_attn.o_proj.weight", prefix),
-                        )?
-                    },
-                    q_norm: load_tensor_1d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.q_norm.weight", prefix),
-                    )?,
-                    k_norm: load_tensor_1d(
-                        &ctx,
-                        &shards,
-                        &weight_map,
-                        &format!("{}.self_attn.k_norm.weight", prefix),
-                    )?,
-                    q_dim,
-                    kv_dim,
-                },
-                post_attention_layernorm: load_tensor_1d(
-                    &ctx,
-                    &shards,
-                    &weight_map,
-                    &format!("{}.post_attention_layernorm.weight", prefix),
-                )?,
-                mlp: MLP {
-                    gate_up_proj,
-                    down_proj: if tensor_parallel.is_sharded() {
-                        load_tensor_2d_col_shard(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.mlp.down_proj.weight", prefix),
-                            inter_row_offset,
-                            inter_rows,
-                        )?
-                    } else {
-                        load_tensor_2d(
-                            &ctx,
-                            &shards,
-                            &weight_map,
-                            &format!("{}.mlp.down_proj.weight", prefix),
-                        )?
-                    },
-                },
-            };
-            layers.push(block);
-        }
-
-        let norm = load_tensor_1d(&ctx, &shards, &weight_map, "model.norm.weight")?;
-
-        debug!("Precomputing RoPE cache on GPU");
-        let (cos_cache, sin_cache) = precompute_rope(
-            &ctx,
-            config.head_dim,
-            config.max_position_embeddings,
-            config.rope_theta,
-        )?;
-
-        ctx.sync()?;
-        info!(
-            "GPU model loaded in {:.0}ms",
-            t_gpu.elapsed().as_secs_f64() * 1e3
-        );
-        drop(shards);
-        drop(mmaps);
-
-        let num_hidden_layers = config.num_hidden_layers;
-        let model = Self {
-            ctx,
-            config,
-            embed_tokens,
-            lm_head,
-            layers,
-            norm,
-            cos_cache,
-            sin_cache,
-            enable_cuda_graph: runtime.enable_cuda_graph,
-            tensor_parallel,
-            tp_comm: None,
-            lora_adapters: HashMap::new(),
-            packed_lora: PackedLoraRegistry::empty(runtime.max_loras, num_hidden_layers),
-            max_loras: runtime.max_loras,
-            max_lora_rank: runtime.max_lora_rank,
-        };
-
-        if model.enable_cuda_graph {
-            debug!(
-                "Decode path CUDA Graph is enabled (single GPU captures on first decode step; TP pre-captures every bucket at startup)"
-            );
-        } else {
-            debug!("Decode path CUDA Graph is disabled");
-        }
-
-        Ok(model)
-    }
-
     pub(super) fn output_projection(&self) -> &DeviceMatrix {
         self.lm_head.as_ref().unwrap_or(&self.embed_tokens)
     }
@@ -740,11 +464,7 @@ impl Qwen3Model {
         Ok(())
     }
 
-    pub(crate) fn lora_layer_for(
-        &self,
-        name: &str,
-        layer_idx: usize,
-    ) -> Option<(&DeviceLoraLayer, f32)> {
+    fn lora_layer_for(&self, name: &str, layer_idx: usize) -> Option<(&DeviceLoraLayer, f32)> {
         self.lora_adapters.get(name).and_then(|adapter| {
             adapter
                 .layers
@@ -1156,7 +876,8 @@ fn install_lora_adapter_in_registry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lora::{DeviceLoraLayer, LoraAdapterManifest};
+    use crate::lora::DeviceLoraLayer;
+    use crate::lora::LoraAdapterManifest;
 
     fn test_device_adapter(name: &str, path: &Path) -> DeviceLoraAdapter {
         DeviceLoraAdapter {
@@ -1245,21 +966,6 @@ mod tests {
             .slot_for_install("adapter-c", false)
             .expect("released slot should be reused");
         assert_eq!(slot_c, 0);
-    }
-
-    #[test]
-    fn memory_options_default_page_size_is_16() {
-        // #545: default behavior is unchanged when the flag is omitted.
-        assert_eq!(Qwen3MemoryOptions::default().page_size, 16);
-    }
-
-    #[test]
-    fn memory_options_accepts_valid_page_sizes() {
-        for &valid in VALID_KV_PAGE_SIZES {
-            Qwen3MemoryOptions::new(0.9, 0, valid)
-                .validate()
-                .unwrap_or_else(|_| panic!("page_size {valid} should be valid"));
-        }
     }
 
     #[test]

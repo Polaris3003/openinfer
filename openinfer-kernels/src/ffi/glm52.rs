@@ -1,5 +1,7 @@
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+
 use super::Half;
-use cudarc::driver::sys::{CUresult, CUstream};
 
 mod flashmla_sparse;
 pub use flashmla_sparse::*;
@@ -17,6 +19,93 @@ mod deepgemm_mqa;
 pub use deepgemm_mqa::*;
 
 unsafe extern "C" {
+    pub fn glm52_router_select_cuda(
+        logits: *const f32,
+        e_score_correction_bias: *const f32,
+        topk_weight: *mut f32,
+        topk_idx: *mut i32,
+        active_tokens: i32,
+        padded_tokens: i32,
+        n_experts: i32,
+        topk: i32,
+        route_scale: f32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_groupwise_gemm_sm100_cuda(
+        activation: *const u8,
+        activation_scale: *const f32,
+        weight: *const u8,
+        weight_scale: *const f32,
+        output: *mut Half,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        m: i32,
+        n: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_fp8_grouped_gemm_sm100_cuda(
+        activation: *const u8,
+        activation_scale: *const f32,
+        weight: *const u8,
+        weight_scale: *const f32,
+        output: *mut Half,
+        m_indptr: *const i32,
+        max_m: i32,
+        n: i32,
+        k: i32,
+        num_groups: i32,
+        workspace: *mut u8,
+        workspace_bytes: usize,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_route_cuda(
+        topk_idx: *const i32,
+        rows: i32,
+        topk: i32,
+        num_experts: i32,
+        expert_counts: *mut i32,
+        m_indptr: *mut i32,
+        gather_rows: *mut i32,
+        route_slot: *mut i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_gather_rows_cuda(
+        input: *const Half,
+        gather_rows: *const i32,
+        output: *mut Half,
+        total: i32,
+        hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_gather_fp8_cuda(
+        input: *const u8,
+        input_scale: *const f32,
+        gather_rows: *const i32,
+        output: *mut u8,
+        output_scale: *mut f32,
+        total: i32,
+        k: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_moe_combine_cuda(
+        w2_out: *const Half,
+        route_slot: *const i32,
+        topk_weight: *const f32,
+        shared_out: *const Half,
+        output: *mut Half,
+        rows: i32,
+        topk: i32,
+        hidden: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn glm52_vocab_parallel_pack_cuda(
         local_values: *const Half,
         local_indices: *const i32,
@@ -62,7 +151,9 @@ unsafe extern "C" {
         masked_out: *const Half,
         masked_m: *const i32,
         expert_offsets: *const i64,
+        row_weights: *const f32,
         aligned_out: *mut Half,
+        aligned_rows: i32,
         n: i32,
         stream: CUstream,
     ) -> CUresult;
@@ -225,9 +316,8 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
-    pub fn glm52_silu_and_mul_weighted_per_token_group_quant_bf16_masked_cuda(
+    pub fn glm52_silu_and_mul_per_token_group_quant_bf16_masked_cuda(
         input: *const Half,
-        topk_weights: *const f32,
         output: *mut u8,
         scales: *mut f32,
         rows: i32,
@@ -303,6 +393,16 @@ unsafe extern "C" {
         k: i32,
         stream: CUstream,
         ksplit_out: *mut i32,
+    ) -> CUresult;
+
+    pub fn glm52_prefill_unpack_pages_cuda(
+        packed: *const u8,
+        block_ids: *const i32,
+        blocks: i32,
+        packed_bytes: i32,
+        max_slots: i64,
+        unpacked: *mut Half,
+        stream: CUstream,
     ) -> CUresult;
 
     pub fn glm52_gemv_reduce_silu_mul_cuda(

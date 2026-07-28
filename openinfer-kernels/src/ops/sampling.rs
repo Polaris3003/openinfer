@@ -1,8 +1,15 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceVec, HiddenStates, HiddenStatesRef};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
+use crate::tensor::HiddenStatesRef;
 
 /// One non-greedy row of a batched sampling call.
 ///
@@ -66,10 +73,6 @@ impl BatchSamplingScratch {
             max_rows,
             vocab,
         })
-    }
-
-    pub fn max_rows(&self) -> usize {
-        self.max_rows
     }
 }
 
@@ -319,43 +322,6 @@ pub fn argmax(ctx: &DeviceContext, x: &DeviceVec) -> Result<u32> {
     Ok(result[0] as u32)
 }
 
-/// Single-row bf16 argmax into pre-allocated device outputs (`value[0]`,
-/// `index[0]`). Slice-level twin of [`argmax_batch_bf16_into`] (same kernel,
-/// rows=1, lowest index wins ties, NaN never wins) for callers whose logits
-/// live in a persistent decode arena. The bf16 top value is emitted so the
-/// caller can keep the crash-early non-finite guard after the 2-byte D2H.
-pub fn argmax_bf16_into(
-    ctx: &DeviceContext,
-    logits: &CudaSlice<half::bf16>,
-    n: usize,
-    value: &mut CudaSlice<half::bf16>,
-    index: &mut CudaSlice<i32>,
-) -> Result<()> {
-    if n == 0 || logits.len() < n {
-        return Err(anyhow!(
-            "argmax_bf16_into logits too small: have {}, need {n}",
-            logits.len()
-        ));
-    }
-    if value.is_empty() || index.is_empty() {
-        return Err(anyhow!("argmax_bf16_into outputs must hold one element"));
-    }
-    let (x_ptr, _gx) = logits.device_ptr(&ctx.stream);
-    let (v_ptr, _gv) = value.device_ptr_mut(&ctx.stream);
-    let (i_ptr, _gi) = index.device_ptr_mut(&ctx.stream);
-    unsafe {
-        ffi::argmax_batch_bf16_cuda(
-            x_ptr as *const ffi::Half,
-            v_ptr as *mut ffi::Half,
-            i_ptr as *mut i32,
-            1,
-            n as i32,
-            crate::tensor::active_cu_stream(ctx),
-        );
-    }
-    Ok(())
-}
-
 pub fn argmax_batch_bf16_into(
     ctx: &DeviceContext,
     logits: &HiddenStates,
@@ -414,8 +380,9 @@ pub fn markov_step_argmax_partials_len(rows: usize, vocab: usize) -> usize {
 }
 
 /// Row-wise two-stage bf16 argmax over `rows` rows of `n`: tile-parallel
-/// partials then one finalize block per row. Same per-row total order as
-/// [`argmax_bf16_into`] (lowest GLOBAL index wins ties, NaN never wins) — the
+/// partials then one finalize block per row. Same per-row total order as the
+/// retired single-row `argmax_bf16_into` (lowest GLOBAL index wins ties, NaN
+/// never wins) — the
 /// partials carry global indices, so each row's result is bit-identical to
 /// the single-block scan (and independent of the other rows) while each vocab
 /// row spreads over ~n/4096 CTAs instead of one. `partial_*` must hold
@@ -535,6 +502,96 @@ pub fn argmax_batch_bf16_split_indexed_into(
             pi_ptr as *mut i32,
             rows as i32,
             logits.hidden_dim as i32,
+            crate::tensor::active_cu_stream(ctx),
+        );
+    }
+
+    Ok(())
+}
+
+/// Launch the per-row logprob reduction into pre-allocated buffers laid out
+/// `[rows]` / `[rows * k_max]` row-major; each row writes `top_k[i] <= k_max`
+/// entries and leaves the tail untouched.
+///
+/// # Safety
+///
+/// The device-resident contents of `row_indices`, `picked`, and `top_k`
+/// cannot be validated here: for every `i < rows`, `row_indices[i]` must lie
+/// in `[0, logits.seq_len)`, `picked[i]` in `[0, logits.hidden_dim)`, and
+/// `top_k[i]` in `[0, min(k_max, logits.hidden_dim)]`. The launch goes to
+/// `active_cu_stream(ctx)`: input buffers must be populated before the
+/// launch and outputs read back after it, in that stream's order.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn logprob_topk_batch_bf16_into(
+    ctx: &DeviceContext,
+    logits: HiddenStatesRef<'_>,
+    row_indices: &CudaSlice<i32>,
+    picked: &CudaSlice<i32>,
+    top_k: &CudaSlice<i32>,
+    rows: usize,
+    k_max: usize,
+    out_picked_lp: &mut CudaSlice<f32>,
+    out_topk_vals: &mut CudaSlice<f32>,
+    out_topk_ids: &mut CudaSlice<i32>,
+) -> Result<()> {
+    ensure!(
+        rows > 0 && logits.hidden_dim > 0,
+        "logprob_topk requires rows > 0 and a non-empty vocab"
+    );
+    let backing = logits
+        .hidden_dim
+        .checked_mul(logits.seq_len)
+        .ok_or_else(|| anyhow!("logprob_topk arena extent overflows"))?;
+    ensure!(
+        logits.data.len() >= backing,
+        "logprob_topk arena backing too small: have {}, need {backing}",
+        logits.data.len()
+    );
+    ensure!(
+        row_indices.len() >= rows && picked.len() >= rows && top_k.len() >= rows,
+        "logprob_topk inputs must hold {rows} elements: have {}/{}/{}",
+        row_indices.len(),
+        picked.len(),
+        top_k.len()
+    );
+    ensure!(
+        out_picked_lp.len() >= rows,
+        "logprob_topk picked output too small: have {}, need {rows}",
+        out_picked_lp.len()
+    );
+    let topk_needed = rows
+        .checked_mul(k_max)
+        .ok_or_else(|| anyhow!("logprob_topk rows * k_max overflows"))?;
+    ensure!(
+        out_topk_vals.len() >= topk_needed && out_topk_ids.len() >= topk_needed,
+        "logprob_topk top-k outputs too small: have {}/{}, need {topk_needed}",
+        out_topk_vals.len(),
+        out_topk_ids.len()
+    );
+    let rows_i32 = i32::try_from(rows)?;
+    let vocab_i32 = i32::try_from(logits.hidden_dim)?;
+    let k_max_i32 = i32::try_from(k_max)?;
+
+    let (x_ptr, _gx) = logits.data.device_ptr(&ctx.stream);
+    let (rows_ptr, _gr) = row_indices.device_ptr(&ctx.stream);
+    let (picked_ptr, _gp) = picked.device_ptr(&ctx.stream);
+    let (k_ptr, _gk) = top_k.device_ptr(&ctx.stream);
+    let (lp_ptr, _gl) = out_picked_lp.device_ptr_mut(&ctx.stream);
+    let (vals_ptr, _gv) = out_topk_vals.device_ptr_mut(&ctx.stream);
+    let (ids_ptr, _gi) = out_topk_ids.device_ptr_mut(&ctx.stream);
+
+    unsafe {
+        ffi::logprob_topk_batch_bf16_cuda(
+            x_ptr as *const ffi::Half,
+            rows_ptr as *const i32,
+            picked_ptr as *const i32,
+            k_ptr as *const i32,
+            lp_ptr as *mut f32,
+            vals_ptr as *mut f32,
+            ids_ptr as *mut i32,
+            rows_i32,
+            vocab_i32,
+            k_max_i32,
             crate::tensor::active_cu_stream(ctx),
         );
     }

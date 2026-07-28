@@ -1,10 +1,13 @@
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+use anyhow::bail;
 use cudarc::driver::CudaSlice;
 use half::bf16;
 
-use crate::page_pool::{OwnedPagePermit, PageId, PagePool};
+use crate::page_pool::OwnedPagePermit;
+use crate::page_pool::PageId;
+use crate::page_pool::PagePool;
 use crate::tensor::DeviceContext;
 
 /// Page-first geometry: dimensions and derived strides for one page.
@@ -73,7 +76,7 @@ struct KvPoolInner {
 ///          └─ page_size × num_kv_heads × head_dim each ─┘
 /// ```
 ///
-/// Cheaply clonable (Arc). Multiple `KvState`s share the same pool.
+/// Cheaply cloneable (Arc). Multiple `KvState`s share the same pool.
 #[derive(Clone)]
 pub struct KvPool {
     inner: Arc<KvPoolInner>,
@@ -157,10 +160,6 @@ impl KvState {
         self.seq_len
     }
 
-    pub fn num_pages(&self) -> usize {
-        self.permit.pages().len()
-    }
-
     pub fn last_page_len(&self) -> usize {
         if self.seq_len == 0 {
             0
@@ -216,16 +215,14 @@ impl KvState {
     /// Build kernel-facing metadata for this request's KV.
     pub fn desc(&self) -> KvDesc<'_> {
         KvDesc {
-            layout: self.pool.inner.layout,
-            buffer: &self.pool.inner.buffer,
             pages: self.permit.pages(),
-            seq_len: self.seq_len,
             last_page_len: self.last_page_len(),
         }
     }
 
     /// Reset for a new request: return all pages, zero seq_len.
-    pub fn reset(&mut self) {
+    #[cfg(test)]
+    fn reset(&mut self) {
         self.permit = self
             .pool
             .inner
@@ -241,39 +238,23 @@ impl KvState {
 /// Bundles pool geometry (strides) with request state (page list, seq_len).
 /// Forward code passes this opaquely to FFI calls.
 pub struct KvDesc<'a> {
-    layout: KvLayout,
-    buffer: &'a CudaSlice<bf16>,
     pages: &'a [PageId],
-    seq_len: usize,
     last_page_len: usize,
 }
 
 impl KvDesc<'_> {
-    pub fn layout(&self) -> &KvLayout {
-        &self.layout
-    }
-
-    pub fn seq_len(&self) -> usize {
-        self.seq_len
-    }
-
-    pub fn last_page_len(&self) -> usize {
+    pub(crate) fn last_page_len(&self) -> usize {
         self.last_page_len
     }
 
-    pub fn num_pages(&self) -> usize {
+    #[cfg(test)]
+    fn num_pages(&self) -> usize {
         self.pages.len()
     }
 
     /// Page indices for this request (CPU-side).
-    pub fn page_indices(&self) -> &[PageId] {
+    pub(crate) fn page_indices(&self) -> &[PageId] {
         self.pages
-    }
-
-    /// The backing buffer. Kernel integration will extract device pointers
-    /// via `buffer.device_ptr(&stream)`.
-    pub fn buffer(&self) -> &CudaSlice<bf16> {
-        self.buffer
     }
 }
 

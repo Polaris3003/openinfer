@@ -1,18 +1,28 @@
 //! Shared GLM5.2 MoE weights and router used by the EP8 and TP8 production
 //! paths.
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_TP_TOKENS, Glm52RouterBatch, Glm52RouterConfig, Glm52RouterOutput,
-    glm52_router_noaux_tc_launch,
-};
+use openinfer_kernels::ops::GLM52_TP_TOKENS;
+use openinfer_kernels::ops::Glm52RouterBatch;
+use openinfer_kernels::ops::Glm52RouterConfig;
+use openinfer_kernels::ops::Glm52RouterOutput;
+use openinfer_kernels::ops::gemm_bf16_f32;
+use openinfer_kernels::ops::glm52_router_noaux_tc_launch;
+use openinfer_kernels::ops::glm52_router_select_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::fp8::{Glm52MlpScratch, ProjWeight, fp8_mlp_into, pack_proj_pair};
+use crate::fp8::Glm52MlpScratch;
 #[cfg(test)]
-use crate::fp8::{Glm52ProjBytes, bytes_to_f32};
+use crate::fp8::Glm52ProjBytes;
+use crate::fp8::ProjWeight;
+#[cfg(test)]
+use crate::fp8::bytes_to_f32;
+use crate::fp8::fp8_mlp_into;
+use crate::fp8::pack_proj_pair;
+use crate::weights::retype_owned;
 
 pub(crate) const HIDDEN: usize = crate::config::GLM52_HIDDEN;
 pub(crate) const EXPERTS: usize = crate::config::GLM52_ROUTED_EXPERTS;
@@ -26,7 +36,7 @@ pub(crate) const W2_N: usize = HIDDEN; // 6144
 pub(crate) const W2_K: usize = INTERMEDIATE; // 2048
 
 pub(crate) const HIDDEN_SCALE_COLS: usize = HIDDEN / QUANT_GROUP; // 48
-pub(crate) const W13_SCALE_ROWS: usize = W13_N / QUANT_GROUP; // 32
+const W13_SCALE_ROWS: usize = W13_N / QUANT_GROUP; // 32
 pub(crate) const W2_SCALE_COLS: usize = W2_K / QUANT_GROUP; // 16
 pub(crate) const W2_SCALE_ROWS: usize = W2_N / QUANT_GROUP; // 48
 
@@ -40,12 +50,16 @@ pub(crate) struct Glm52MoeRoutedExpertBytes<'a> {
 
 /// Router weights: the bf16 gate GEMM and the f32 selection-bias.
 pub(crate) struct Glm52MoeRouterWeights {
-    gate_weight: CudaSlice<u8>,  // bf16 [EXPERTS, HIDDEN]
-    e_score_bias: CudaSlice<u8>, // f32  [EXPERTS]
+    gate_weight: CudaSlice<bf16>, // bf16 [EXPERTS, HIDDEN]
+    e_score_bias: CudaSlice<u8>,  // f32  [EXPERTS]
 }
 
 impl Glm52MoeRouterWeights {
-    pub(crate) fn new(gate_weight: CudaSlice<u8>, e_score_bias: CudaSlice<u8>) -> Result<Self> {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        gate_weight: CudaSlice<u8>,
+        e_score_bias: CudaSlice<u8>,
+    ) -> Result<Self> {
         ensure!(
             gate_weight.len() == EXPERTS * HIDDEN * 2 && e_score_bias.len() == EXPERTS * 4,
             "GLM5.2 MoE router weight bytes unexpected: gate {}, bias {}",
@@ -53,7 +67,7 @@ impl Glm52MoeRouterWeights {
             e_score_bias.len()
         );
         Ok(Self {
-            gate_weight,
+            gate_weight: retype_owned(&ctx.stream, gate_weight)?,
             e_score_bias,
         })
     }
@@ -117,7 +131,7 @@ pub(crate) struct Glm52MoeExpertBank {
 }
 
 impl Glm52MoeExpertBank {
-    pub(crate) fn new(
+    fn new(
         n_experts: usize,
         w13_weight: CudaSlice<u8>,
         w13_scale: CudaSlice<f32>,
@@ -240,9 +254,9 @@ impl Glm52MoeExpertBank {
     }
 }
 
-/// Router output for one token: the top-8 GLOBAL expert ids and their
-/// normalized, x2.5-scaled weights, both device-resident (never read back to
-/// host).
+/// Router output for one token: the top-8 GLOBAL expert ids and weights, both
+/// device-resident (never read back to host). The caller chooses whether the
+/// model's routed scale is folded into these weights.
 pub(crate) struct RoutedTopk {
     pub(crate) topk_idx: CudaSlice<i32>,
     pub(crate) topk_weight: CudaSlice<f32>,
@@ -283,13 +297,38 @@ pub(crate) fn run_router_into(
     normed_hidden: &CudaSlice<bf16>,
     s: &mut Glm52RouterScratch,
 ) -> Result<()> {
+    run_router_into_with_config(ctx, router, normed_hidden, s, Glm52RouterConfig::glm52())
+}
+
+pub(crate) fn run_ep_router_into(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+    s: &mut Glm52RouterScratch,
+) -> Result<()> {
+    run_router_into_with_config(
+        ctx,
+        router,
+        normed_hidden,
+        s,
+        Glm52RouterConfig::glm52_unscaled(),
+    )
+}
+
+fn run_router_into_with_config(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+    s: &mut Glm52RouterScratch,
+    config: Glm52RouterConfig,
+) -> Result<()> {
     let mut router_out = Glm52RouterOutput {
         topk_weight: &mut s.route.topk_weight,
         topk_idx: &mut s.route.topk_idx,
     };
     glm52_router_noaux_tc_launch(
         ctx,
-        Glm52RouterConfig::glm52(),
+        config,
         Glm52RouterBatch {
             active_tokens: s.tokens,
             padded_tokens: s.tokens,
@@ -303,15 +342,60 @@ pub(crate) fn run_router_into(
     Ok(())
 }
 
-/// Allocating convenience over [`run_router_into`] for the oracle-gate/test
-/// paths.
+pub(crate) fn run_router_rows_into(
+    ctx: &DeviceContext,
+    router: &Glm52MoeRouterWeights,
+    normed_hidden: &CudaSlice<bf16>,
+    active_tokens: usize,
+    padded_tokens: usize,
+    s: &mut Glm52RouterScratch,
+) -> Result<()> {
+    ensure!(
+        active_tokens > 0
+            && active_tokens <= padded_tokens
+            && padded_tokens <= s.tokens
+            && normed_hidden.len() >= padded_tokens * HIDDEN,
+        "GLM5.2 router prefill shape is invalid"
+    );
+    gemm_bf16_f32(
+        ctx,
+        true,
+        false,
+        EXPERTS,
+        padded_tokens,
+        HIDDEN,
+        &router.gate_weight,
+        HIDDEN,
+        normed_hidden,
+        HIDDEN,
+        &mut s.logits,
+        EXPERTS,
+    )?;
+    let mut router_out = Glm52RouterOutput {
+        topk_weight: &mut s.route.topk_weight,
+        topk_idx: &mut s.route.topk_idx,
+    };
+    glm52_router_select_launch(
+        ctx,
+        Glm52RouterConfig::glm52(),
+        Glm52RouterBatch {
+            active_tokens,
+            padded_tokens,
+        },
+        &s.logits,
+        &router.e_score_bias,
+        &mut router_out,
+    )
+}
+
+/// Allocating EP/unscaled router for oracle-gate/test paths.
 #[cfg(test)]
-pub(crate) fn run_router(
+pub(crate) fn run_ep_router(
     ctx: &DeviceContext,
     router: &Glm52MoeRouterWeights,
     normed_hidden: &CudaSlice<bf16>,
 ) -> Result<RoutedTopk> {
     let mut s = Glm52RouterScratch::new(ctx, 1)?;
-    run_router_into(ctx, router, normed_hidden, &mut s)?;
+    run_ep_router_into(ctx, router, normed_hidden, &mut s)?;
     Ok(s.route)
 }

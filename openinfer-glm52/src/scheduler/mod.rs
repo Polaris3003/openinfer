@@ -37,6 +37,7 @@ mod admission;
 mod contract_tests;
 mod graph;
 mod load;
+mod mtp;
 mod offload;
 mod plan;
 mod slot;
@@ -45,25 +46,55 @@ mod testkit;
 
 use std::collections::VecDeque;
 
-use openinfer_core::engine::{GenerateRequest, LoadSnapshot, TokenEvent};
-use openinfer_kv_cache::{BlockPool, RequestKv};
-use openinfer_kv_offload::OffloadEngine;
-use openinfer_sample::mix_seed;
-use tokio::sync::{mpsc, watch};
-
-use crate::model::{
-    GLM52_MAX_BATCH_PER_RANK, GLM52_MODEL_LEN_ALIGN, Glm52StepKv, Glm52StepShape,
-    glm52_pool_blocks, glm52_table_width,
-};
-use crate::runner::{Glm52StepFlags, Glm52Worker};
-
-use admission::{admit_from_queue, intake};
-use graph::{GraphDumpRequest, dump_rank0_decode_graph, precapture_step_graphs};
-use load::{pending_is_empty, publish_load, running_counts};
+use admission::admit_from_queue;
+use admission::intake;
+use anyhow::Context;
+use graph::GraphDumpRequest;
+use graph::dump_rank0_decode_graph;
+use graph::precapture_step_graphs;
+use load::pending_is_empty;
+use load::publish_load;
+use load::running_counts;
+use mtp::run_mtp_round;
 pub(crate) use offload::REMOTE_FETCH_DEADLINE;
 use offload::VllmPdState;
-use plan::{collect_sampling_rows, feed_wants, launch_ahead_flags, plan_step_shapes};
-use slot::{GLM52_PADDING_STEP, Glm52SlotState, Glm52StepOutcome};
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_core::engine::TokenEvent;
+use openinfer_kv_cache::BlockPool;
+use openinfer_kv_cache::RequestKv;
+use openinfer_kv_offload::OffloadEngine;
+use openinfer_sample::mix_seed;
+use plan::collect_sampling_rows;
+use plan::feed_wants;
+use plan::launch_ahead_flags;
+use plan::plan_prefill_spans;
+use plan::plan_step_shapes;
+use plan::takes_argmax;
+use slot::GLM52_PADDING_STEP;
+use slot::Glm52SlotState;
+use slot::Glm52StepOutcome;
+#[cfg(test)]
+pub(crate) use slot::MTP_PRODUCTION_GATE_REQUEST_ID;
+#[cfg(test)]
+pub(crate) use slot::MTP_SLOT_REUSE_GATE_REQUEST_ID;
+#[cfg(test)]
+pub(crate) use slot::mtp_production_stats;
+#[cfg(test)]
+pub(crate) use slot::reset_mtp_production_stats;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::model::glm52_pool_blocks;
+use crate::model::glm52_table_width;
+use crate::runner::Glm52MtpAppend;
+use crate::runner::Glm52PrefillBatch;
+use crate::runner::Glm52StepFlags;
+use crate::runner::Glm52Worker;
 
 /// The KV page size (== the FlashMLA page / index-K block / model-len
 /// alignment — one 64 everywhere).
@@ -114,7 +145,8 @@ pub(crate) fn run_dp8_coordinator(
     mut submit_rx: mpsc::UnboundedReceiver<GenerateRequest>,
     workers: Vec<Glm52Worker>,
     eos_token_ids: &[u32],
-    dspark_enabled: bool,
+    drafter: crate::Glm52Drafter,
+    prefill_chunk_size: Option<usize>,
     max_model_len: usize,
     no_prefix_cache: bool,
     offload: Option<Vec<OffloadEngine>>,
@@ -123,6 +155,9 @@ pub(crate) fn run_dp8_coordinator(
     load_txs: Vec<watch::Sender<LoadSnapshot>>,
     graph_dump_request: Option<GraphDumpRequest>,
 ) {
+    let prefill_only = prefill_chunk_size.is_some();
+    let dspark_enabled = drafter.is_dspark();
+    let mtp_enabled = drafter.is_mtp();
     // Tensor-replicated topology: ONE logical rank drives mirrored executors.
     // Every worker receives the identical step (inputs, shape, KV, seed) and
     // must return bit-identical outputs — the scheduler admits, plans, and
@@ -165,7 +200,19 @@ pub(crate) fn run_dp8_coordinator(
     // padding page. Under tp8 the single pool drives every executor — the
     // mirrored steps write the identical block ids on all 8 arenas.
     let pools: Vec<BlockPool> = match (0..logical_ranks)
-        .map(|_| BlockPool::new(PAGE, glm52_pool_blocks(max_model_len)))
+        .map(|_| {
+            BlockPool::new(
+                PAGE,
+                glm52_pool_blocks(
+                    max_model_len,
+                    if prefill_only {
+                        1
+                    } else {
+                        GLM52_MAX_BATCH_PER_RANK
+                    },
+                ),
+            )
+        })
         .collect::<anyhow::Result<Vec<_>>>()
     {
         Ok(pools) => pools,
@@ -181,15 +228,14 @@ pub(crate) fn run_dp8_coordinator(
     // Pool pages available to requests per rank (total minus the padding
     // page) — constant for the engine's lifetime.
     let usable_blocks: Vec<usize> = pools.iter().map(|pool| pool.total_blocks() - 1).collect();
-    // The DSpark draft lane asserts every anchor position equals its
-    // committed + pending context rows — a skipped (cache-hit) prefix never
-    // produces the aux-hidden captures the draft consumes, so prefix
-    // matching is off while the drafter is on. Speculative decoding and
-    // prefix caching are mutually exclusive for now (the qwen3 offload path
-    // draws the same line). `--no-prefix-cache` is the explicit kill switch.
-    let prefix_cache_enabled = !dspark_enabled && !no_prefix_cache;
-    if dspark_enabled && !no_prefix_cache {
-        log::info!("GLM5.2 prefix cache disabled: the DSpark drafter is on");
+    // A cache-hit prefix skips state required by either speculative lane:
+    // DSpark loses the aux-hidden captures it consumes, while native MTP
+    // loses target hidden rows and continuity in its separate KV cache.
+    // Prefix matching therefore stays off while any drafter is active.
+    // `--no-prefix-cache` remains the explicit kill switch.
+    let prefix_cache_enabled = !drafter.enabled() && !no_prefix_cache;
+    if drafter.enabled() && !no_prefix_cache {
+        log::info!("GLM5.2 prefix cache disabled: speculative decoding is on");
     }
     let mut slots: Vec<RankSlots> = (0..logical_ranks)
         .map(|_| std::array::from_fn(|_| None))
@@ -211,7 +257,10 @@ pub(crate) fn run_dp8_coordinator(
     // contexts already exist: on failure broadcast Shutdown before the
     // workers' sequential Drop joins them (the same collective-teardown
     // contract as the exit path).
-    if let Err(err) = precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket) {
+    if !prefill_only
+        && let Err(err) =
+            precapture_step_graphs(&workers, &pools, table_width, mirrored, full_bucket)
+    {
         if let Some((_, response)) = graph_dump_request {
             let _ = response.send(Err(anyhow::anyhow!("{err:#}")));
         }
@@ -253,13 +302,25 @@ pub(crate) fn run_dp8_coordinator(
         if channel_open && all_idle(&slots) && pending_is_empty(&pending) {
             publish_load(&load_txs, &pools, &slots, &pending);
             match submit_rx.blocking_recv() {
-                Some(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
+                Some(req) => intake(
+                    req,
+                    &mut pending,
+                    &running_counts(&slots),
+                    max_model_len,
+                    prefill_only,
+                ),
                 None => channel_open = false,
             }
         }
         while channel_open {
             match submit_rx.try_recv() {
-                Ok(req) => intake(req, &mut pending, &running_counts(&slots), max_model_len),
+                Ok(req) => intake(
+                    req,
+                    &mut pending,
+                    &running_counts(&slots),
+                    max_model_len,
+                    prefill_only,
+                ),
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => channel_open = false,
             }
@@ -281,7 +342,8 @@ pub(crate) fn run_dp8_coordinator(
             &workers,
             mirrored,
             prefix_cache_enabled,
-            dspark_enabled,
+            drafter.enabled(),
+            prefill_only,
             &mut pending_resets,
             &mut slots_changed,
         ) {
@@ -298,27 +360,63 @@ pub(crate) fn run_dp8_coordinator(
             }
             continue;
         }
+        if prefill_only
+            && slots
+                .iter()
+                .flat_map(|rank| rank.iter().flatten())
+                .any(|active| !active.state.mid_prefill())
+        {
+            fail_step(
+                &mut slots,
+                &anyhow::anyhow!("GLM5.2 prefill-only invariant failed: a request reached decode"),
+            );
+            break 'serve;
+        }
+
+        if let Some(max_rows) = prefill_chunk_size {
+            sample_step += 1;
+            if let Err(err) = submit_join_apply_prefill(
+                &workers,
+                &pools,
+                &mut slots,
+                max_rows,
+                eos_token_ids,
+                sample_step,
+            ) {
+                fail_step(&mut slots, &err);
+                break 'serve;
+            }
+            slots_changed = true;
+            continue;
+        }
 
         // One lock-step step: every rank forwards the SAME bucket — each
         // active slot's span of consecutive next tokens, padding rows on the
         // free slots — and all responses are joined before any output is
         // interpreted.
         let shapes = plan_step_shapes(&feed_wants(&slots), full_bucket);
-        let flags = launch_ahead_flags(
-            &shapes,
-            leased_shapes.as_deref(),
-            slots_changed,
-            pending_is_empty(&pending),
-            dspark_enabled,
-            offload.is_some(),
-            &slots,
-            max_model_len,
-        );
+        let flags = if prefill_only {
+            Glm52StepFlags {
+                eager: true,
+                ..Glm52StepFlags::plain()
+            }
+        } else {
+            launch_ahead_flags(
+                &shapes,
+                leased_shapes.as_deref(),
+                slots_changed,
+                pending_is_empty(&pending),
+                drafter.enabled(),
+                offload.is_some(),
+                &slots,
+                max_model_len,
+            )
+        };
         leased_shapes = flags.lease.then(|| shapes.clone());
         slots_changed = false;
         sample_step += 1;
         // One lock-step step (see [`submit_and_join_step`]).
-        let (outputs, span_kinds) = match submit_and_join_step(
+        let (outputs, span_kinds, step_inputs) = match submit_and_join_step(
             &workers,
             &pools,
             &mut slots,
@@ -334,7 +432,7 @@ pub(crate) fn run_dp8_coordinator(
             }
         };
 
-        let (rank_appends, mut rank_proposals) = match apply_step_outputs(
+        let (rank_appends, mtp_appends, mut rank_proposals) = match apply_step_outputs(
             &mut slots,
             outputs,
             &shapes,
@@ -342,7 +440,8 @@ pub(crate) fn run_dp8_coordinator(
             &pools,
             offload.as_deref(),
             eos_token_ids,
-            dspark_enabled,
+            &drafter,
+            &step_inputs,
             &mut pending_resets,
             &mut slots_changed,
         ) {
@@ -377,8 +476,8 @@ pub(crate) fn run_dp8_coordinator(
             }
         }
 
-        if dspark_enabled
-            && let Err(err) = run_draft_round(
+        let draft_result = if dspark_enabled {
+            run_draft_round(
                 &workers,
                 &mut slots,
                 &shapes,
@@ -387,7 +486,19 @@ pub(crate) fn run_dp8_coordinator(
                 rank_proposals,
                 span_drafts,
             )
-        {
+        } else if mtp_enabled {
+            run_mtp_round(
+                &workers,
+                &mut slots,
+                &shapes,
+                &mut pending_resets,
+                mtp_appends,
+                rank_proposals,
+            )
+        } else {
+            Ok(())
+        };
+        if let Err(err) = draft_result {
             fail_step(&mut slots, &err);
             break 'serve;
         }
@@ -404,7 +515,7 @@ pub(crate) fn run_dp8_coordinator(
 
     // Drain in-flight release saves and drop the offload engines BEFORE the
     // workers drop the models: the registered arenas' device memory must
-    // outlive every D2H copy (the `with_arenas` contract), and pegaflow's
+    // outlive every D2H copy (the `with_arenas_on` contract), and pegaflow's
     // save worker cannot cancel a copy already handed to it. `flush_saves`
     // is deadline-bounded, so a stuck host tier cannot hang teardown.
     if let Some(offload) = offload {
@@ -443,6 +554,7 @@ fn submit_and_join_step(
 ) -> anyhow::Result<(
     Vec<[u32; GLM52_MAX_BATCH_PER_RANK]>,
     Vec<[Option<SpanKind>; GLM52_MAX_BATCH_PER_RANK]>,
+    Vec<[(u32, usize); GLM52_MAX_BATCH_PER_RANK]>,
 )> {
     // Logical-to-executor mapping: 1:1 under EP8, or the single logical
     // rank's step mirrored onto every worker under the replicated tp8
@@ -454,6 +566,7 @@ fn submit_and_join_step(
         .map(|_| [None; GLM52_MAX_BATCH_PER_RANK])
         .collect();
     let mut responses = Vec::with_capacity(workers.len());
+    let mut step_inputs = Vec::with_capacity(slots.len());
     let mut submit_err: Option<anyhow::Error> = None;
     'submit: for (rank, (rank_slots, shape)) in slots.iter_mut().zip(shapes).enumerate() {
         let pool = &pools[rank];
@@ -544,6 +657,7 @@ fn submit_and_join_step(
             pages: pages.into_boxed_slice(),
             slot_mapping,
         };
+        step_inputs.push(inputs);
         let executors: &[Glm52Worker] = if mirrored {
             workers
         } else {
@@ -599,7 +713,170 @@ fn submit_and_join_step(
         }
         outputs.truncate(1);
     }
-    Ok((outputs, span_kinds))
+    Ok((outputs, span_kinds, step_inputs))
+}
+
+fn submit_join_apply_prefill(
+    workers: &[Glm52Worker],
+    pools: &[BlockPool],
+    slots: &mut [RankSlots],
+    max_rows: usize,
+    eos_token_ids: &[u32],
+    sample_step: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        slots.len() == 1 && pools.len() == 1 && workers.len() > 1,
+        "GLM5.2 native prefill requires one logical rank mirrored across local TP workers"
+    );
+    let wants = feed_wants(slots);
+    let spans = plan_prefill_spans(&wants[0], max_rows);
+    let pool = &pools[0];
+    let mut batch = Glm52PrefillBatch {
+        token_ids: Vec::new(),
+        positions: Vec::new(),
+        request_indptr: vec![0],
+        block_indptr: vec![0],
+        block_ids: Vec::new(),
+        padding_block: pool.padding_block_id(),
+        slot_mapping: Vec::new(),
+        output_rows: Vec::new(),
+        sampling: Vec::new(),
+        seed: mix_seed(GLM52_SAMPLE_SEED, sample_step),
+    };
+    let mut scheduled = Vec::new();
+    for (slot_id, &span) in spans.iter().enumerate() {
+        if span == 0 {
+            continue;
+        }
+        let active = slots[0][slot_id]
+            .as_mut()
+            .expect("prefill planner assigns only active slots");
+        anyhow::ensure!(
+            active.state.mid_prefill() && span <= active.state.remaining_prompt(),
+            "GLM5.2 prefill planner produced an invalid span"
+        );
+        anyhow::ensure!(
+            active.state.next_input_at(0).position == active.kv.kv_position(),
+            "GLM5.2 prefill slot {slot_id} position drift"
+        );
+        active
+            .kv
+            .schedule_prefill(span, pool)
+            .map_err(|err| anyhow::anyhow!("GLM5.2 prefill slot {slot_id} schedule: {err}"))?;
+        let view = active.kv.prefill_view(span);
+        for offset in 0..span {
+            let input = active.state.next_input_at(offset);
+            batch.token_ids.push(input.token);
+            batch.positions.push(input.position as u32);
+            let page = view.page_indices()[input.position / PAGE];
+            batch
+                .slot_mapping
+                .push(page as i64 * PAGE as i64 + (input.position % PAGE) as i64);
+        }
+        batch.block_ids.extend_from_slice(view.page_indices());
+        batch.request_indptr.push(batch.token_ids.len() as u32);
+        batch.block_indptr.push(batch.block_ids.len() as u32);
+        let boundary = span == active.state.remaining_prompt();
+        if boundary {
+            batch.output_rows.push((batch.token_ids.len() - 1) as u32);
+            if !takes_argmax(&active.req.params) {
+                batch.sampling.push(crate::runner::Glm52RowSample {
+                    row: batch.output_rows.len() - 1,
+                    params: active.req.params,
+                    step: active.state.completion_tokens() as u64,
+                });
+            }
+        }
+        scheduled.push((slot_id, span, boundary));
+    }
+    batch.validate()?;
+
+    let responses = workers
+        .iter()
+        .map(|worker| worker.prefill_chunk_async(batch.clone()))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut outputs = Vec::with_capacity(responses.len());
+    for (rank, response) in responses.into_iter().enumerate() {
+        outputs.push(
+            response
+                .recv()
+                .map_err(|_| anyhow::anyhow!("GLM5.2 rank {rank} dropped prefill response"))?
+                .with_context(|| format!("GLM5.2 rank {rank} prefill"))?,
+        );
+    }
+    for (rank, output) in outputs.iter().enumerate().skip(1) {
+        anyhow::ensure!(
+            output == &outputs[0],
+            "GLM5.2 TP prefill output diverged on rank {rank}"
+        );
+    }
+    anyhow::ensure!(
+        outputs[0].len() == batch.output_rows.len(),
+        "GLM5.2 prefill returned {} boundary outputs, expected {}",
+        outputs[0].len(),
+        batch.output_rows.len()
+    );
+
+    let mut boundary_output = outputs[0].iter();
+    for (slot_id, span, boundary) in scheduled {
+        let slot = &mut slots[0][slot_id];
+        let active = slot
+            .as_mut()
+            .expect("scheduled prefill slot remains active");
+        let mut span_outputs = vec![0; span];
+        if boundary {
+            span_outputs[span - 1] = *boundary_output.next().expect("validated output count");
+        }
+        let prompt_tokens = active.req.prompt_tokens.len();
+        let outcome = active.state.advance_span(&span_outputs, eos_token_ids);
+        let freed = match outcome {
+            Glm52StepOutcome::Prefilling => {
+                active.kv.apply_prefill_chunk(pool)?;
+                active.req.token_tx.is_closed()
+            }
+            Glm52StepOutcome::Commit {
+                committed,
+                emit,
+                finish,
+                ..
+            } => {
+                active.kv.apply_prefill(committed[0], pool)?;
+                let mut freed = false;
+                for &token in &committed[..emit] {
+                    if active
+                        .req
+                        .token_tx
+                        .send(TokenEvent::Token {
+                            id: token,
+                            logprob: None,
+                        })
+                        .is_err()
+                    {
+                        freed = true;
+                        break;
+                    }
+                }
+                if let Some(finish_reason) = finish
+                    && !freed
+                {
+                    let _ = active.req.token_tx.send(TokenEvent::Finished {
+                        finish_reason,
+                        prompt_tokens,
+                        completion_tokens: active.state.completion_tokens(),
+                    });
+                    freed = true;
+                }
+                freed
+            }
+        };
+        if freed {
+            if let Err(err) = active.kv.release() {
+                log::warn!("GLM5.2 prefill slot {slot_id} KV release failed: {err:#}");
+            }
+            *slot = None;
+        }
+    }
+    Ok(())
 }
 
 /// Fold every rank's span of outputs into its slot state, commit the span's
@@ -616,11 +893,17 @@ fn apply_step_outputs(
     pools: &[BlockPool],
     offload: Option<&[offload::RankOffload]>,
     eos_token_ids: &[u32],
-    dspark_enabled: bool,
+    drafter: &crate::Glm52Drafter,
+    step_inputs: &[[(u32, usize); GLM52_MAX_BATCH_PER_RANK]],
     pending_resets: &mut [Vec<usize>],
     slots_changed: &mut bool,
-) -> anyhow::Result<(Vec<Vec<(usize, usize)>>, Vec<Vec<(usize, u32, usize)>>)> {
+) -> anyhow::Result<(
+    Vec<Vec<(usize, usize)>>,
+    Vec<Vec<Glm52MtpAppend>>,
+    Vec<Vec<(usize, u32, usize)>>,
+)> {
     let mut rank_appends: Vec<Vec<(usize, usize)>> = slots.iter().map(|_| Vec::new()).collect();
+    let mut mtp_appends: Vec<Vec<Glm52MtpAppend>> = slots.iter().map(|_| Vec::new()).collect();
     let mut rank_proposals: Vec<Vec<(usize, u32, usize)>> =
         slots.iter().map(|_| Vec::new()).collect();
     for (rank, ((rank_slots, rank_outputs), shape)) in
@@ -716,6 +999,10 @@ fn apply_step_outputs(
                 }
             };
             if freed {
+                #[cfg(test)]
+                active
+                    .state
+                    .record_mtp_production_gate(active.req.request_id.as_deref());
                 active.state.log_spec_stats(rank, slot_id);
                 // Offload the freshly-sealed blocks BEFORE release: the
                 // hashes and guards come off the still-assigned request
@@ -733,24 +1020,42 @@ fn apply_step_outputs(
                          (blocks return via RAII): {err:#}"
                     );
                 }
-                if dspark_enabled {
+                if drafter.enabled() {
                     pending_resets[rank].push(slot_id);
                 }
                 *slot = None;
                 *slots_changed = true;
-            } else if dspark_enabled {
-                // Committed rows' captured hidden feeds the draft
-                // context; then re-propose from the new anchor.
-                rank_appends[rank].extend(span_rows.take(context_rows).map(|r| (r, slot_id)));
-                if active.state.wants_drafts()
-                    && let Some((anchor, anchor_pos)) = active.state.decode_anchor()
-                {
+            } else if drafter.enabled() {
+                if drafter.is_dspark() {
+                    rank_appends[rank]
+                        .extend(span_rows.clone().take(context_rows).map(|r| (r, slot_id)));
+                } else {
+                    for (offset, target_row) in span_rows.clone().take(context_rows).enumerate() {
+                        let input_token = if offset + 1 < context_rows {
+                            step_inputs[rank][target_row + 1].0
+                        } else {
+                            active.state.next_input_at(0).token
+                        };
+                        mtp_appends[rank].push(Glm52MtpAppend {
+                            target_row,
+                            slot: slot_id,
+                            input_token,
+                            position: step_inputs[rank][target_row].1,
+                        });
+                    }
+                }
+                let wants_drafts = if drafter.is_mtp() {
+                    active.state.wants_full_draft(crate::mtp::GLM52_MTP_DRAFTS)
+                } else {
+                    active.state.wants_drafts()
+                };
+                if wants_drafts && let Some((anchor, anchor_pos)) = active.state.decode_anchor() {
                     rank_proposals[rank].push((slot_id, anchor, anchor_pos));
                 }
             }
         }
     }
-    Ok((rank_appends, rank_proposals))
+    Ok((rank_appends, mtp_appends, rank_proposals))
 }
 
 /// Draft round (rank-local, no collectives): resets, context appends from

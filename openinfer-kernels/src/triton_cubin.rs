@@ -6,10 +6,16 @@
 
 use std::ffi::c_void;
 
-use cudarc::driver::sys::{CUresult, CUstream};
-use tvm_ffi::{
-    Any, AnyView, Error, Function, RUNTIME_ERROR, Result as TvmResult, TYPE_ERROR, VALUE_ERROR,
-};
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+use tvm_ffi::Any;
+use tvm_ffi::AnyView;
+use tvm_ffi::Error;
+use tvm_ffi::Function;
+use tvm_ffi::RUNTIME_ERROR;
+use tvm_ffi::Result as TvmResult;
+use tvm_ffi::TYPE_ERROR;
+use tvm_ffi::VALUE_ERROR;
 
 use crate::ffi;
 
@@ -44,7 +50,7 @@ pub const TRITON_CUBIN_FUNCTIONS: &[TritonCubinFunctionSpec] = &[QWEN35_GDR_CHUN
 
 /// Return a fresh TVM FFI function for a known Triton CUBIN launcher.
 #[must_use]
-pub fn function(name: &str) -> Option<Function> {
+fn function(name: &str) -> Option<Function> {
     if name == QWEN35_GDR_CHUNK_SOLVE.name {
         return Some(Function::from_packed(launch_qwen35_gdr_chunk_solve));
     }

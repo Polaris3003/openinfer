@@ -7,23 +7,58 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::{Condvar, Mutex};
+use std::sync::Condvar;
+use std::sync::Mutex;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
 use half::bf16;
-use openinfer_kernels::ops::{
-    GLM52_TP_BANK_EXPERTS, GLM52_TP_HIDDEN, GLM52_TP_MAX_RANKS, GLM52_TP_TOKENS,
-    GLM52_TP_UNION_MAX, Glm52MoeTpBuffers, Glm52TpLlBuffer, Glm52TpTopology,
-    glm52_moe_tp_epoch_advance, glm52_moe_tp_layer_launch, glm52_moe_tp_max_blocks,
-    glm52_tp_ar_buffer_bytes, glm52_tp_ar_chunk_packets, glm52_tp_ar_launch,
-};
+use openinfer_kernels::ops::GLM52_FP8_GROUPED_GEMM_WORKSPACE_BYTES;
+use openinfer_kernels::ops::GLM52_TP_BANK_EXPERTS;
+use openinfer_kernels::ops::GLM52_TP_HIDDEN;
+use openinfer_kernels::ops::GLM52_TP_MAX_RANKS;
+use openinfer_kernels::ops::GLM52_TP_TOKENS;
+use openinfer_kernels::ops::GLM52_TP_UNION_MAX;
+use openinfer_kernels::ops::Glm52MoeQuantShape;
+use openinfer_kernels::ops::Glm52MoeTpBuffers;
+use openinfer_kernels::ops::Glm52TpLlBuffer;
+use openinfer_kernels::ops::Glm52TpTopology;
+use openinfer_kernels::ops::glm52_fp8_grouped_gemm_sm100_launch;
+use openinfer_kernels::ops::glm52_fp8_per_token_group_quant_bf16_launch;
+use openinfer_kernels::ops::glm52_moe_tp_epoch_advance;
+use openinfer_kernels::ops::glm52_moe_tp_layer_launch;
+use openinfer_kernels::ops::glm52_moe_tp_max_blocks;
+use openinfer_kernels::ops::glm52_prefill_moe_combine_launch;
+use openinfer_kernels::ops::glm52_prefill_moe_gather_fp8_launch;
+use openinfer_kernels::ops::glm52_prefill_moe_route_launch;
+use openinfer_kernels::ops::glm52_silu_and_mul_bf16_launch;
+use openinfer_kernels::ops::glm52_tp_ar_buffer_bytes;
+use openinfer_kernels::ops::glm52_tp_ar_chunk_packets;
+use openinfer_kernels::ops::glm52_tp_ar_launch;
 use openinfer_kernels::tensor::DeviceContext;
 
-use crate::config::{GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE, GLM52_HIDDEN};
-use crate::moe_decode::{EXPERTS, QUANT_GROUP, W2_K, W2_N, W2_SCALE_COLS, W2_SCALE_ROWS};
-use crate::weights::{Glm52WeightManifest, expected_tensor_contract, mmap_file, retype_owned};
+use crate::config::GLM52_EXPERT_INTERMEDIATE as INTERMEDIATE;
+use crate::config::GLM52_HIDDEN;
+use crate::fp8::Glm52Fp8GemmScratch;
+use crate::fp8::fp8_linear_large_m_bank_into;
+use crate::moe_decode::EXPERTS;
+use crate::moe_decode::Glm52MoeRouterWeights;
+use crate::moe_decode::Glm52RouterScratch;
+use crate::moe_decode::QUANT_GROUP;
+use crate::moe_decode::TOPK;
+use crate::moe_decode::W2_K;
+use crate::moe_decode::W2_N;
+use crate::moe_decode::W2_SCALE_COLS;
+use crate::moe_decode::W2_SCALE_ROWS;
+use crate::moe_decode::run_router_rows_into;
+use crate::weights::Glm52WeightManifest;
+use crate::weights::expected_tensor_contract;
+use crate::weights::mmap_file;
+use crate::weights::retype_owned;
 
 const H: usize = GLM52_TP_HIDDEN;
 const RANKS: usize = GLM52_TP_MAX_RANKS;
@@ -43,13 +78,13 @@ const SLICE_I: usize = Glm52TpTopology::Tp8.slice_i();
 /// One pilot layer's TP slice bank: this rank's intermediate rows of all 257
 /// experts, in the layout the cooperative kernel consumes.
 pub(crate) struct Glm52MoeTpSliceBank {
-    pub(crate) tp_ranks: usize,
-    pub(crate) slice_i: usize,
-    pub(crate) slice_rows: usize,
-    pub(crate) w13: CudaSlice<u8>,        // fp8 [257, 512, 6144]
-    pub(crate) w13_scale: CudaSlice<f32>, // f32 [257, 4, 48]
-    pub(crate) w2: CudaSlice<u8>,         // fp8 [257, 6144, 256]
-    pub(crate) w2_scale: CudaSlice<f32>,  // f32 [257, 48, 2]
+    tp_ranks: usize,
+    slice_i: usize,
+    slice_rows: usize,
+    w13: CudaSlice<u8>,        // fp8 [257, 512, 6144]
+    w13_scale: CudaSlice<f32>, // f32 [257, 4, 48]
+    w2: CudaSlice<u8>,         // fp8 [257, 6144, 256]
+    w2_scale: CudaSlice<f32>,  // f32 [257, 48, 2]
 }
 
 /// Slice one expert's checkpoint tensors into the rank-r staging bank.
@@ -310,6 +345,8 @@ pub(crate) struct Glm52TpExchange {
     all_in: Condvar,
     departed: Mutex<usize>,
     all_out: Condvar,
+    nccl_id: Mutex<Option<[core::ffi::c_char; 128]>>,
+    nccl_ready: Condvar,
 }
 
 impl Glm52TpExchange {
@@ -324,7 +361,38 @@ impl Glm52TpExchange {
             all_in: Condvar::new(),
             departed: Mutex::new(0),
             all_out: Condvar::new(),
+            nccl_id: Mutex::new(None),
+            nccl_ready: Condvar::new(),
         }
+    }
+
+    /// Share one NCCL unique id across the in-process rank threads: rank 0
+    /// mints it, everyone returns the same bytes. Used only by the
+    /// prefill-only NCCL all-reduce bring-up (collective — all ranks must
+    /// call this concurrently, like the LL pointer rendezvous).
+    fn nccl_id_rendezvous(&self, rank: usize) -> Result<cudarc::nccl::Id> {
+        let mut slot = self.nccl_id.lock().expect("TP exchange poisoned");
+        if rank == 0 {
+            ensure!(slot.is_none(), "TP NCCL id minted twice");
+            let id = cudarc::nccl::Id::new()
+                .map_err(|err| anyhow::anyhow!("NCCL unique id creation failed: {:?}", err.0))?;
+            *slot = Some(*id.internal());
+            self.nccl_ready.notify_all();
+            return Ok(id);
+        }
+        while slot.is_none() {
+            let (guard, timeout) = self
+                .nccl_ready
+                .wait_timeout(slot, Duration::from_secs(120))
+                .expect("TP exchange poisoned");
+            slot = guard;
+            if timeout.timed_out() && slot.is_none() {
+                bail!("TP NCCL id rendezvous timed out after 120s — rank 0 never published");
+            }
+        }
+        Ok(cudarc::nccl::Id::uninit(
+            *slot.as_ref().expect("checked above"),
+        ))
     }
 
     /// Publish this rank's mappings — or its failure. A failed rank MUST
@@ -444,6 +512,272 @@ impl Glm52MoeTpRank {
     }
 }
 
+/// Row-block bound for the chunk-scale MoE: bounds the gathered-route
+/// buffers (`block * TOPK` rows) while keeping per-layer expert weight
+/// re-reads to `ceil(chunk / block)` passes.
+pub(crate) const GLM52_PREFILL_MOE_BLOCK_ROWS: usize = 8192;
+
+/// Chunk-scale TP prefill MoE scratch: the router runs over the whole
+/// coordinator batch, routes are grouped on device, and both expert
+/// projections run as ONE FlashInfer CUTLASS grouped GEMM over the rank's
+/// 256 routed-expert slices (fp8 weights + f32 block scales, checkpoint
+/// layout as-is — no cubins, no UE8M0 requant). The shared expert (bank
+/// index 256) takes every row and runs as a dense large-M chain; the
+/// deterministic combine folds `shared + Σ_j w_j * routed_j` in f32.
+pub(crate) struct Glm52MoeTpPrefillScratch {
+    chunk_rows: usize,
+    block_rows: usize,
+    router: Glm52RouterScratch,
+    act_fp8: CudaSlice<u8>,
+    act_scale: CudaSlice<f32>,
+    expert_counts: CudaSlice<i32>,
+    m_indptr: CudaSlice<i32>,
+    gather_rows: CudaSlice<i32>,
+    route_slot: CudaSlice<i32>,
+    routed_fp8: CudaSlice<u8>,
+    routed_scale: CudaSlice<f32>,
+    gate_up: CudaSlice<bf16>,
+    silu: CudaSlice<bf16>,
+    silu_fp8: CudaSlice<u8>,
+    silu_scale: CudaSlice<f32>,
+    w2_out: CudaSlice<bf16>,
+    shared_gate_up: CudaSlice<bf16>,
+    shared_silu: CudaSlice<bf16>,
+    shared_out: CudaSlice<bf16>,
+    grouped_workspace: CudaSlice<u8>,
+    shared_gemm: Glm52Fp8GemmScratch,
+}
+
+impl Glm52MoeTpPrefillScratch {
+    pub(crate) fn new(
+        ctx: &DeviceContext,
+        topology: Glm52TpTopology,
+        chunk_rows: usize,
+    ) -> Result<Self> {
+        ensure!(chunk_rows > 0, "GLM5.2 TP prefill MoE needs positive rows");
+        let chunk = chunk_rows.next_multiple_of(4);
+        let block = chunk.min(GLM52_PREFILL_MOE_BLOCK_ROWS);
+        let routes = block * TOPK;
+        let slice_rows = topology.slice_rows();
+        let slice_i = topology.slice_i();
+        Ok(Self {
+            chunk_rows: chunk,
+            block_rows: block,
+            router: Glm52RouterScratch::new(ctx, chunk)?,
+            act_fp8: ctx.stream.alloc_zeros::<u8>(chunk * H)?,
+            act_scale: ctx.stream.alloc_zeros::<f32>(chunk * (H / QUANT_GROUP))?,
+            expert_counts: ctx.stream.alloc_zeros::<i32>(EXPERTS)?,
+            m_indptr: ctx.stream.alloc_zeros::<i32>(EXPERTS + 1)?,
+            gather_rows: ctx.stream.alloc_zeros::<i32>(routes)?,
+            route_slot: ctx.stream.alloc_zeros::<i32>(routes)?,
+            routed_fp8: ctx.stream.alloc_zeros::<u8>(routes * H)?,
+            routed_scale: ctx.stream.alloc_zeros::<f32>(routes * (H / QUANT_GROUP))?,
+            gate_up: ctx.stream.alloc_zeros::<bf16>(routes * slice_rows)?,
+            silu: ctx.stream.alloc_zeros::<bf16>(routes * slice_i)?,
+            silu_fp8: ctx.stream.alloc_zeros::<u8>(routes * slice_i)?,
+            silu_scale: ctx
+                .stream
+                .alloc_zeros::<f32>(routes * slice_i.div_ceil(QUANT_GROUP))?,
+            w2_out: ctx.stream.alloc_zeros::<bf16>(routes * H)?,
+            shared_gate_up: ctx.stream.alloc_zeros::<bf16>(block * slice_rows)?,
+            shared_silu: ctx.stream.alloc_zeros::<bf16>(block * slice_i)?,
+            shared_out: ctx.stream.alloc_zeros::<bf16>(block * H)?,
+            grouped_workspace: ctx
+                .stream
+                .alloc_zeros::<u8>(GLM52_FP8_GROUPED_GEMM_WORKSPACE_BYTES)?,
+            shared_gemm: Glm52Fp8GemmScratch::new(ctx, block, H)?,
+        })
+    }
+
+    /// Chunk-scale MoE forward: `output[..active * H]` receives this rank\'s
+    /// UNREDUCED partial (shared + routed slice contributions); the caller
+    /// all-reduces. Row blocks bound scratch, not correctness.
+    pub(crate) fn forward(
+        &mut self,
+        ctx: &DeviceContext,
+        state: &mut Glm52MoeTpState,
+        router: &Glm52MoeRouterWeights,
+        bank: &Glm52MoeTpSliceBank,
+        normed: &CudaSlice<bf16>,
+        active: usize,
+        output: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        let rows = active.next_multiple_of(4);
+        ensure!(
+            active > 0
+                && rows <= self.chunk_rows
+                && bank.tp_ranks == state.ranks()
+                && bank.slice_i == INTERMEDIATE / state.ranks()
+                && normed.len() >= rows * H
+                && output.len() >= active * H,
+            "GLM5.2 TP prefill MoE shape is invalid"
+        );
+        run_router_rows_into(ctx, router, normed, active, rows, &mut self.router)?;
+        // One quantization of the whole chunk; routed gathers reuse it.
+        glm52_fp8_per_token_group_quant_bf16_launch(
+            ctx,
+            Glm52MoeQuantShape {
+                rows,
+                width: H,
+                group_size: QUANT_GROUP,
+            },
+            normed,
+            &mut self.act_fp8,
+            &mut self.act_scale,
+        )?;
+        let mut start = 0usize;
+        while start < active {
+            let block = (active - start).min(self.block_rows);
+            self.forward_block(ctx, bank, normed, start, block, output)?;
+            start += block;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_block(
+        &mut self,
+        ctx: &DeviceContext,
+        bank: &Glm52MoeTpSliceBank,
+        normed: &CudaSlice<bf16>,
+        start: usize,
+        block: usize,
+        output: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        let routes = block * TOPK;
+        let topk_idx = self
+            .router
+            .route
+            .topk_idx
+            .slice(start * TOPK..(start + block) * TOPK);
+        let topk_weight = self
+            .router
+            .route
+            .topk_weight
+            .slice(start * TOPK..(start + block) * TOPK);
+        glm52_prefill_moe_route_launch(
+            ctx,
+            block,
+            TOPK,
+            EXPERTS,
+            &topk_idx,
+            &mut self.expert_counts,
+            &mut self.m_indptr,
+            &mut self.gather_rows,
+            &mut self.route_slot,
+        )?;
+        glm52_prefill_moe_gather_fp8_launch(
+            ctx,
+            routes,
+            H,
+            &self.act_fp8.slice(start * H..),
+            &self.act_scale.slice(start * (H / QUANT_GROUP)..),
+            &self.gather_rows,
+            &mut self.routed_fp8,
+            &mut self.routed_scale,
+        )?;
+        glm52_fp8_grouped_gemm_sm100_launch(
+            ctx,
+            routes,
+            bank.slice_rows,
+            H,
+            EXPERTS,
+            &self.routed_fp8,
+            &self.routed_scale,
+            &bank.w13,
+            &bank.w13_scale,
+            &self.m_indptr,
+            &mut self.gate_up,
+            &mut self.grouped_workspace,
+        )?;
+        glm52_silu_and_mul_bf16_launch(ctx, routes, bank.slice_i, &self.gate_up, &mut self.silu)?;
+        glm52_fp8_per_token_group_quant_bf16_launch(
+            ctx,
+            Glm52MoeQuantShape {
+                rows: routes,
+                width: bank.slice_i,
+                group_size: QUANT_GROUP,
+            },
+            &self.silu,
+            &mut self.silu_fp8,
+            &mut self.silu_scale,
+        )?;
+        glm52_fp8_grouped_gemm_sm100_launch(
+            ctx,
+            routes,
+            H,
+            bank.slice_i,
+            EXPERTS,
+            &self.silu_fp8,
+            &self.silu_scale,
+            &bank.w2,
+            &bank.w2_scale,
+            &self.m_indptr,
+            &mut self.w2_out,
+            &mut self.grouped_workspace,
+        )?;
+
+        // Shared expert (bank index 256): every row, dense large-M chain.
+        let shared = EXPERTS;
+        let block4 = block.next_multiple_of(4);
+        fp8_linear_large_m_bank_into(
+            ctx,
+            block4,
+            bank.slice_rows,
+            H,
+            &normed.slice(start * H..),
+            &bank.w13,
+            shared * bank.slice_rows * H,
+            &bank.w13_scale,
+            shared * (bank.slice_rows / QUANT_GROUP) * (H / QUANT_GROUP),
+            &mut self.shared_gemm,
+            &mut self.shared_gate_up,
+        )?;
+        glm52_silu_and_mul_bf16_launch(
+            ctx,
+            block4,
+            bank.slice_i,
+            &self.shared_gate_up,
+            &mut self.shared_silu,
+        )?;
+        fp8_linear_large_m_bank_into(
+            ctx,
+            block4,
+            H,
+            bank.slice_i,
+            &self.shared_silu,
+            &bank.w2,
+            shared * H * bank.slice_i,
+            &bank.w2_scale,
+            shared * (H / QUANT_GROUP) * (bank.slice_i / QUANT_GROUP),
+            &mut self.shared_gemm,
+            &mut self.shared_out,
+        )?;
+
+        let mut out_view = output.slice_mut(start * H..);
+        glm52_prefill_moe_combine_launch(
+            ctx,
+            block,
+            TOPK,
+            H,
+            &self.w2_out,
+            &self.route_slot,
+            &topk_weight,
+            &self.shared_out,
+            &mut out_view,
+        )?;
+        Ok(())
+    }
+}
+
+/// cudarc's `Comm` holds a raw `ncclComm_t` and is `!Send`; this rank's
+/// runtime (and therefore the comm) is created and used on its own worker
+/// thread only, so moving the containing runtime between threads before
+/// first use is safe. NCCL comms are not used concurrently from two threads.
+pub(crate) struct Glm52PrefillNccl(cudarc::nccl::Comm);
+
+unsafe impl Send for Glm52PrefillNccl {}
+
 /// Per-rank tensor-parallel runtime state shared by TP4 and TP8.
 pub(crate) struct Glm52MoeTpState {
     topology: Glm52TpTopology,
@@ -456,6 +790,10 @@ pub(crate) struct Glm52MoeTpState {
     ar_local: u64,
     peer_rs: [u64; RANKS],
     peer_ar: [u64; RANKS],
+    /// Prefill-only NCCL communicator over the TP fleet: the chunk-scale
+    /// prefill all-reduces ride ncclAllReduce(bf16) instead of a custom
+    /// kernel. Created collectively in `init_prefill_nccl`.
+    nccl: Option<Glm52PrefillNccl>,
     epoch_dev: CudaSlice<u64>,
     active_rows_dev: CudaSlice<i32>,
     guidx: CudaSlice<i32>,
@@ -556,6 +894,7 @@ impl Glm52MoeTpState {
             _ar: ar,
             peer_rs,
             peer_ar,
+            nccl: None,
             epoch_dev,
             active_rows_dev,
             guidx: ctx.stream.alloc_zeros(GLM52_TP_UNION_MAX)?,
@@ -617,6 +956,71 @@ impl Glm52MoeTpState {
             Some(&self.active_rows_dev),
             self.rank,
         )
+    }
+
+    /// Collective NCCL bring-up for the prefill-only path: all TP ranks must
+    /// call this concurrently (rank 0 mints the unique id via the exchange).
+    pub(crate) fn init_prefill_nccl(
+        &mut self,
+        ctx: &DeviceContext,
+        exchange: &Glm52TpExchange,
+    ) -> Result<()> {
+        ensure!(self.nccl.is_none(), "GLM5.2 prefill NCCL initialized twice");
+        let id = exchange.nccl_id_rendezvous(self.rank)?;
+        let comm =
+            cudarc::nccl::Comm::from_rank(ctx.stream.clone(), self.rank, self.topology.ranks(), id)
+                .map_err(|err| {
+                    anyhow::anyhow!("GLM5.2 prefill NCCL comm init failed: {:?}", err.0)
+                })?;
+        self.nccl = Some(Glm52PrefillNccl(comm));
+        Ok(())
+    }
+
+    /// Sum-all-reduce `partial[..rows * H]` into `out[..rows * H]` across the
+    /// TP fleet on this rank\'s stream (ncclAllReduce, bf16).
+    pub(crate) fn prefill_allreduce(
+        &mut self,
+        _ctx: &DeviceContext,
+        rows: usize,
+        partial: &CudaSlice<bf16>,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && partial.len() >= rows * H && out.len() >= rows * H,
+            "GLM5.2 prefill all-reduce buffers are invalid"
+        );
+        let comm = self
+            .nccl
+            .as_ref()
+            .context("GLM5.2 prefill NCCL communicator was never initialized")?;
+        let send = partial.slice(..rows * H);
+        let mut recv = out.slice_mut(..rows * H);
+        comm.0
+            .all_reduce(&send, &mut recv, &cudarc::nccl::ReduceOp::Sum)
+            .map_err(|err| anyhow::anyhow!("GLM5.2 prefill NCCL all-reduce failed: {:?}", err.0))?;
+        Ok(())
+    }
+
+    /// In-place variant of [`Self::prefill_allreduce`].
+    pub(crate) fn prefill_allreduce_in_place(
+        &mut self,
+        _ctx: &DeviceContext,
+        rows: usize,
+        buffer: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        ensure!(
+            rows > 0 && buffer.len() >= rows * H,
+            "GLM5.2 prefill all-reduce buffer is invalid"
+        );
+        let comm = self
+            .nccl
+            .as_ref()
+            .context("GLM5.2 prefill NCCL communicator was never initialized")?;
+        let mut view = buffer.slice_mut(..rows * H);
+        comm.0
+            .all_reduce_in_place(&mut view, &cudarc::nccl::ReduceOp::Sum)
+            .map_err(|err| anyhow::anyhow!("GLM5.2 prefill NCCL all-reduce failed: {:?}", err.0))?;
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -800,5 +1204,73 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod prefill_nccl_tests {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::Mutex;
+
+    use openinfer_kernels::tensor::DeviceContext;
+
+    use super::*;
+
+    /// Minimal in-process 4-rank cudarc NCCL smoke: Id share + from_rank +
+    /// bf16 sum all-reduce, mirroring the prefill bring-up exactly.
+    #[test]
+    #[ignore = "requires 4 CUDA devices"]
+    fn tp4_nccl_allreduce_smoke() -> Result<()> {
+        const RANKS: usize = 4;
+        const ELEMS: usize = 6144 * 32;
+        let id_slot: Arc<(Mutex<Option<[core::ffi::c_char; 128]>>, Condvar)> =
+            Arc::new((Mutex::new(None), Condvar::new()));
+        let barrier = Arc::new(Barrier::new(RANKS));
+        let handles: Vec<_> = (0..RANKS)
+            .map(|rank| {
+                let id_slot = Arc::clone(&id_slot);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || -> Result<()> {
+                    let ctx = DeviceContext::new_with_device(rank)?;
+                    let id = if rank == 0 {
+                        let id = cudarc::nccl::Id::new()
+                            .map_err(|err| anyhow::anyhow!("id: {:?}", err.0))?;
+                        *id_slot.0.lock().unwrap() = Some(*id.internal());
+                        id_slot.1.notify_all();
+                        id
+                    } else {
+                        let mut slot = id_slot.0.lock().unwrap();
+                        while slot.is_none() {
+                            slot = id_slot.1.wait(slot).unwrap();
+                        }
+                        cudarc::nccl::Id::uninit(slot.unwrap())
+                    };
+                    barrier.wait();
+                    let comm = cudarc::nccl::Comm::from_rank(ctx.stream.clone(), rank, RANKS, id)
+                        .map_err(|err| anyhow::anyhow!("init: {:?}", err.0))?;
+                    let send_host = vec![bf16::from_f32((rank + 1) as f32); ELEMS];
+                    let send = ctx.stream.clone_htod(&send_host)?;
+                    let mut recv = ctx.stream.alloc_zeros::<bf16>(ELEMS)?;
+                    let send_view = send.slice(..ELEMS);
+                    let mut recv_view = recv.slice_mut(..ELEMS);
+                    comm.all_reduce(&send_view, &mut recv_view, &cudarc::nccl::ReduceOp::Sum)
+                        .map_err(|err| anyhow::anyhow!("allreduce: {:?}", err.0))?;
+                    drop(recv_view);
+                    let host = ctx.stream.clone_dtoh(&recv)?;
+                    ensure!(
+                        host.iter().all(|v| v.to_f32() == 10.0),
+                        "rank {rank} sum mismatch: {}",
+                        host[0].to_f32()
+                    );
+                    barrier.wait();
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("nccl smoke rank panicked")?;
+        }
+        Ok(())
     }
 }

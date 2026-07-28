@@ -5,25 +5,30 @@
 //! not measure serving latency, throughput, SLO compliance, soak behavior, or
 //! production readiness; those claims belong to retained benchmark artifacts.
 
-use std::{
-    env, fs,
-    path::{Path, PathBuf},
-    sync::{Arc, Barrier},
-    thread,
-};
+use std::env;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Barrier;
+use std::thread;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use openinfer_deepseek_v2_lite::DeepSeekV2LiteEp2Generator;
-use openinfer_engine::{
-    engine::{
-        EngineLoadOptions, FinishReason, GenerateRequest, TokenEvent, TokenSink,
-        TokenStreamReceiver,
-    },
-    sampler::SamplingParams,
-};
+use openinfer_engine::engine::EngineLoadOptions;
+use openinfer_engine::engine::FinishReason;
+use openinfer_engine::engine::GenerateRequest;
+use openinfer_engine::engine::TokenEvent;
+use openinfer_engine::engine::TokenSink;
+use openinfer_engine::engine::TokenStreamReceiver;
+use openinfer_engine::sampler::SamplingParams;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use vllm_text::tokenizer::{HuggingFaceTokenizer, Tokenizer};
+use sha2::Digest;
+use sha2::Sha256;
+use vllm_text::tokenizer::HuggingFaceTokenizer;
+use vllm_text::tokenizer::Tokenizer;
 
 const EXPECTED_GENERATED_TOKENS: usize = 16;
 const EXPECTED_OUTPUT_SHA256_PAIRS: &[(&str, &str, &str)] = &[
@@ -620,6 +625,7 @@ fn run_mixed_serving_generation(model_path: &Path, model_path_label: &str) -> Re
     for (id, _prompt, prompt_tokens, max_tokens, ignore_eos) in encoded_cases {
         let (token_tx, token_rx) = TokenSink::standalone();
         let req = GenerateRequest {
+            trace_parent: None,
             request_id: Some(id.clone()),
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -705,6 +711,7 @@ fn run_mixed_serving_position_fallback(
     for (id, prompt_tokens, max_tokens, ignore_eos) in encoded_cases {
         let (token_tx, token_rx) = TokenSink::standalone();
         let req = GenerateRequest {
+            trace_parent: None,
             request_id: Some(id.clone()),
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -774,6 +781,7 @@ fn run_mixed_serving_rejection_isolation(
 ) -> Result<()> {
     let (invalid_tx, mut invalid_rx) = TokenSink::standalone();
     let invalid_req = GenerateRequest {
+        trace_parent: None,
         request_id: Some("mixed-invalid-logprobs".to_string()),
         queued_at_unix_s: None,
         data_parallel_rank: None,
@@ -788,6 +796,7 @@ fn run_mixed_serving_rejection_isolation(
 
     let (valid_tx, mut valid_rx) = TokenSink::standalone();
     let valid_req = GenerateRequest {
+        trace_parent: None,
         request_id: Some(valid_id.to_string()),
         queued_at_unix_s: None,
         data_parallel_rank: None,

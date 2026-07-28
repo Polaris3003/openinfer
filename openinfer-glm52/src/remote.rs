@@ -18,31 +18,46 @@
 //! exactly like a dead worker thread today. No retry, no reconnect, no
 //! buffering.
 
-use std::{
-    collections::VecDeque,
-    io::{BufReader, BufWriter, Read, Write},
-    net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-    thread,
-};
+use std::collections::VecDeque;
+use std::io::BufReader;
+use std::io::BufWriter;
+use std::io::Read;
+use std::io::Write;
+use std::net::TcpListener;
+use std::net::TcpStream;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::thread;
 
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use anyhow::ensure;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use crossbeam_channel::bounded;
+use crossbeam_channel::unbounded;
 use openinfer_kv_offload::KvArena;
 
 use crate::Glm52MoeTopo;
 use crate::dspark::GLM52_DSPARK_DRAFTS;
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52StepKv, Glm52StepShape};
-use crate::runner::{
-    Glm52RankPlacement, Glm52RankWeightLoadReport, Glm52RankWorker, Glm52RowSample, Glm52StepFlags,
-};
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::runner::Glm52RankPlacement;
+use crate::runner::Glm52RankWeightLoadReport;
+use crate::runner::Glm52RankWorker;
+use crate::runner::Glm52RowSample;
+use crate::runner::Glm52StepFlags;
 use crate::weights::Glm52WeightManifest;
 
 /// Bump on ANY wire-visible change. Both ends ship in one repo at one
 /// commit; the handshake check turns a mixed deploy into a clean reject
 /// instead of a bincode decode error mid-flight.
-const GLM52_WIRE_VERSION: u32 = 1;
+const GLM52_WIRE_VERSION: u32 = 2;
 
 /// Frames are small (a `Step` is < 100 KiB even at max table width); anything
 /// bigger than this is a corrupted length prefix, not a real frame.
@@ -110,11 +125,12 @@ enum WireRequest {
     LoadWeights {
         model_path: PathBuf,
         moe_topo: Glm52MoeTopo,
+        weight_staging: bool,
     },
     BuildModel {
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
     },
     SetupComm {
         unique_id: Vec<u8>,
@@ -441,6 +457,7 @@ impl Glm52RemoteRankWorker {
         &self,
         model_path: &Path,
         moe_topo: Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (tx, rx) = bounded(1);
         self.node.shared.submit(
@@ -448,6 +465,7 @@ impl Glm52RemoteRankWorker {
             WireRequest::LoadWeights {
                 model_path: model_path.to_path_buf(),
                 moe_topo,
+                weight_staging,
             },
             PendingResp::LoadWeights(tx),
         )?;
@@ -458,7 +476,7 @@ impl Glm52RemoteRankWorker {
         &self,
         max_model_len: usize,
         moe_topo: Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (tx, rx) = bounded(1);
         self.node.shared.submit(
@@ -466,7 +484,7 @@ impl Glm52RemoteRankWorker {
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
             },
             PendingResp::BuildModel(tx),
         )?;
@@ -747,6 +765,9 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
             "GLM5.2 rank-host teardown exceeded {deadline:?} (worker stuck in a \
              collective missing peers?); exiting for a clean restart"
         );
+        // EP rank-host watchdog: a stuck collective can never make progress, so
+        // dying here and letting the orchestrator restart the rank is the protocol.
+        #[allow(clippy::exit)]
         std::process::exit(2);
     }
     let _ = teardown.join();
@@ -755,7 +776,7 @@ fn serve_connection(stream: TcpStream) -> Result<()> {
 
 fn spawn_hosted_workers(hello: &WireHello) -> Result<Vec<Glm52RankWorker>> {
     let manifest = Glm52WeightManifest::from_model_dir(&hello.model_path)?;
-    let bundles = manifest.all_rank_load_bundles(hello.moe_topo)?;
+    let bundles = manifest.all_rank_load_bundles(hello.moe_topo, false)?;
     ensure!(
         hello.first_rank + hello.rank_count <= bundles.len(),
         "GLM5.2 rank-host asked for ranks {}..{} but {:?} has {} ranks",
@@ -804,15 +825,21 @@ fn host_demux_loop(
             WireRequest::LoadWeights {
                 model_path,
                 moe_topo,
-            } => HostPending::LoadWeights(worker.load_weights_async(&model_path, moe_topo)?),
+                weight_staging,
+            } => HostPending::LoadWeights(worker.load_weights_async(
+                &model_path,
+                moe_topo,
+                weight_staging,
+            )?),
             WireRequest::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
             } => HostPending::BuildModel(worker.build_model_async(
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
+                None,
             )?),
             WireRequest::SetupComm {
                 unique_id,
@@ -905,6 +932,35 @@ mod tests {
                 ensure!(kv.pages.len() == 8 * 16 && kv.slot_mapping == [9i64; 8]);
                 ensure!(sampling.len() == 1 && sampling[0].row == 2);
                 ensure!(seed == 0xDEAD_BEEF);
+            }
+            other => bail!("decoded wrong variant: {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn build_model_frame_roundtrip_preserves_drafter_path() -> Result<()> {
+        let mut buf = Vec::new();
+        let cmd = WireCmd {
+            worker: 5,
+            req: WireRequest::BuildModel {
+                max_model_len: 65_536,
+                moe_topo: Glm52MoeTopo::Ep8,
+                drafter: crate::Glm52Drafter::Dspark(PathBuf::from("/models/dspark")),
+            },
+        };
+        write_frame(&mut buf, &cmd)?;
+        let decoded: WireCmd = read_frame(&mut buf.as_slice())?;
+        ensure!(decoded.worker == 5);
+        match decoded.req {
+            WireRequest::BuildModel {
+                max_model_len,
+                moe_topo,
+                drafter,
+            } => {
+                ensure!(max_model_len == 65_536);
+                ensure!(moe_topo == Glm52MoeTopo::Ep8);
+                ensure!(drafter == crate::Glm52Drafter::Dspark(PathBuf::from("/models/dspark")));
             }
             other => bail!("decoded wrong variant: {other:?}"),
         }

@@ -54,9 +54,9 @@ This is also the tracing leg of the `direction.md` ledger → simulator → trac
 
 *Done when:* a `vllm bench serve` run against Qwen3-4B is fully explainable from the dashboard alone.
 
-### 4. GLM5.2 large-MoE mainline (in progress)
+### 4. GLM5.2 large-MoE mainline
 
-The DP1/EP8 DSA decode line (`docs/models/glm52/dp1-ep8-decode-plan.md`, five sub-PRs from the #476 load-weight scaffold). Actively underway; this is the main engine-depth work of the half and the path to the large-MoE / multi-node story.
+The original DP1/EP8 bring-up campaign is complete and has grown into Hopper EP8/TP8, Blackwell EP4/TP4, one-domain EP-N, and cross-engine P/D serving paths. Current capabilities and promotion blockers live in `docs/models/glm52/serving-status.md`.
 
 It is also the deliberate **boundary test** for shared infrastructure: large MoE forces the question of which DeepGEMM / DeepEP / FlashMLA substrate is genuinely cross-model (`openinfer-kernels::moe`) versus model-local. We do not refactor scaffolding speculatively — the boundary moves when GLM5.2 provides evidence it must (per `direction.md`). Any extraction of shared MoE/MLA primitives falls out of this line, not out of a standalone "clean up the scaffolding" project.
 
@@ -81,7 +81,7 @@ The next model we add should be runnable by contributors, so the model roster ma
 
 ### 7. Kernel ledger → simulator MVP
 
-Carried from `execution.md`. Qwen3 and Qwen3.5 already have `kernel_plan()` descriptors; the cross-model ledger format and a Qwen3-4B simulator MVP come after observability lands, because the tracing spans are the measurement side of the loop. Value is *explaining* a TTFT/TPOT number, not predicting it.
+Carried from `execution.md`. ~~Qwen3 and Qwen3.5 already have `kernel_plan()` descriptors~~ (the descriptors had no readers and were removed in #743); the cross-model ledger format and a Qwen3-4B simulator MVP come after observability lands, because the tracing spans are the measurement side of the loop. Value is *explaining* a TTFT/TPOT number, not predicting it.
 
 ---
 

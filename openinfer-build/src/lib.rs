@@ -1,7 +1,6 @@
-use std::{
-    env,
-    path::{Path, PathBuf},
-};
+use std::env;
+use std::path::Path;
+use std::path::PathBuf;
 
 /// Finds a package's install root: probes `$env_var` first, then each of
 /// `default_paths`, for any of the `check_files` — several cover layout
@@ -10,7 +9,8 @@ use std::{
 ///
 /// # Panics
 /// When nothing matches.
-pub fn find_package(
+#[cfg(test)]
+fn find_package(
     provider: &str,
     env_var: &str,
     default_paths: &[&str],
@@ -69,7 +69,7 @@ pub struct CudaToolkit {
     /// `{root}/bin/nvcc` when present, otherwise bare `nvcc` from `$PATH`.
     pub nvcc: PathBuf,
     pub include_dirs: Vec<PathBuf>,
-    pub lib_dirs: Vec<PathBuf>,
+    lib_dirs: Vec<PathBuf>,
 }
 
 impl CudaToolkit {
@@ -88,7 +88,7 @@ impl CudaToolkit {
         Self::from_root(root)
     }
 
-    pub fn from_root(root: PathBuf) -> Self {
+    fn from_root(root: PathBuf) -> Self {
         let nvcc = root.join("bin/nvcc");
         let nvcc = if nvcc.is_file() {
             nvcc
@@ -140,25 +140,6 @@ impl CudaToolkit {
             println!("cargo:rustc-link-search=native={}", dir.display());
         }
     }
-
-    /// Driver-stub variant, for linking `libcuda` without a GPU driver.
-    pub fn link_search_stubs(&self) {
-        let dirs: Vec<PathBuf> = self
-            .lib_dirs
-            .iter()
-            .map(|dir| dir.join("stubs"))
-            .filter(|dir| dir.is_dir())
-            .collect();
-        if dirs.is_empty() {
-            println!(
-                "cargo:warning=no CUDA stub dir found under {}",
-                self.root.display()
-            );
-        }
-        for dir in dirs {
-            println!("cargo:rustc-link-search=native={}", dir.display());
-        }
-    }
 }
 
 fn existing_deduped(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -175,35 +156,6 @@ fn existing_deduped(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
         }
     }
     out
-}
-
-/// Recursively emits `cargo:rerun-if-changed` for all files under `src_dir`
-/// with one of the given `extensions`.
-pub fn emit_rerun_if_changed_files(src_dir: &str, extensions: &[&str]) {
-    fn visit_dir(dir: &Path, extensions: &[&str]) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path.is_dir() {
-                visit_dir(&path, extensions)?;
-            } else if let Some(ext) = path.extension().and_then(|s| s.to_str())
-                && extensions.contains(&ext)
-            {
-                println!("cargo:rerun-if-changed={}", path.display());
-            }
-        }
-        Ok(())
-    }
-
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let root = manifest_dir.join(src_dir);
-
-    if let Err(err) = visit_dir(&root, extensions) {
-        eprintln!("cargo:warning=Failed to scan {}: {}", root.display(), err);
-    }
-
-    // Also watch the directory itself so new files trigger rebuilds
-    println!("cargo:rerun-if-changed={}", root.display());
 }
 
 #[cfg(test)]

@@ -1,14 +1,24 @@
-use anyhow::{Result, bail, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
-use crate::tensor::{AxisSpec, DeviceContext, GpuTensor, KernelCall, TensorSpec};
+#[cfg(test)]
+use crate::tensor::AxisSpec;
+use crate::tensor::DeviceContext;
+use crate::tensor::GpuTensor;
+#[cfg(test)]
+use crate::tensor::KernelCall;
+#[cfg(test)]
+use crate::tensor::TensorSpec;
 
 pub const KIMI_K2_HIDDEN: usize = 7168;
 pub const KIMI_K2_EXPERT_INTERMEDIATE: usize = 2048;
 pub const KIMI_K2_SHARED_GATE_UP: usize = 2 * KIMI_K2_EXPERT_INTERMEDIATE;
-pub const KIMI_K2_ROUTED_EXPERTS: usize = 384;
+const KIMI_K2_ROUTED_EXPERTS: usize = 384;
 pub const KIMI_K2_EP_WORLD: usize = 8;
 pub const KIMI_K2_LOCAL_EXPERTS: usize = KIMI_K2_ROUTED_EXPERTS / KIMI_K2_EP_WORLD;
 pub const KIMI_K2_TOPK: usize = 8;
@@ -145,7 +155,7 @@ pub enum KimiInt4ExpertRole {
 
 impl KimiInt4ExpertRole {
     #[must_use]
-    pub const fn expected_shape(self) -> KimiInt4LogicalShape {
+    const fn expected_shape(self) -> KimiInt4LogicalShape {
         match self {
             Self::W1Gate | Self::W3Up => KimiInt4LogicalShape {
                 out_dim: KIMI_K2_EXPERT_INTERMEDIATE,
@@ -159,7 +169,7 @@ impl KimiInt4ExpertRole {
     }
 
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::W1Gate => "w1_gate",
             Self::W3Up => "w3_up",
@@ -176,7 +186,7 @@ pub enum KimiInt4NibbleOrder {
 
 impl KimiInt4NibbleOrder {
     #[must_use]
-    pub const fn label(self) -> &'static str {
+    const fn label(self) -> &'static str {
         match self {
             Self::LowThenHigh => "low_then_high",
             Self::HighThenLow => "high_then_low",
@@ -189,15 +199,6 @@ pub enum KimiInt4Encoding {
     SignedSymmetric,
 }
 
-impl KimiInt4Encoding {
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::SignedSymmetric => "signed_symmetric",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiInt4LogicalShape {
     pub out_dim: usize,
@@ -206,9 +207,9 @@ pub struct KimiInt4LogicalShape {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiInt4TensorShape {
-    pub experts: usize,
-    pub rows: usize,
-    pub cols: usize,
+    experts: usize,
+    rows: usize,
+    cols: usize,
 }
 
 impl KimiInt4TensorShape {
@@ -220,16 +221,16 @@ impl KimiInt4TensorShape {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KimiInt4WeightManifest {
-    pub role: KimiInt4ExpertRole,
-    pub global_experts: usize,
+    role: KimiInt4ExpertRole,
+    global_experts: usize,
     pub local_experts: usize,
-    pub local_expert_offset: usize,
+    local_expert_offset: usize,
     pub logical_shape: KimiInt4LogicalShape,
     pub packed_shape: KimiInt4TensorShape,
     pub scale_shape: KimiInt4TensorShape,
-    pub group_size: usize,
-    pub nibble_order: KimiInt4NibbleOrder,
-    pub encoding: KimiInt4Encoding,
+    group_size: usize,
+    nibble_order: KimiInt4NibbleOrder,
+    encoding: KimiInt4Encoding,
 }
 
 impl KimiInt4WeightManifest {
@@ -338,12 +339,8 @@ impl KimiInt4WeightManifest {
     }
 
     #[must_use]
-    pub fn weight_packed_spec(&self) -> TensorSpec {
-        self.weight_packed_checkpoint_spec()
-    }
-
-    #[must_use]
-    pub fn weight_packed_checkpoint_spec(&self) -> TensorSpec {
+    #[cfg(test)]
+    fn weight_packed_checkpoint_spec(&self) -> TensorSpec {
         TensorSpec::named(
             "u8",
             "expert_major_int4_packed_checkpoint_offset_binary",
@@ -356,12 +353,13 @@ impl KimiInt4WeightManifest {
     }
 
     #[must_use]
-    pub fn marlin_packed_u32_elements(&self) -> usize {
+    fn marlin_packed_u32_elements(&self) -> usize {
         self.local_experts * (self.logical_shape.in_dim / 16) * (self.logical_shape.out_dim * 2)
     }
 
     #[must_use]
-    pub fn weight_packed_marlin_uint4b8_spec(&self) -> TensorSpec {
+    #[cfg(test)]
+    fn weight_packed_marlin_uint4b8_spec(&self) -> TensorSpec {
         TensorSpec::named(
             "u32",
             "expert_major_int4_packed_marlin_uint4b8_noact",
@@ -374,12 +372,8 @@ impl KimiInt4WeightManifest {
     }
 
     #[must_use]
-    pub fn weight_scale_spec(&self) -> TensorSpec {
-        self.weight_scale_checkpoint_spec()
-    }
-
-    #[must_use]
-    pub fn weight_scale_checkpoint_spec(&self) -> TensorSpec {
+    #[cfg(test)]
+    fn weight_scale_checkpoint_spec(&self) -> TensorSpec {
         TensorSpec::named(
             "bf16",
             "expert_major_group_scale_checkpoint",
@@ -392,7 +386,8 @@ impl KimiInt4WeightManifest {
     }
 
     #[must_use]
-    pub fn weight_scale_marlin_permuted_spec(&self) -> TensorSpec {
+    #[cfg(test)]
+    fn weight_scale_marlin_permuted_spec(&self) -> TensorSpec {
         TensorSpec::named(
             "bf16",
             "expert_major_group_scale_marlin_group_major_perm64",
@@ -412,7 +407,7 @@ pub struct KimiMarlinInt4Weight<'a> {
 }
 
 impl KimiMarlinInt4Weight<'_> {
-    pub fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<()> {
         self.manifest.validate()?;
         ensure!(
             self.weight_packed_uint4b8.len() == self.manifest.packed_shape.elements(),
@@ -435,27 +430,6 @@ impl KimiMarlinInt4Weight<'_> {
             self.manifest.nibble_order.label()
         );
         Ok(())
-    }
-
-    #[must_use]
-    pub fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.int4_marlin_weight",
-            "Kimi-K2 vLLM Marlin WNA16 INT4 expert weight package",
-        )
-        .input(
-            "weight_packed_uint4b8",
-            self.manifest.weight_packed_marlin_uint4b8_spec(),
-        )
-        .input(
-            "weight_scale_permuted",
-            self.manifest.weight_scale_marlin_permuted_spec(),
-        )
-        .attr("encoding", "uint4b8_bias_8".to_string())
-        .attr("scale_layout", "vllm_group_major_perm64".to_string())
-        .attr("act_order", "false".to_string())
-        .attr("group_size", self.manifest.group_size.to_string())
-        .attr("local_experts", self.manifest.local_experts.to_string())
     }
 }
 
@@ -511,43 +485,6 @@ impl KimiMarlinFusedW13Int4Weight<'_> {
         );
         Ok(())
     }
-
-    #[must_use]
-    pub fn manifest_call(&self) -> KernelCall {
-        KernelCall::new(
-            "kimi_k2.moe.int4_marlin_w13_weight",
-            "Kimi-K2 vLLM Marlin WNA16 fused W13 expert weight package",
-        )
-        .input(
-            "weight_packed_uint4b8",
-            TensorSpec::named(
-                "u32",
-                "expert_major_int4_packed_marlin_w13_uint4b8_noact",
-                [
-                    AxisSpec::named("local_expert", self.local_experts),
-                    AxisSpec::named("in_tile16", self.in_dim / 16),
-                    AxisSpec::named("out_x2", 2 * self.intermediate_dim * 2),
-                ],
-            ),
-        )
-        .input(
-            "weight_scale_permuted",
-            TensorSpec::named(
-                "bf16",
-                "expert_major_group_scale_marlin_w13_group_major_perm64",
-                [
-                    AxisSpec::named("local_expert", self.local_experts),
-                    AxisSpec::named("in_group", self.in_dim / self.group_size),
-                    AxisSpec::named("out", 2 * self.intermediate_dim),
-                ],
-            ),
-        )
-        .attr("encoding", "uint4b8_bias_8".to_string())
-        .attr("scale_layout", "vllm_w13_group_major_perm64".to_string())
-        .attr("act_order", "false".to_string())
-        .attr("group_size", self.group_size.to_string())
-        .attr("w13_order", "gate_then_up".to_string())
-    }
 }
 
 pub struct KimiMarlinInt4ExpertWeights<'a> {
@@ -569,17 +506,17 @@ impl KimiMarlinInt4ExpertWeights<'_> {
 }
 
 pub struct KimiMarlinRouteWorkspace {
-    pub sorted_token_ids: CudaSlice<i32>,
-    pub expert_ids: CudaSlice<i32>,
-    pub num_tokens_post_padded: CudaSlice<i32>,
-    pub expert_offsets: CudaSlice<u32>,
-    pub expert_cursor: CudaSlice<u32>,
-    pub max_active_tokens: usize,
-    pub max_padded_tokens: usize,
+    sorted_token_ids: CudaSlice<i32>,
+    expert_ids: CudaSlice<i32>,
+    num_tokens_post_padded: CudaSlice<i32>,
+    expert_offsets: CudaSlice<u32>,
+    expert_cursor: CudaSlice<u32>,
+    max_active_tokens: usize,
+    max_padded_tokens: usize,
     pub max_m_blocks: usize,
-    pub block_size: usize,
-    pub topk: usize,
-    pub local_experts: usize,
+    block_size: usize,
+    topk: usize,
+    local_experts: usize,
 }
 
 impl KimiMarlinRouteWorkspace {
@@ -606,7 +543,7 @@ impl KimiMarlinRouteWorkspace {
         })
     }
 
-    pub fn validate_for(&self, active_tokens: usize) -> Result<()> {
+    fn validate_for(&self, active_tokens: usize) -> Result<()> {
         validate_marlin_block_size(self.block_size)?;
         ensure!(
             active_tokens > 0,
@@ -664,11 +601,11 @@ impl KimiMarlinRouteWorkspace {
 
 pub struct KimiMarlinWna16Workspace {
     pub locks: CudaSlice<i32>,
-    pub c_tmp: CudaSlice<f32>,
-    pub max_m_blocks: usize,
-    pub max_padded_tokens: usize,
-    pub max_size_n: usize,
-    pub block_size: usize,
+    c_tmp: CudaSlice<f32>,
+    max_m_blocks: usize,
+    max_padded_tokens: usize,
+    max_size_n: usize,
+    block_size: usize,
 }
 
 impl KimiMarlinWna16Workspace {
@@ -714,7 +651,7 @@ impl KimiMarlinWna16Workspace {
         })
     }
 
-    pub fn validate_for(&self, routing: &KimiMarlinRouting<'_>, size_n: usize) -> Result<()> {
+    fn validate_for(&self, routing: &KimiMarlinRouting<'_>, size_n: usize) -> Result<()> {
         validate_marlin_block_size(self.block_size)?;
         ensure!(
             self.block_size == routing.block_size,
@@ -769,21 +706,26 @@ impl KimiMarlinWna16Workspace {
 }
 
 pub struct KimiMarlinRouting<'a> {
-    pub batch_size: usize,
-    pub active_tokens: usize,
+    // Read only by the test-only `manifest_call`; kept as manifest metadata.
+    #[allow(dead_code)]
+    batch_size: usize,
+    active_tokens: usize,
     pub route_elems: usize,
-    pub global_expert_start: usize,
-    pub block_size: usize,
-    pub max_padded_tokens: usize,
+    // Read only by the test-only `manifest_call`.
+    #[allow(dead_code)]
+    global_expert_start: usize,
+    block_size: usize,
+    max_padded_tokens: usize,
     pub max_m_blocks: usize,
-    pub sorted_token_ids: &'a CudaSlice<i32>,
-    pub expert_ids: &'a CudaSlice<i32>,
+    sorted_token_ids: &'a CudaSlice<i32>,
+    expert_ids: &'a CudaSlice<i32>,
     pub num_tokens_post_padded: &'a CudaSlice<i32>,
 }
 
 impl KimiMarlinRouting<'_> {
     #[must_use]
-    pub fn manifest_call(&self) -> KernelCall {
+    #[cfg(test)]
+    fn manifest_call(&self) -> KernelCall {
         KernelCall::new(
             "kimi_k2.moe.marlin_align_block_size",
             "Kimi-K2 vLLM Marlin WNA16 route alignment metadata",
@@ -1531,7 +1473,7 @@ fn launch_marlin_wna16_gemm(
 }
 
 #[must_use]
-pub const fn packed_int4_cols(cols: usize) -> usize {
+const fn packed_int4_cols(cols: usize) -> usize {
     cols.div_ceil(2)
 }
 
@@ -1566,18 +1508,6 @@ fn marlin_padded_route_capacity(active_tokens: usize, block_size: usize) -> Resu
     route_elems
         .checked_add(max_padding)
         .ok_or_else(|| anyhow::anyhow!("Marlin padded route capacity overflow"))
-}
-
-pub fn validate_ep_rank(ep_rank: usize) -> Result<()> {
-    if ep_rank < KIMI_K2_EP_WORLD {
-        Ok(())
-    } else {
-        bail!(
-            "Kimi-K2 EP rank must be < {}, got {}",
-            KIMI_K2_EP_WORLD,
-            ep_rank
-        )
-    }
 }
 
 #[cfg(test)]

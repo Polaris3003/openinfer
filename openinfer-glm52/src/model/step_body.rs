@@ -1,27 +1,42 @@
 //! Captured GLM5.2 whole-step forward body.
 
-use anyhow::{Context as _, Result, ensure};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
 use cudarc::driver::CudaSlice;
-use openinfer_kernels::ops::{
-    add_into, argmax_bf16_split_into, copy_hidden_rows_raw_into, glm52_vocab_parallel_pack_launch,
-    glm52_vocab_parallel_unpack_launch, rms_norm_rows_into,
-};
-use openinfer_kernels::tensor::{DeviceContext, DeviceMatrix, DeviceVec};
+use openinfer_kernels::ops::add_scaled_bf16_into;
+use openinfer_kernels::ops::argmax_bf16_split_into;
+use openinfer_kernels::ops::copy_hidden_rows_raw_into;
+use openinfer_kernels::ops::glm52_vocab_parallel_pack_launch;
+use openinfer_kernels::ops::glm52_vocab_parallel_unpack_launch;
+use openinfer_kernels::ops::rms_norm_rows_into;
+use openinfer_kernels::tensor::DeviceContext;
+use openinfer_kernels::tensor::DeviceMatrix;
+use openinfer_kernels::tensor::DeviceVec;
 
-use crate::bookend::{glm52_embed_into, glm52_final_norm_into, glm52_lm_head_into};
-use crate::config::{GLM52_HIDDEN, GLM52_RMS_EPS, GLM52_VOCAB};
+use super::GLM52_MAX_BATCH_PER_RANK;
+use super::VOCAB_AR_SLOT;
+use crate::bookend::glm52_embed_into;
+use crate::bookend::glm52_final_norm_into;
+use crate::bookend::glm52_lm_head_into;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_RMS_EPS;
+use crate::config::GLM52_VOCAB;
 use crate::dense::glm52_dense_mlp_forward_into;
-use crate::layer::{
-    Glm52DecodeStep, Glm52DecoderLayerWeights, Glm52LayerCaches, Glm52LayerMlp,
-    glm52_layer_attention_half, glm52_layer_finish, glm52_layer_finish_fused,
-};
+use crate::layer::Glm52DecodeStep;
+use crate::layer::Glm52DecoderLayerWeights;
+use crate::layer::Glm52LayerCaches;
+use crate::layer::Glm52LayerIndexMode;
+use crate::layer::Glm52LayerMlp;
+use crate::layer::glm52_layer_attention_half;
+use crate::layer::glm52_layer_finish;
+use crate::layer::glm52_layer_finish_fused;
+use crate::moe_decode::run_ep_router_into;
 use crate::moe_decode::run_router_into;
 use crate::moe_ep_wo::Glm52MoeEpState;
 use crate::moe_ep8::Glm52MoeEp8LayerWeights;
 use crate::moe_tp::Glm52MoeTpRank;
 use crate::scratch::Glm52DecodeScratch;
-
-use super::{GLM52_MAX_BATCH_PER_RANK, VOCAB_AR_SLOT};
 
 /// The captured region of one decode step: embed → 78 layers → lm_head →
 /// device argmax over the step's `batch` rows (read from the attend plan —
@@ -91,6 +106,7 @@ pub(super) fn run_step_body(
             parity,
             layer == 0,
             tp_ar,
+            Glm52LayerIndexMode::Normal,
         )
         .with_context(|| format!("GLM5.2 layer {layer} attention half"))?;
         let mut tp_padded_mlp = false;
@@ -253,7 +269,7 @@ pub(super) fn run_step_body(
 /// DeepEP dispatch/expert-GEMM/combine, joined by the closing add into
 /// `mlp_out`. The events recorded here during capture become graph edges;
 /// replay keeps the parallel branches.
-fn glm52_moe_ep_layer(
+pub(super) fn glm52_moe_ep_layer(
     ctx: &DeviceContext,
     aux: &DeviceContext,
     ep8: &mut Glm52MoeEpState,
@@ -276,7 +292,7 @@ fn glm52_moe_ep_layer(
     )?;
     let shared_done = aux.stream.record_event(None)?;
 
-    run_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
+    run_ep_router_into(ctx, &moe.router, s.layer.normed2.data(), &mut s.router)?;
     let dispatched = ep8.routed_forward(
         ctx,
         &moe.bank,
@@ -289,9 +305,10 @@ fn glm52_moe_ep_layer(
     );
     // Join: the closing add consumes both branches.
     ctx.stream.wait(&shared_done)?;
-    add_into(
+    add_scaled_bf16_into(
         ctx,
         ep8.combined(),
+        crate::config::GLM52_ROUTED_SCALING_FACTOR as f32,
         s.layer.shared_out.data(),
         batch * GLM52_HIDDEN,
         s.layer.mlp_out.data_mut(),

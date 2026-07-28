@@ -17,7 +17,8 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
 use super::policy::EventEmissionPolicy;
-use super::protocol::{EventReleaseHandle, KvCacheEvent};
+use super::protocol::EventReleaseHandle;
+use super::protocol::KvCacheEvent;
 use crate::registry::BlockRegistrationHandle;
 
 /// Settings for constructing an [`EventsManager`].
@@ -57,11 +58,6 @@ pub struct EventsManagerSettings {
 }
 
 impl EventsManagerSettings {
-    /// Creates a new builder for EventsManagerSettings.
-    pub fn builder() -> EventsManagerSettingsBuilder {
-        EventsManagerSettingsBuilder::default()
-    }
-
     /// Converts settings into an EventsManager.
     pub fn into_manager(self) -> EventsManager {
         let policy = self
@@ -200,12 +196,14 @@ impl EventsManager {
 
 #[cfg(test)]
 mod tests {
-    use super::super::policy::PowerOfTwoPolicy;
-    use super::*;
-    use crate::registry::BlockRegistry;
-    use crate::{KvbmSequenceHashProvider, SequenceHash};
     use dynamo_tokens::TokenBlockSequence;
     use futures::StreamExt;
+
+    use super::super::policy::PowerOfTwoPolicy;
+    use super::*;
+    use crate::KvbmSequenceHashProvider;
+    use crate::SequenceHash;
+    use crate::registry::BlockRegistry;
 
     fn create_seq_hash_at_position(position: usize) -> SequenceHash {
         let tokens_per_block = 4;

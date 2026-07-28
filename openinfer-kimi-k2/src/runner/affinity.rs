@@ -1,10 +1,16 @@
 use std::collections::BTreeSet;
 
-use anyhow::{Context, Result, ensure};
-use openinfer_core::cpu_topology::{
-    CpuId, RankCpuSlice, RankNumaNode, cuda_device_numa_node, current_allowed_cpus,
-    pin_current_thread_to_cpu, read_numa_cpu_pool, split_rank_cpu_slices,
-};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use openinfer_core::cpu_topology::CpuId;
+use openinfer_core::cpu_topology::RankCpuSlice;
+use openinfer_core::cpu_topology::RankNumaNode;
+use openinfer_core::cpu_topology::cuda_device_numa_node;
+use openinfer_core::cpu_topology::current_allowed_cpus;
+use openinfer_core::cpu_topology::pin_current_thread_to_cpu;
+use openinfer_core::cpu_topology::read_numa_cpu_pool;
+use openinfer_core::cpu_topology::split_rank_cpu_slices;
 
 const SYSTEM_RESERVED_CPU: usize = 0;
 const SCHEDULER_CPU: usize = 1;
@@ -12,7 +18,7 @@ const SCHEDULER_CPU: usize = 1;
 #[derive(Clone, Debug)]
 pub(super) struct KimiRankThreadPlacement {
     pub(super) rank: usize,
-    pub(super) rank_worker_cpu: CpuId,
+    rank_worker_cpu: CpuId,
 }
 
 #[derive(Clone, Debug)]

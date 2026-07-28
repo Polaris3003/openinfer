@@ -17,9 +17,11 @@
 
 use std::path::Path;
 
-use openinfer_core::engine::{
-    EngineHandle, EngineLoadOptions, GenerateRequest, TokenEvent, TokenSink,
-};
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::EngineLoadOptions;
+use openinfer_core::engine::GenerateRequest;
+use openinfer_core::engine::TokenEvent;
+use openinfer_core::engine::TokenSink;
 use openinfer_core::sampler::SamplingParams;
 use vllm_text::tokenizer::DynTokenizer;
 
@@ -53,6 +55,7 @@ fn generate_text(
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,
@@ -103,6 +106,7 @@ fn oversized_prompt_is_rejected_with_context_length_error() {
     let (token_tx, mut rx) = TokenSink::standalone();
     handle
         .submit(GenerateRequest {
+            trace_parent: None,
             request_id: None,
             queued_at_unix_s: None,
             data_parallel_rank: None,

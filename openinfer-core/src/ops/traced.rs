@@ -1,13 +1,21 @@
 use anyhow::Result;
 use cudarc::driver::CudaSlice;
+use openinfer_kernels::tensor::Hidden;
+use openinfer_kernels::tensor::InDim;
+use openinfer_kernels::tensor::OutDim;
 
-use crate::ops::call_spec::{
-    embedding_batch_call, fused_add_rms_norm_batch_call, gemm_call, gemm_rows_call,
-    qk_norm_rope_batch_decode_call, rms_norm_batch_call, silu_mul_fused_batch_call,
-};
+use crate::ops::call_spec::embedding_batch_call;
+use crate::ops::call_spec::fused_add_rms_norm_batch_call;
+use crate::ops::call_spec::gemm_call;
+use crate::ops::call_spec::gemm_rows_call;
+use crate::ops::call_spec::qk_norm_rope_batch_decode_call;
+use crate::ops::call_spec::rms_norm_batch_call;
+use crate::ops::call_spec::silu_mul_fused_batch_call;
 use crate::ops::call_trace;
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates};
-use openinfer_kernels::tensor::{Hidden, InDim, OutDim};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
 
 pub fn embedding_batch(
     ctx: &DeviceContext,
@@ -86,6 +94,15 @@ pub fn gemm_into(
     x: &HiddenStates,
     out: &mut HiddenStates,
 ) {
+    gemm_into_checked(ctx, weight, x, out).expect("GEMM launch failed");
+}
+
+pub fn gemm_into_checked(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    x: &HiddenStates,
+    out: &mut HiddenStates,
+) -> Result<()> {
     if call_trace::is_enabled() {
         let label = call_trace::current_label("gemm");
         call_trace::record_call(gemm_call::<OutDim, InDim>(
@@ -95,7 +112,7 @@ pub fn gemm_into(
             x.seq_len,
         ));
     }
-    openinfer_kernels::ops::gemm_into(ctx, weight, x, out);
+    openinfer_kernels::ops::gemm_into_checked(ctx, weight, x, out)
 }
 
 pub fn gemm_token_range_into_checked(

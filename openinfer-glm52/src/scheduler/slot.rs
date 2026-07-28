@@ -5,7 +5,65 @@
 
 use openinfer_core::engine::FinishReason;
 
-use crate::dspark::{GLM52_DSPARK_DRAFTS, accept_prefix_match};
+use crate::dspark::GLM52_DSPARK_DRAFTS;
+use crate::dspark::accept_prefix_match;
+
+#[cfg(test)]
+pub(crate) const MTP_PRODUCTION_GATE_REQUEST_ID: &str = "native-mtp-hidden-boundary-gate";
+#[cfg(test)]
+pub(crate) const MTP_SLOT_REUSE_GATE_REQUEST_ID: &str = "native-mtp-slot-reuse-gate";
+
+#[cfg(test)]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MtpProductionGateStats {
+    pub(crate) first_proposal: Option<Vec<u32>>,
+    pub(crate) rounds: u64,
+    pub(crate) accepted_drafts: u64,
+    pub(crate) reuse_first_proposal: Option<Vec<u32>>,
+    pub(crate) reuse_rounds: u64,
+    pub(crate) reuse_accepted_drafts: u64,
+}
+
+#[cfg(test)]
+static MTP_PRODUCTION_STATS: std::sync::LazyLock<std::sync::Mutex<MtpProductionGateStats>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(MtpProductionGateStats::default()));
+
+#[cfg(test)]
+pub(crate) fn reset_mtp_production_stats() {
+    *MTP_PRODUCTION_STATS
+        .lock()
+        .expect("MTP production stats lock poisoned") = MtpProductionGateStats::default();
+}
+
+#[cfg(test)]
+pub(super) fn record_mtp_proposal(request_id: Option<&str>, drafts: &[u32]) {
+    if !matches!(
+        request_id,
+        Some(MTP_PRODUCTION_GATE_REQUEST_ID | MTP_SLOT_REUSE_GATE_REQUEST_ID)
+    ) {
+        return;
+    }
+    let mut stats = MTP_PRODUCTION_STATS
+        .lock()
+        .expect("MTP production stats lock poisoned");
+    match request_id {
+        Some(MTP_PRODUCTION_GATE_REQUEST_ID) if stats.first_proposal.is_none() => {
+            stats.first_proposal = Some(drafts.to_vec());
+        }
+        Some(MTP_SLOT_REUSE_GATE_REQUEST_ID) if stats.reuse_first_proposal.is_none() => {
+            stats.reuse_first_proposal = Some(drafts.to_vec());
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mtp_production_stats() -> MtpProductionGateStats {
+    MTP_PRODUCTION_STATS
+        .lock()
+        .expect("MTP production stats lock poisoned")
+        .clone()
+}
 
 /// What a rank forwards this step. Idle rows feed the padding input; their
 /// KV/index-cache writes land in the pool's reserved padding page, which no
@@ -68,7 +126,7 @@ pub(super) struct Glm52SlotState {
 }
 
 /// Drafts fed per verify span under EP8: 3 drafts + anchor = a bucket-4
-/// verify step. A/B-measured on jz-38 (2026-07-04,
+/// verify step. A/B-measured on 8×H200 (2026-07-04,
 /// docs/models/glm52/dspark-mtp.md): the bucket-4 step costs ~32 ms vs
 /// bucket-8's ~46, and that cheaper round beats span 8's extra accepted tail
 /// on EVERY tested prompt class. The drafter still proposes 7; the tail is
@@ -107,6 +165,30 @@ impl Glm52SlotState {
             last_token: 0,
             drafts: Vec::new(),
             spec: SpecStats::default(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_mtp_production_gate(&self, request_id: Option<&str>) {
+        if !matches!(
+            request_id,
+            Some(MTP_PRODUCTION_GATE_REQUEST_ID | MTP_SLOT_REUSE_GATE_REQUEST_ID)
+        ) {
+            return;
+        }
+        let mut stats = MTP_PRODUCTION_STATS
+            .lock()
+            .expect("MTP production stats lock poisoned");
+        match request_id {
+            Some(MTP_PRODUCTION_GATE_REQUEST_ID) => {
+                stats.rounds = self.spec.rounds;
+                stats.accepted_drafts = self.spec.accepted_sum;
+            }
+            Some(MTP_SLOT_REUSE_GATE_REQUEST_ID) => {
+                stats.reuse_rounds = self.spec.rounds;
+                stats.reuse_accepted_drafts = self.spec.accepted_sum;
+            }
+            _ => {}
         }
     }
 
@@ -205,6 +287,14 @@ impl Glm52SlotState {
         !self.mid_prefill() && self.completion + 1 < self.max_tokens
     }
 
+    /// Native MTP always executes its fixed five-token proposal chain. Do not
+    /// start that chain in a shorter request tail: the verifier would discard
+    /// most of it, and the unused speculative KV positions could cross the
+    /// request's launch-time model-length cap.
+    pub(super) fn wants_full_draft(&self, draft_tokens: usize) -> bool {
+        !self.mid_prefill() && self.max_tokens - self.completion >= draft_tokens
+    }
+
     /// Install the draft lane's proposal for the next verify span, truncated
     /// to the topology's span cap ([`GLM52_DSPARK_EP8_SPAN_DRAFTS`] under EP8,
     /// all of [`GLM52_DSPARK_DRAFTS`] under TP8's span shape).
@@ -247,7 +337,8 @@ impl Glm52SlotState {
             debug_assert!(drafts_fed <= self.drafts.len());
             let committed = accept_prefix_match(&self.drafts[..drafts_fed], outputs);
             if drafts_fed > 0 {
-                self.spec.record(committed.len() - 1);
+                let accepted_drafts = committed.len() - 1;
+                self.spec.record(accepted_drafts);
             }
             let context_rows = committed.len();
             (committed, context_rows)
@@ -292,7 +383,7 @@ impl Glm52SlotState {
         }
         let mean_accepted = stats.accepted_sum as f64 / stats.rounds as f64;
         log::info!(
-            "GLM5.2 dspark: rank={rank} slot={slot} rounds={} mean_accepted_drafts={mean_accepted:.3} \
+            "GLM5.2 speculative: rank={rank} slot={slot} rounds={} mean_accepted_drafts={mean_accepted:.3} \
              mean_accepted_incl_bonus={:.3} hist={:?}",
             stats.rounds,
             mean_accepted + 1.0,
@@ -312,7 +403,9 @@ impl SpecStats {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scheduler::testkit::{EOS, commit, state};
+    use crate::scheduler::testkit::EOS;
+    use crate::scheduler::testkit::commit;
+    use crate::scheduler::testkit::state;
 
     #[test]
     fn prefill_rides_decode_then_emits() {
@@ -356,6 +449,17 @@ mod tests {
                 position: 3
             }
         );
+    }
+
+    #[test]
+    fn one_token_contract_finishes_on_the_prompt_tail() {
+        let mut state = state(vec![10, 11, 12], 1, false);
+        assert_eq!(
+            state.advance_span(&[90, 91, 42], EOS),
+            commit(&[42], 1, Some(FinishReason::Length), 3)
+        );
+        assert_eq!(state.completion_tokens(), 1);
+        assert!(!state.mid_prefill());
     }
 
     #[test]
@@ -581,6 +685,19 @@ mod tests {
         assert!(state.wants_drafts());
         assert_eq!(state.advance_span(&[21], EOS), commit(&[21], 1, None, 1));
         assert!(!state.wants_drafts(), "one-token tail is a plain row");
+    }
+
+    #[test]
+    fn fixed_mtp_chain_stops_before_a_short_tail() {
+        let mut state = state(vec![10], 6, false);
+        assert!(!state.wants_full_draft(5), "mid-prefill never drafts");
+        assert_eq!(state.advance_span(&[20], EOS), commit(&[20], 1, None, 1));
+        assert!(state.wants_full_draft(5));
+        assert_eq!(state.advance_span(&[21], EOS), commit(&[21], 1, None, 1));
+        assert!(
+            !state.wants_full_draft(5),
+            "four-token tail must not launch a five-token MTP chain"
+        );
     }
 
     #[test]

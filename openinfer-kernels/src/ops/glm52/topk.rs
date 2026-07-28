@@ -1,10 +1,13 @@
-use anyhow::{Result, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
-pub const GLM52_INDEXER_TOPK_MAX_K: usize = 2048;
+const GLM52_INDEXER_TOPK_MAX_K: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Glm52IndexerTopK {
@@ -14,7 +17,7 @@ pub struct Glm52IndexerTopK {
 }
 
 impl Glm52IndexerTopK {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.num_rows > 0,
             "GLM5.2 indexer top-k num_rows must be positive"
@@ -47,8 +50,8 @@ impl Glm52IndexerTopK {
 pub fn glm52_flashinfer_topk_2048_launch(
     ctx: &DeviceContext,
     contract: Glm52IndexerTopK,
-    logits: &CudaSlice<f32>,
-    lengths: &CudaSlice<i32>,
+    logits: &impl DevicePtr<f32>,
+    lengths: &impl DevicePtr<i32>,
     output_indices: &mut CudaSlice<i32>,
     output_values: &mut CudaSlice<f32>,
 ) -> Result<()> {

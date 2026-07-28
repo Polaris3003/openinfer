@@ -1,4 +1,5 @@
-use cudarc::driver::sys::{CUresult, CUstream};
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
 
 unsafe extern "C" {
     pub fn glm52_deepgemm_paged_mqa_metadata_cuda(
@@ -11,6 +12,20 @@ unsafe extern "C" {
         is_context_lens_2d: bool,
         is_varlen: bool,
         indices_ptr: *const i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn glm52_deepgemm_mqa_logits_unpaged_cuda(
+        q_fp8: *const u8,
+        k_fp8: *const u8,
+        k_scale: *const f32,
+        weights: *const f32,
+        cu_seqlen_ks: *const i32,
+        cu_seqlen_ke: *const i32,
+        logits: *mut std::ffi::c_void,
+        seq_q: i32,
+        seq_kv: i32,
+        logits_stride: i32,
         stream: CUstream,
     ) -> CUresult;
 

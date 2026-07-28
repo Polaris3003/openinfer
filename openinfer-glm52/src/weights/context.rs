@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
-use anyhow::{Context, Result, ensure};
-use cudarc::driver::{CudaContext, CudaStream};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
+use cudarc::driver::CudaContext;
+use cudarc::driver::CudaStream;
 
 #[derive(Clone)]
 pub(crate) struct Glm52RankGpuContext {
@@ -63,6 +66,10 @@ impl Glm52RankGpuContext {
 
     pub(crate) fn stream(&self) -> &Arc<CudaStream> {
         &self.stream
+    }
+
+    pub(crate) fn cuda_context(&self) -> &Arc<CudaContext> {
+        &self.ctx
     }
 
     /// The kernels-crate view of this rank's context/stream pair (shared

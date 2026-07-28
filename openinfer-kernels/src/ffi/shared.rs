@@ -1,5 +1,7 @@
+use cudarc::driver::sys::CUresult;
+use cudarc::driver::sys::CUstream;
+
 use super::Half;
-use cudarc::driver::sys::{CUresult, CUstream};
 
 // Shared kernels used across all models (CUDA / cuBLAS / FlashInfer).
 unsafe extern "C" {
@@ -30,6 +32,15 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> CUresult;
 
+    pub fn add_scaled_bf16_cuda(
+        routed: *const Half,
+        scale: f32,
+        shared: *const Half,
+        out: *mut Half,
+        n: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
     pub fn copy_hidden_rows_cuda(
         src: *const Half,
         dst: *mut Half,
@@ -38,6 +49,15 @@ unsafe extern "C" {
         row_offset: i32,
         rows: i32,
         seq_len: i32,
+        stream: CUstream,
+    ) -> CUresult;
+
+    pub fn mask_position_zero_rows_cuda(
+        src: *const Half,
+        positions: *const u32,
+        dst: *mut Half,
+        hidden_dim: i32,
+        rows: i32,
         stream: CUstream,
     ) -> CUresult;
 
@@ -114,6 +134,20 @@ unsafe extern "C" {
     ) -> CUresult;
 
     pub fn argmax_cuda(x: *const Half, out: *mut i32, n: i32, stream: CUstream);
+
+    pub fn logprob_topk_batch_bf16_cuda(
+        x: *const Half,
+        row_indices: *const i32,
+        picked: *const i32,
+        top_k: *const i32,
+        out_picked_lp: *mut f32,
+        out_topk_vals: *mut f32,
+        out_topk_ids: *mut i32,
+        rows: i32,
+        n: i32,
+        k_max: i32,
+        stream: CUstream,
+    );
 
     pub fn flashinfer_top1_cuda(
         logits: *const Half,
@@ -197,6 +231,21 @@ unsafe extern "C" {
         ldc: i32,
         stride_c: i64,
         batch_count: i32,
+        stream: CUstream,
+    ) -> i32;
+
+    pub fn gemm_bf16_f32_cuda(
+        op_a: i32,
+        op_b: i32,
+        m: i32,
+        n: i32,
+        k: i32,
+        a: *const Half,
+        lda: i32,
+        b: *const Half,
+        ldb: i32,
+        c: *mut f32,
+        ldc: i32,
         stream: CUstream,
     ) -> i32;
 

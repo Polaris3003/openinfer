@@ -1,29 +1,41 @@
-use std::{
-    collections::BTreeMap,
-    path::{Path, PathBuf},
-    sync::Arc,
-    thread,
-};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::thread;
+use std::time::Instant;
 
-use anyhow::{Context as _, Result, ensure};
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::ensure;
+use crossbeam_channel::Receiver;
+use crossbeam_channel::Sender;
+use crossbeam_channel::bounded;
+use crossbeam_channel::unbounded;
 use openinfer_core::cuda_graph::CudaGraphDumpSummary;
 use openinfer_kv_offload::KvArena;
 
-use crate::dspark::{
-    GLM52_DSPARK_DRAFTS, Glm52DsparkModel, Glm52DsparkScratch, Glm52DsparkSlotState,
-};
-
-use crate::model::{GLM52_MAX_BATCH_PER_RANK, Glm52RankModel, Glm52StepKv, Glm52StepShape};
-use crate::moe_ep_wo::{Glm52MoeEpState, Glm52MoeEpWoState};
+use crate::dspark::GLM52_DSPARK_DRAFTS;
+use crate::dspark::Glm52DsparkModel;
+use crate::dspark::Glm52DsparkScratch;
+use crate::dspark::Glm52DsparkSlotState;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::Glm52RankModel;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::moe_ep_wo::Glm52MoeEpState;
+use crate::moe_ep_wo::Glm52MoeEpWoState;
 use crate::moe_ep8::Glm52MoeEp8State;
-use crate::moe_tp::{
-    Glm52MoeTpRank, Glm52MoeTpSliceBank, Glm52MoeTpState, Glm52TpExchange, load_tp_slice_layer,
-};
-use crate::weights::{
-    Glm52RankGpuContext, Glm52RankGpuWeights, Glm52RankLoadBundle, Glm52WeightManifest,
-    load_rank_weights_to_gpu,
-};
+use crate::moe_tp::Glm52MoeTpRank;
+use crate::moe_tp::Glm52MoeTpSliceBank;
+use crate::moe_tp::Glm52MoeTpState;
+use crate::moe_tp::Glm52TpExchange;
+use crate::moe_tp::load_tp_slice_layer;
+use crate::weights::Glm52RankGpuContext;
+use crate::weights::Glm52RankGpuWeights;
+use crate::weights::Glm52RankLoadBundle;
+use crate::weights::Glm52WeightManifest;
+use crate::weights::load_rank_weights_to_gpu;
 
 /// Global rank + local CUDA device of one worker. Rank bounds are enforced
 /// where placements are built, against the launch topology's real width —
@@ -39,7 +51,7 @@ pub(crate) struct Glm52RankWeightLoadReport {
     pub(crate) rank: usize,
     pub(crate) loaded_tensor_count: usize,
     pub(crate) loaded_total_bytes: usize,
-    pub(crate) resident_raw_bytes: usize,
+    resident_raw_bytes: usize,
     pub(crate) loaded_to_gpu: bool,
     /// This rank's device free VRAM right after the weights landed — the
     /// launch-time context-cap probe takes the fleet minimum.
@@ -57,6 +69,8 @@ pub(crate) struct Glm52StepFlags {
     /// advanced by its own argmax — every rank MUST enqueue that next
     /// replay launch-ahead (see `Glm52RankModel::decode_step`).
     pub(crate) lease: bool,
+    /// Bypass CUDA graph capture and replay.
+    pub(crate) eager: bool,
 }
 
 impl Glm52StepFlags {
@@ -65,6 +79,7 @@ impl Glm52StepFlags {
         Self {
             consume: false,
             lease: false,
+            eager: false,
         }
     }
 }
@@ -83,10 +98,121 @@ pub(crate) struct Glm52RowSample {
     pub(crate) step: u64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct Glm52PrefillBatch {
+    pub(crate) token_ids: Vec<u32>,
+    pub(crate) positions: Vec<u32>,
+    pub(crate) request_indptr: Vec<u32>,
+    pub(crate) block_indptr: Vec<u32>,
+    pub(crate) block_ids: Vec<i32>,
+    pub(crate) padding_block: i32,
+    pub(crate) slot_mapping: Vec<i64>,
+    pub(crate) output_rows: Vec<u32>,
+    pub(crate) sampling: Vec<Glm52RowSample>,
+    pub(crate) seed: u64,
+}
+
+impl Glm52PrefillBatch {
+    pub(crate) fn validate(&self) -> Result<()> {
+        let rows = self.token_ids.len();
+        ensure!(
+            rows > 0 && self.positions.len() == rows && self.slot_mapping.len() == rows,
+            "GLM5.2 prefill batch row buffers disagree"
+        );
+        ensure!(
+            self.request_indptr.first() == Some(&0)
+                && self.request_indptr.last().copied() == Some(rows as u32)
+                && self.request_indptr.windows(2).all(|w| w[0] < w[1]),
+            "GLM5.2 prefill request row ranges are invalid"
+        );
+        let requests = self.request_indptr.len() - 1;
+        ensure!(
+            self.block_indptr.len() == requests + 1
+                && self.block_indptr.first() == Some(&0)
+                && self.block_indptr.last().copied() == Some(self.block_ids.len() as u32)
+                && self.block_indptr.windows(2).all(|w| w[0] <= w[1]),
+            "GLM5.2 prefill block ranges are invalid"
+        );
+        ensure!(
+            self.padding_block >= 0,
+            "GLM5.2 prefill padding block is invalid"
+        );
+        ensure!(
+            self.output_rows.windows(2).all(|w| w[0] < w[1])
+                && self.output_rows.iter().all(|&row| (row as usize) < rows),
+            "GLM5.2 prefill output rows are invalid"
+        );
+        ensure!(
+            self.sampling.windows(2).all(|w| w[0].row < w[1].row)
+                && self
+                    .sampling
+                    .iter()
+                    .all(|sample| sample.row < self.output_rows.len()),
+            "GLM5.2 prefill sampling rows are invalid"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Glm52MtpAppend {
+    /// Row in the target step's retained final-normalized hidden buffer.
+    pub(crate) target_row: usize,
+    pub(crate) slot: usize,
+    /// Sequence token shifted one place to the left, matching vLLM's MTP
+    /// first-pass input construction.
+    pub(crate) input_token: u32,
+    pub(crate) position: usize,
+}
+
+/// One rank's work in a fleet-wide native-MTP round. The coordinator selects
+/// the same variant for every EP rank, including empty ranks, so no worker can
+/// skip a collective entered by its peers.
+#[derive(Debug)]
+pub(crate) enum Glm52MtpRound {
+    Reset {
+        resets: Vec<usize>,
+    },
+    Context {
+        source_bucket: usize,
+        context_bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<Glm52MtpAppend>,
+    },
+    Propose {
+        source_bucket: usize,
+        context_bucket: usize,
+        draft_bucket: usize,
+        resets: Vec<usize>,
+        appends: Vec<Glm52MtpAppend>,
+        proposal_slots: Vec<usize>,
+    },
+}
+
+impl Glm52MtpRound {
+    pub(crate) fn resets(&self) -> &[usize] {
+        match self {
+            Self::Reset { resets }
+            | Self::Context { resets, .. }
+            | Self::Propose { resets, .. } => resets,
+        }
+    }
+
+    pub(crate) fn source_bucket(&self) -> Option<usize> {
+        match self {
+            Self::Reset { .. } => None,
+            Self::Context { source_bucket, .. } | Self::Propose { source_bucket, .. } => {
+                Some(*source_bucket)
+            }
+        }
+    }
+}
+
 enum Glm52RankCommand {
     LoadWeights {
         model_path: PathBuf,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
         resp: Sender<Result<Glm52RankWeightLoadReport>>,
     },
     /// Non-collective: adopt the resident weights into the rank's model.
@@ -97,7 +223,8 @@ enum Glm52RankCommand {
     BuildModel {
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
+        prefill_chunk_size: Option<usize>,
         resp: Sender<Result<Vec<KvArena>>>,
     },
     /// Collective: create the DeepEP context (barriers across ranks). Issued
@@ -130,6 +257,10 @@ enum Glm52RankCommand {
         seed: u64,
         resp: Sender<Result<[u32; GLM52_MAX_BATCH_PER_RANK]>>,
     },
+    PrefillChunk {
+        batch: Glm52PrefillBatch,
+        resp: Sender<Result<Vec<u32>>>,
+    },
     /// Non-collective: load the DSpark draft model onto this rank. Issued to
     /// every rank after BuildModel (the draft reuses the target's
     /// embed/lm_head at forward time).
@@ -154,6 +285,13 @@ enum Glm52RankCommand {
         appends: Vec<(usize, usize)>,
         proposals: Vec<(usize, u32, usize)>,
         resp: Sender<Result<Vec<[u32; GLM52_DSPARK_DRAFTS]>>>,
+    },
+    /// Collective native-MTP round. Every EP rank receives one command,
+    /// including ranks with no live proposal, and uses the coordinator-agreed
+    /// context/draft buckets for the layer-78 MoE collectives.
+    MtpDraft {
+        round: Glm52MtpRound,
+        resp: Sender<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>,
     },
     /// Rank-local, vLLM-compat P/D only: deinterleave the RoPE dims of pages
     /// just restored from a vLLM-written namespace (see
@@ -235,12 +373,14 @@ impl Glm52RankWorker {
         &self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::LoadWeights {
                 model_path: model_path.to_path_buf(),
                 moe_topo,
+                weight_staging,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -251,14 +391,16 @@ impl Glm52RankWorker {
         &self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
             .send(Glm52RankCommand::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
+                prefill_chunk_size,
                 resp: resp_tx,
             })
             .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
@@ -307,6 +449,20 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
+    pub(crate) fn prefill_chunk_async(
+        &self,
+        batch: Glm52PrefillBatch,
+    ) -> Result<Receiver<Result<Vec<u32>>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::PrefillChunk {
+                batch,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
     pub(crate) fn load_dspark_async(&self, path: &Path) -> Result<Receiver<Result<()>>> {
         let (resp_tx, resp_rx) = bounded(1);
         self.tx
@@ -346,7 +502,21 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn dump_decode_graph_async(
+    pub(crate) fn mtp_draft_async(
+        &self,
+        round: Glm52MtpRound,
+    ) -> Result<Receiver<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>> {
+        let (resp_tx, resp_rx) = bounded(1);
+        self.tx
+            .send(Glm52RankCommand::MtpDraft {
+                round,
+                resp: resp_tx,
+            })
+            .map_err(|_| anyhow::anyhow!("GLM5.2 rank worker channel closed"))?;
+        Ok(resp_rx)
+    }
+
+    fn dump_decode_graph_async(
         &self,
         bucket: usize,
         png_path: PathBuf,
@@ -364,7 +534,7 @@ impl Glm52RankWorker {
         Ok(resp_rx)
     }
 
-    pub(crate) fn shutdown(&mut self) -> Result<()> {
+    fn shutdown(&mut self) -> Result<()> {
         self.request_shutdown()?;
         self.join()
     }
@@ -407,10 +577,11 @@ impl Glm52Worker {
         &self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Receiver<Result<Glm52RankWeightLoadReport>>> {
         match self {
-            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo),
-            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo),
+            Self::Local(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
+            Self::Remote(worker) => worker.load_weights_async(model_path, moe_topo, weight_staging),
         }
     }
 
@@ -418,14 +589,19 @@ impl Glm52Worker {
         &self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Receiver<Result<Vec<KvArena>>>> {
         match self {
             Self::Local(worker) => {
-                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+                worker.build_model_async(max_model_len, moe_topo, drafter, prefill_chunk_size)
             }
             Self::Remote(worker) => {
-                worker.build_model_async(max_model_len, moe_topo, dspark_enabled)
+                ensure!(
+                    prefill_chunk_size.is_none(),
+                    "GLM5.2 TP4 prefill-only execution is single-host"
+                );
+                worker.build_model_async(max_model_len, moe_topo, drafter)
             }
         }
     }
@@ -463,6 +639,18 @@ impl Glm52Worker {
         }
     }
 
+    pub(crate) fn prefill_chunk_async(
+        &self,
+        batch: Glm52PrefillBatch,
+    ) -> Result<Receiver<Result<Vec<u32>>>> {
+        match self {
+            Self::Local(worker) => worker.prefill_chunk_async(batch),
+            Self::Remote(_) => {
+                anyhow::bail!("GLM5.2 TP4 prefill-only execution is single-host")
+            }
+        }
+    }
+
     pub(crate) fn load_dspark_async(&self, path: &Path) -> Result<Receiver<Result<()>>> {
         match self {
             Self::Local(worker) => worker.load_dspark_async(path),
@@ -487,6 +675,18 @@ impl Glm52Worker {
         match self {
             Self::Local(worker) => worker.draft_async(bucket, resets, appends, proposals),
             Self::Remote(worker) => worker.draft_async(bucket, resets, appends, proposals),
+        }
+    }
+
+    pub(crate) fn mtp_draft_async(
+        &self,
+        round: Glm52MtpRound,
+    ) -> Result<Receiver<Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>>>> {
+        match self {
+            Self::Local(worker) => worker.mtp_draft_async(round),
+            Self::Remote(_) => {
+                anyhow::bail!("GLM5.2 native MTP currently requires all EP ranks in one process")
+            }
         }
     }
 
@@ -576,15 +776,21 @@ impl Glm52RankThreadState {
         &mut self,
         model_path: &Path,
         moe_topo: crate::Glm52MoeTopo,
+        weight_staging: bool,
     ) -> Result<Glm52RankWeightLoadReport> {
-        let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle)?;
+        let rank_load_started = Instant::now();
+        let loaded = load_rank_weights_to_gpu(&self.ctx, model_path, &self.bundle, weight_staging)?;
+        let resident_load_secs = rank_load_started.elapsed().as_secs_f64();
         if moe_topo.uses_tensor_replicated_moe() {
             // Tensor-replicated topology: the bundle carried no routed experts;
             // gather this rank's 1/TP intermediate slice of ALL experts for
             // every MoE layer instead.
             let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
             let dev_ctx = self.ctx.device_context()?;
+            let tp_slices_started = Instant::now();
+            let mut slowest_layer = None::<(usize, f64)>;
             for layer in crate::config::GLM52_DENSE_LAYERS..crate::config::GLM52_LAYERS {
+                let layer_started = Instant::now();
                 let bank = load_tp_slice_layer(
                     &dev_ctx,
                     model_path,
@@ -594,7 +800,24 @@ impl Glm52RankThreadState {
                     layer,
                 )?;
                 self.tp_slices.insert(layer, bank);
+                let elapsed = layer_started.elapsed().as_secs_f64();
+                if slowest_layer.is_none_or(|(_, slowest)| elapsed > slowest) {
+                    slowest_layer = Some((layer, elapsed));
+                }
             }
+            let (slowest_layer, slowest_secs) =
+                slowest_layer.expect("tensor-replicated topology has MoE layers");
+            log::info!(
+                "GLM5.2 rank {} TP slice-bank load profile: layers={}, total={:.2}s, \
+                 mean={:.2}s/layer, slowest_layer={} {:.2}s; this second pass re-reads and \
+                 host-gathers every routed expert independently on each TP rank",
+                self.placement.rank,
+                self.tp_slices.len(),
+                tp_slices_started.elapsed().as_secs_f64(),
+                tp_slices_started.elapsed().as_secs_f64() / self.tp_slices.len() as f64,
+                slowest_layer,
+                slowest_secs,
+            );
         }
         ensure!(
             loaded.loaded_total_bytes == loaded.weights.total_bytes,
@@ -613,6 +836,13 @@ impl Glm52RankThreadState {
             free_vram_bytes,
         };
         self.loaded = Some(loaded.weights);
+        log::info!(
+            "GLM5.2 rank {} complete weight residency: base_plan={resident_load_secs:.2}s, \
+             tp_slice_second_pass={:.2}s, total={:.2}s",
+            self.placement.rank,
+            (rank_load_started.elapsed().as_secs_f64() - resident_load_secs).max(0.0),
+            rank_load_started.elapsed().as_secs_f64(),
+        );
         Ok(report)
     }
 
@@ -620,7 +850,8 @@ impl Glm52RankThreadState {
         &mut self,
         max_model_len: usize,
         moe_topo: crate::Glm52MoeTopo,
-        dspark_enabled: bool,
+        drafter: crate::Glm52Drafter,
+        prefill_chunk_size: Option<usize>,
     ) -> Result<Vec<KvArena>> {
         let mut weights = self
             .loaded
@@ -635,7 +866,8 @@ impl Glm52RankThreadState {
             moe_topo
                 .uses_tensor_replicated_moe()
                 .then_some(self.placement.rank),
-            dspark_enabled,
+            &drafter,
+            prefill_chunk_size,
         )?);
         let arenas = model.kv_arenas(&dev_ctx.stream)?;
         let aux_ctx = self.ctx.auxiliary_device_context("decode aux")?;
@@ -745,6 +977,26 @@ impl Glm52RankThreadState {
         )
     }
 
+    fn mtp_draft(
+        &mut self,
+        round: &Glm52MtpRound,
+    ) -> Result<Vec<[u32; crate::mtp::GLM52_MTP_DRAFTS]>> {
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 native MTP draft before build_model")?;
+        runtime.model.mtp_propose(
+            &dev_ctx,
+            &runtime.aux_ctx,
+            runtime
+                .ep8
+                .as_mut()
+                .context("GLM5.2 native MTP requires the EP8 collective state")?,
+            round,
+        )
+    }
+
     fn setup_comm(
         &mut self,
         unique_id: &[u8; 128],
@@ -810,7 +1062,7 @@ impl Glm52RankThreadState {
                 crate::Glm52MoeTopo::Tp4 => openinfer_kernels::ops::Glm52TpTopology::Tp4,
                 _ => anyhow::bail!("GLM5.2 {moe_topo:?} setup received a TP exchange"),
             };
-            let state = Glm52MoeTpState::new(
+            let mut state = Glm52MoeTpState::new(
                 &dev_ctx,
                 topology,
                 self.placement.rank,
@@ -821,6 +1073,11 @@ impl Glm52RankThreadState {
                 // candidates after the 78 attention slots.
                 crate::config::GLM52_LAYERS + 1,
             )?;
+            if runtime.model.is_prefill_only() {
+                // Collective like the LL rendezvous above: every TP rank
+                // reaches this concurrently in its own SetupComm.
+                state.init_prefill_nccl(&dev_ctx, exchange)?;
+            }
             runtime.tp = Some(Glm52MoeTpRank {
                 state,
                 slices: std::mem::take(&mut self.tp_slices),
@@ -886,6 +1143,18 @@ impl Glm52RankThreadState {
         )
     }
 
+    fn prefill_chunk(&mut self, batch: &Glm52PrefillBatch) -> Result<Vec<u32>> {
+        batch.validate()?;
+        let dev_ctx = self.ctx.device_context()?;
+        let runtime = self
+            .runtime
+            .as_mut()
+            .context("GLM5.2 prefill chunk before build_model")?;
+        runtime
+            .model
+            .prefill_chunk(&dev_ctx, batch, runtime.tp.as_mut())
+    }
+
     fn vllm_rope_fixup(&mut self, pages: &[i32]) -> Result<()> {
         let dev_ctx = self.ctx.device_context()?;
         let runtime = self
@@ -915,17 +1184,24 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
             Glm52RankCommand::LoadWeights {
                 model_path,
                 moe_topo,
+                weight_staging,
                 resp,
             } => {
-                let _ = resp.send(state.load_weights(&model_path, moe_topo));
+                let _ = resp.send(state.load_weights(&model_path, moe_topo, weight_staging));
             }
             Glm52RankCommand::BuildModel {
                 max_model_len,
                 moe_topo,
-                dspark_enabled,
+                drafter,
+                prefill_chunk_size,
                 resp,
             } => {
-                let _ = resp.send(state.build_model(max_model_len, moe_topo, dspark_enabled));
+                let _ = resp.send(state.build_model(
+                    max_model_len,
+                    moe_topo,
+                    drafter,
+                    prefill_chunk_size,
+                ));
             }
             Glm52RankCommand::SetupComm {
                 unique_id,
@@ -945,6 +1221,9 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 resp,
             } => {
                 let _ = resp.send(state.step(&inputs, shape, &kv, flags, &sampling, seed));
+            }
+            Glm52RankCommand::PrefillChunk { batch, resp } => {
+                let _ = resp.send(state.prefill_chunk(&batch));
             }
             Glm52RankCommand::VllmRopeFixup { pages, resp } => {
                 let _ = resp.send(state.vllm_rope_fixup(&pages));
@@ -971,6 +1250,9 @@ fn rank_worker_loop(rx: &Receiver<Glm52RankCommand>, mut state: Glm52RankThreadS
                 resp,
             } => {
                 let _ = resp.send(state.draft(bucket, &resets, &appends, &proposals));
+            }
+            Glm52RankCommand::MtpDraft { round, resp } => {
+                let _ = resp.send(state.mtp_draft(&round));
             }
             Glm52RankCommand::Shutdown => break,
         }

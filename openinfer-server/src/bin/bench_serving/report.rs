@@ -1,6 +1,7 @@
 //! Serializable report and metric types emitted by the benchmark runners.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct RunInfo {
@@ -254,6 +255,15 @@ pub(crate) struct MixedLoadConfig {
     pub(crate) inj_warm_frac: f64,
     pub(crate) warmup: usize,
     pub(crate) seed: u64,
+    /// Scheduler concurrent-request cap (`--max-batch`) the engine was built
+    /// with. Core to reproducing the #470 matrix (e.g. 5 leaves one free slot
+    /// for the injector above `bg_concurrency=4`). `0` in pre-#470 snapshots.
+    #[serde(default)]
+    pub(crate) max_batch: usize,
+    /// Per-step chunked-prefill token budget (`--max-prefill-tokens`). `None`
+    /// means the model default (chunking on); a huge value means chunking off.
+    #[serde(default)]
+    pub(crate) max_prefill_tokens: Option<usize>,
 }
 
 /// Inter-token-latency of the background decode streams
@@ -276,6 +286,8 @@ pub(crate) struct InjectionRecord {
     pub(crate) warm: bool,
     pub(crate) prefill_ms: f64,
     pub(crate) arrival_offset_ms: f64,
+    pub(crate) generated_tokens: usize,
+    pub(crate) generated_token_trace: GeneratedTokenTrace,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -295,6 +307,8 @@ pub(crate) struct MixedLoadReport {
     pub(crate) gpu: String,
     pub(crate) run: RunInfo,
     pub(crate) config: MixedLoadConfig,
+    pub(crate) background_generated_tokens: CountStats,
+    pub(crate) background_generated_token_traces: Vec<GeneratedTokenTrace>,
     pub(crate) baseline_itl: Option<DurationStats>,
     pub(crate) mixed_itl: MixedLoadItl,
     pub(crate) injections: Vec<InjectionRecord>,

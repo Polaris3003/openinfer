@@ -1,29 +1,41 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
-};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::ensure;
 use memmap2::Mmap;
 use safetensors::Dtype;
 use serde_json::Value;
 
-use crate::config::{
-    GLM52_DENSE_INTERMEDIATE, GLM52_DENSE_LAYERS, GLM52_EXPERT_INTERMEDIATE, GLM52_HIDDEN,
-    GLM52_INDEX_HEAD_DIM, GLM52_INDEX_HEADS, GLM52_KV_A_OUT, GLM52_KV_B_OUT, GLM52_KV_LORA_RANK,
-    GLM52_LAYERS, GLM52_O_PROJ_IN, GLM52_Q_B_OUT, GLM52_Q_LORA_RANK, GLM52_ROUTED_EXPERTS,
-    GLM52_VOCAB,
-};
+use crate::config::GLM52_DENSE_INTERMEDIATE;
+use crate::config::GLM52_DENSE_LAYERS;
+use crate::config::GLM52_EXPERT_INTERMEDIATE;
+use crate::config::GLM52_HIDDEN;
+use crate::config::GLM52_INDEX_HEAD_DIM;
+use crate::config::GLM52_INDEX_HEADS;
+use crate::config::GLM52_KV_A_OUT;
+use crate::config::GLM52_KV_B_OUT;
+use crate::config::GLM52_KV_LORA_RANK;
+use crate::config::GLM52_LAYERS;
+use crate::config::GLM52_MTP_LAYER;
+use crate::config::GLM52_O_PROJ_IN;
+use crate::config::GLM52_Q_B_OUT;
+use crate::config::GLM52_Q_LORA_RANK;
+use crate::config::GLM52_ROUTED_EXPERTS;
+use crate::config::GLM52_VOCAB;
 
 mod context;
 mod load;
+mod staging;
 
 pub(crate) use context::Glm52RankGpuContext;
 pub(crate) use load::Glm52ExpertLayerRegions;
-pub(crate) use load::{Glm52RankGpuWeights, load_rank_weights_to_gpu};
+pub(crate) use load::Glm52RankGpuWeights;
+pub(crate) use load::load_rank_weights_to_gpu;
 
 const GLM52_WEIGHT_INDEX: &str = "model.safetensors.index.json";
-pub(crate) const GLM52_MTP_LAYER: usize = GLM52_LAYERS;
 /// The EP8 production partition (8 ranks × 32 experts). Serving-path code
 /// derives rank/expert counts from the launch topology
 /// (`Glm52MoeTopo::ep_local_experts`); these constants remain the manifest
@@ -62,7 +74,7 @@ pub(crate) enum Glm52ExpertRegionKind {
 }
 
 impl Glm52ExpertRegionKind {
-    pub(crate) const ALL: [Self; 4] = [
+    const ALL: [Self; 4] = [
         Self::W13Weight,
         Self::W13Scale,
         Self::W2Weight,
@@ -71,7 +83,7 @@ impl Glm52ExpertRegionKind {
 
     /// Total bytes of this region for one layer's rank-local experts
     /// (`local_experts` = 32 for EP8, 64 for EP4).
-    pub(crate) fn region_bytes(self, local_experts: usize) -> usize {
+    fn region_bytes(self, local_experts: usize) -> usize {
         local_experts * self.expert_stride()
     }
 
@@ -88,9 +100,9 @@ impl Glm52ExpertRegionKind {
 /// Destination of one routed-expert tensor inside its layer's packed regions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52ExpertPlacement {
-    pub(crate) layer: usize,
-    pub(crate) region: Glm52ExpertRegionKind,
-    pub(crate) offset: usize,
+    layer: usize,
+    region: Glm52ExpertRegionKind,
+    offset: usize,
 }
 
 /// Classify a tensor name: `Some(placement)` for routed-expert tensors (the
@@ -101,7 +113,10 @@ pub(crate) fn expert_placement(
     name: &str,
     rank_experts: &std::ops::Range<usize>,
 ) -> Result<Option<Glm52ExpertPlacement>> {
-    use Glm52ExpertRegionKind::{W2Scale, W2Weight, W13Scale, W13Weight};
+    use Glm52ExpertRegionKind::W2Scale;
+    use Glm52ExpertRegionKind::W2Weight;
+    use Glm52ExpertRegionKind::W13Scale;
+    use Glm52ExpertRegionKind::W13Weight;
 
     let Some((layer, rest)) = name
         .strip_prefix("model.layers.")
@@ -148,14 +163,14 @@ pub(crate) fn expert_placement(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52TensorLoadSpec {
-    pub(crate) name: String,
-    pub(crate) shard: String,
+    name: String,
+    shard: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52ShardLoadPlan {
-    pub(crate) shard: String,
-    pub(crate) tensors: Vec<Glm52TensorLoadSpec>,
+    shard: String,
+    tensors: Vec<Glm52TensorLoadSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,11 +183,11 @@ pub(crate) struct Glm52RankWeightPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Glm52RankLoadBundle {
     pub(crate) plan: Glm52RankWeightPlan,
-    pub(crate) shards: Vec<Glm52ShardLoadPlan>,
+    shards: Vec<Glm52ShardLoadPlan>,
 }
 
 impl Glm52RankLoadBundle {
-    pub(crate) fn planned_total_bytes(&self) -> Result<usize> {
+    fn planned_total_bytes(&self) -> Result<usize> {
         self.shards
             .iter()
             .flat_map(|shard| shard.tensors.iter())
@@ -200,7 +215,7 @@ pub(crate) struct Glm52TensorContract {
 }
 
 impl Glm52TensorContract {
-    pub(crate) fn byte_len(&self) -> Result<usize> {
+    fn byte_len(&self) -> Result<usize> {
         let elements = self.shape.iter().try_fold(1usize, |total, dim| {
             total.checked_mul(*dim).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -245,9 +260,10 @@ impl Glm52WeightManifest {
     pub(crate) fn all_rank_load_bundles(
         &self,
         moe_topo: crate::Glm52MoeTopo,
+        native_mtp: bool,
     ) -> Result<Vec<Glm52RankLoadBundle>> {
         (0..moe_topo.device_count())
-            .map(|rank| self.rank_load_bundle(rank, moe_topo))
+            .map(|rank| self.rank_load_bundle(rank, moe_topo, native_mtp))
             .collect()
     }
 
@@ -264,8 +280,9 @@ impl Glm52WeightManifest {
         &self,
         rank: usize,
         moe_topo: crate::Glm52MoeTopo,
+        native_mtp: bool,
     ) -> Result<Glm52RankLoadBundle> {
-        let names = self.rank_resident_tensor_names(rank, moe_topo)?;
+        let names = self.rank_resident_tensor_names(rank, moe_topo, native_mtp)?;
         let mut by_shard: BTreeMap<String, Vec<Glm52TensorLoadSpec>> = BTreeMap::new();
         for name in names {
             let shard = self
@@ -302,9 +319,9 @@ impl Glm52WeightManifest {
         })
     }
 
-    /// Full checkpoint coverage, including the native MTP layer. This is a
-    /// manifest invariant only: resident load plans below deliberately omit
-    /// tensors that the serving model never consumes.
+    /// Full checkpoint coverage, including the MTP accuracy-oracle layer.
+    /// This is a manifest invariant only: resident load plans below
+    /// deliberately omit tensors that the serving model never consumes.
     fn rank_tensor_names(&self, rank: usize) -> Result<Vec<String>> {
         ensure!(
             rank < GLM52_EP_RANKS,
@@ -320,14 +337,15 @@ impl Glm52WeightManifest {
         Ok(names)
     }
 
-    /// Tensors that must become GPU-resident for one serving rank. Native MTP
-    /// layer 78 is validation-only and never enters this list. TP8 gets all
+    /// Tensors that must become GPU-resident for one serving rank. MTP layer
+    /// 78 enters the EP plan only when native MTP is enabled. TP8 gets all
     /// routed + shared experts from `load_tp8_slice_layer`, so its first pass
     /// loads routers but not duplicate full shared-expert projections.
     fn rank_resident_tensor_names(
         &self,
         rank: usize,
         moe_topo: crate::Glm52MoeTopo,
+        native_mtp: bool,
     ) -> Result<Vec<String>> {
         ensure!(
             rank < moe_topo.device_count(),
@@ -342,6 +360,15 @@ impl Glm52WeightManifest {
             for layer_idx in GLM52_DENSE_LAYERS..GLM52_LAYERS {
                 push_routed_experts(&mut names, layer_idx, expert_range.clone());
             }
+            if native_mtp {
+                self.push_mtp_non_expert_names(&mut names, true);
+                push_routed_experts(&mut names, GLM52_MTP_LAYER, expert_range);
+            }
+        } else {
+            ensure!(
+                !native_mtp,
+                "GLM5.2 native MTP resident loading currently requires an EP topology"
+            );
         }
         Ok(names)
     }
@@ -367,6 +394,10 @@ impl Glm52WeightManifest {
 
     fn push_checkpoint_non_expert_names(&self, names: &mut Vec<String>) {
         self.push_resident_non_expert_names(names, true);
+        self.push_mtp_non_expert_names(names, true);
+    }
+
+    fn push_mtp_non_expert_names(&self, names: &mut Vec<String>, include_shared_experts: bool) {
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.enorm.weight"));
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.hnorm.weight"));
         names.push(format!("model.layers.{GLM52_MTP_LAYER}.eh_proj.weight"));
@@ -374,7 +405,7 @@ impl Glm52WeightManifest {
             "model.layers.{GLM52_MTP_LAYER}.shared_head.norm.weight"
         ));
         self.push_attention_names(names, GLM52_MTP_LAYER);
-        push_moe_non_expert(names, GLM52_MTP_LAYER, true);
+        push_moe_non_expert(names, GLM52_MTP_LAYER, include_shared_experts);
     }
 
     fn push_attention_names(&self, names: &mut Vec<String>, layer_idx: usize) {
@@ -659,6 +690,7 @@ pub(crate) fn mmap_file(path: &Path) -> Result<Mmap> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
 
     #[test]
@@ -724,10 +756,10 @@ mod tests {
             weight_map: BTreeMap::new(),
         };
         let ep8 = manifest
-            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Ep8)
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Ep8, false)
             .unwrap();
         let tp8 = manifest
-            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8)
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8, false)
             .unwrap();
 
         let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
@@ -746,13 +778,105 @@ mod tests {
     }
 
     #[test]
+    fn native_mtp_ep8_plan_adds_the_local_layer_78_partition() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        let plain = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep8, false)
+            .unwrap();
+        let native_mtp = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep8, true)
+            .unwrap();
+        let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
+
+        assert!(plain.iter().all(|name| !name.starts_with(&mtp_prefix)));
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}eh_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.96.gate_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.127.down_proj.weight"))
+        );
+        assert!(native_mtp.iter().all(|name| {
+            if !name.starts_with(&format!("{mtp_prefix}mlp.experts.")) {
+                return true;
+            }
+            name.split(".mlp.experts.")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|expert| expert.parse::<usize>().ok())
+                .is_some_and(|expert| (96..128).contains(&expert))
+        }));
+    }
+
+    #[test]
+    fn native_mtp_ep4_plan_adds_the_local_layer_78_partition() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        let plain = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep4, false)
+            .unwrap();
+        let native_mtp = manifest
+            .rank_resident_tensor_names(3, crate::Glm52MoeTopo::Ep4, true)
+            .unwrap();
+        let mtp_prefix = format!("model.layers.{GLM52_MTP_LAYER}.");
+
+        assert!(plain.iter().all(|name| !name.starts_with(&mtp_prefix)));
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}eh_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.192.gate_proj.weight"))
+        );
+        assert!(
+            native_mtp
+                .iter()
+                .any(|name| name == &format!("{mtp_prefix}mlp.experts.255.down_proj.weight"))
+        );
+        assert!(native_mtp.iter().all(|name| {
+            if !name.starts_with(&format!("{mtp_prefix}mlp.experts.")) {
+                return true;
+            }
+            name.split(".mlp.experts.")
+                .nth(1)
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|expert| expert.parse::<usize>().ok())
+                .is_some_and(|expert| (192..256).contains(&expert))
+        }));
+    }
+
+    #[test]
+    fn native_mtp_resident_plan_rejects_non_ep_topologies() {
+        let manifest = Glm52WeightManifest {
+            weight_map: BTreeMap::new(),
+        };
+        manifest
+            .rank_resident_tensor_names(0, crate::Glm52MoeTopo::Tp8, true)
+            .expect_err("native MTP must not construct a TP resident plan");
+    }
+
+    #[test]
     fn ep4_resident_plan_carries_64_expert_bundles() {
         let manifest = Glm52WeightManifest {
             weight_map: BTreeMap::new(),
         };
         // Rank 1 of EP4 owns whole experts 64..128 on every MoE layer.
         let ep4 = manifest
-            .rank_resident_tensor_names(1, crate::Glm52MoeTopo::Ep4)
+            .rank_resident_tensor_names(1, crate::Glm52MoeTopo::Ep4, false)
             .unwrap();
         assert!(
             ep4.iter()
@@ -773,7 +897,7 @@ mod tests {
         // Four EP4 ranks cover the full routed set.
         assert!(
             manifest
-                .rank_resident_tensor_names(4, crate::Glm52MoeTopo::Ep4)
+                .rank_resident_tensor_names(4, crate::Glm52MoeTopo::Ep4, false)
                 .is_err()
         );
     }

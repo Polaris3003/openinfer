@@ -3,9 +3,11 @@
 #include <cublasLt.h>
 
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <mutex>
 
 static constexpr int CUBLAS_STATUS_ERROR_OFFSET = 100000;
 
@@ -42,6 +44,16 @@ thread_local cublasLtHandle_t g_lt_handle = nullptr;
 thread_local void *g_lt_workspace = nullptr;
 thread_local std::map<std::array<int, 3>, LtGemmPlan> g_lt_plans;
 static const size_t LT_WORKSPACE_SIZE = 32 * 1024 * 1024; // 32MB
+
+// Tuned winners are device-scoped, not thread-scoped: one thread benchmarks a
+// shape and the rest adopt the published winner.
+struct LtTunedEntry {
+  bool ready = false;
+  cublasLtMatmulAlgo_t algo{};
+};
+static std::mutex g_lt_tuned_mu;
+static std::condition_variable g_lt_tuned_cv;
+static std::map<std::array<int, 4>, LtTunedEntry> g_lt_tuned_algos;
 
 // Pin-path workspace, separate from the 32MB default. Arch-dependent, with 128MB kept as margin
 // for the tested decode buckets. Allocated lazily on first Pin use.
@@ -384,6 +396,29 @@ int gemm_strided_batched_bf16_cuda(int op_a, int op_b, int m, int n, int k,
   return static_cast<int>(cudaPeekAtLastError());
 }
 
+int gemm_bf16_f32_cuda(int op_a, int op_b, int m, int n, int k,
+                       const __nv_bfloat16 *A, int lda,
+                       const __nv_bfloat16 *B, int ldb, float *C, int ldc,
+                       cudaStream_t stream) {
+  if (g_cublas_handle == nullptr || m <= 0 || n <= 0 || k <= 0) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const cublasOperation_t ta = op_a != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const cublasOperation_t tb = op_b != 0 ? CUBLAS_OP_T : CUBLAS_OP_N;
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasStatus_t status = cublasSetStream(g_cublas_handle, stream);
+  if (status == CUBLAS_STATUS_SUCCESS) {
+    status = cublasGemmEx(g_cublas_handle, ta, tb, m, n, k, &alpha, A,
+                          CUDA_R_16BF, lda, B, CUDA_R_16BF, ldb, &beta, C,
+                          CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F,
+                          CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  }
+  return status == CUBLAS_STATUS_SUCCESS
+             ? static_cast<int>(cudaPeekAtLastError())
+             : cublas_status_to_error(status);
+}
+
 // Decode GEMM through the cublasLt plan tuned by gemm_lt_tune_cuda. Returns
 // GEMM_LT_UNTUNED when this thread holds no plan for (M, N, K) — the tuned
 // kernel was already executed during tuning, so replaying it inside a CUDA
@@ -434,6 +469,48 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
   if (g_lt_plans.find(key) != g_lt_plans.end()) {
     return static_cast<int>(cudaSuccess);
   }
+
+  int device = -1;
+  cudaError_t dev_status = cudaGetDevice(&device);
+  if (dev_status != cudaSuccess) {
+    return static_cast<int>(dev_status);
+  }
+  const std::array<int, 4> shared_key{device, M, N, K};
+  {
+    std::unique_lock<std::mutex> lock(g_lt_tuned_mu);
+    for (;;) {
+      auto it = g_lt_tuned_algos.find(shared_key);
+      if (it == g_lt_tuned_algos.end()) {
+        g_lt_tuned_algos.emplace(shared_key, LtTunedEntry{});
+        break;
+      }
+      if (it->second.ready) {
+        LtGemmPlan plan;
+        cublasStatus_t status = lt_plan_create(plan, M, N, K);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+          lt_plan_destroy(plan);
+          return cublas_status_to_error(status);
+        }
+        plan.algo = it->second.algo;
+        g_lt_plans.emplace(key, plan);
+        return static_cast<int>(cudaSuccess);
+      }
+      g_lt_tuned_cv.wait(lock);
+    }
+  }
+  struct TunedClaim {
+    std::array<int, 4> key;
+    bool published = false;
+    ~TunedClaim() {
+      if (!published) {
+        {
+          std::lock_guard<std::mutex> lock(g_lt_tuned_mu);
+          g_lt_tuned_algos.erase(key);
+        }
+        g_lt_tuned_cv.notify_all();
+      }
+    }
+  } claim{shared_key};
 
   LtGemmPlan plan;
   cublasStatus_t status = lt_plan_create(plan, M, N, K);
@@ -526,6 +603,12 @@ int gemm_lt_tune_cuda(const __nv_bfloat16 *const *Ws, int num_ws, int M, int N, 
     return cublas_status_to_error(CUBLAS_STATUS_NOT_SUPPORTED);
   }
   plan.algo = results[best].algo;
+  {
+    std::lock_guard<std::mutex> lock(g_lt_tuned_mu);
+    g_lt_tuned_algos[shared_key] = LtTunedEntry{true, plan.algo};
+  }
+  g_lt_tuned_cv.notify_all();
+  claim.published = true;
   g_lt_plans.emplace(key, plan);
   return static_cast<int>(cudaSuccess);
 }

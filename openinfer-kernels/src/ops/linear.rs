@@ -1,11 +1,20 @@
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
-use anyhow::{Result, bail, ensure};
-use cudarc::driver::{DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
-use crate::tensor::{DeviceContext, DeviceMatrix, DeviceVec, HiddenStates, HiddenStatesRef};
+use crate::tensor::DeviceContext;
+use crate::tensor::DeviceMatrix;
+use crate::tensor::DeviceVec;
+use crate::tensor::HiddenStates;
+use crate::tensor::HiddenStatesRef;
 
 /// Generic strided-batched bf16 GEMM — one `cublasGemmStridedBatchedEx` on the
 /// graph-safe (workspace-free, decode/capture) cuBLAS handle. `lda`/`ldb`/`ldc`
@@ -24,10 +33,10 @@ pub fn gemm_strided_batched_bf16(
     m: usize,
     n: usize,
     k: usize,
-    a: &cudarc::driver::CudaSlice<bf16>,
+    a: &impl cudarc::driver::DevicePtr<bf16>,
     lda: usize,
     stride_a: usize,
-    b: &cudarc::driver::CudaSlice<bf16>,
+    b: &impl cudarc::driver::DevicePtr<bf16>,
     ldb: usize,
     stride_b: usize,
     c: &mut cudarc::driver::CudaSlice<bf16>,
@@ -84,6 +93,48 @@ pub fn gemm_strided_batched_bf16(
         status == 0,
         "gemm_strided_batched_bf16 failed: status={status} (m={m} n={n} k={k} batch={batch})"
     );
+    Ok(())
+}
+
+#[allow(clippy::many_single_char_names, clippy::too_many_arguments)]
+pub fn gemm_bf16_f32(
+    ctx: &DeviceContext,
+    transpose_a: bool,
+    transpose_b: bool,
+    m: usize,
+    n: usize,
+    k: usize,
+    a: &cudarc::driver::CudaSlice<bf16>,
+    lda: usize,
+    b: &cudarc::driver::CudaSlice<bf16>,
+    ldb: usize,
+    c: &mut cudarc::driver::CudaSlice<f32>,
+    ldc: usize,
+) -> Result<()> {
+    ensure!(
+        m > 0 && n > 0 && k > 0 && a.len() >= m * k && b.len() >= n * k && c.len() >= m * n,
+        "gemm_bf16_f32 buffers do not fit [{m},{n},{k}]"
+    );
+    let (a_ptr, _ga) = a.device_ptr(&ctx.stream);
+    let (b_ptr, _gb) = b.device_ptr(&ctx.stream);
+    let (c_ptr, _gc) = c.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::gemm_bf16_f32_cuda(
+            i32::from(transpose_a),
+            i32::from(transpose_b),
+            m as i32,
+            n as i32,
+            k as i32,
+            a_ptr as *const ffi::Half,
+            lda as i32,
+            b_ptr as *const ffi::Half,
+            ldb as i32,
+            c_ptr as *mut f32,
+            ldc as i32,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    ensure!(status == 0, "gemm_bf16_f32 failed: status={status}");
     Ok(())
 }
 
@@ -155,7 +206,7 @@ const GEMM_LT_PIN_NONDET: i32 = -3;
 #[derive(Clone, Copy, Debug)]
 pub struct PinAlgoConfig {
     pub splitk: i32,
-    pub reduction_scheme: i32,
+    reduction_scheme: i32,
 }
 
 impl PinAlgoConfig {
@@ -470,7 +521,7 @@ pub fn gemm_graphsafe_ref_into_checked(
     gemm_ref_into_with_policy(ctx, weight, x, out, true)
 }
 
-pub fn gemm_per_token_into_checked(
+pub(crate) fn gemm_per_token_into_checked(
     ctx: &DeviceContext,
     weight: &DeviceMatrix,
     x: &HiddenStates,

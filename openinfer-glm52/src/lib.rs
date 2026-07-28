@@ -25,8 +25,10 @@ mod moe_decode;
 mod moe_ep8;
 mod moe_ep_wo;
 mod moe_tp;
+mod mtp;
 #[cfg(test)]
 mod oracle;
+mod prefill_tp;
 mod remote;
 mod rows;
 mod runner;
@@ -34,30 +36,82 @@ mod scheduler;
 mod scratch;
 mod weights;
 
-use std::{
-    collections::BTreeSet,
-    path::{Path, PathBuf},
-    time::Instant,
-};
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::Instant;
 
-use anyhow::{Context as _, Result, bail, ensure};
+use anyhow::Context as _;
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
 use bytesize::ByteSize;
-use openinfer_core::engine::{EngineHandle, KvCapacity, LoadSnapshot};
-use openinfer_kv_offload::{HostConfig, KvArena, OffloadEngine, OffloadHost};
+pub(crate) use config::GLM52_LAYERS;
+pub(crate) use config::GLM52_ROUTED_EXPERTS;
+pub use config::probe_config_json;
+use openinfer_core::engine::EngineHandle;
+use openinfer_core::engine::KvCapacity;
+use openinfer_core::engine::LoadSnapshot;
+use openinfer_kv_offload::HostConfig;
+use openinfer_kv_offload::KvArena;
+use openinfer_kv_offload::OffloadEngine;
+use openinfer_kv_offload::OffloadHost;
 use remote::Glm52RemoteNode;
-use runner::{Glm52RankPlacement, Glm52RankWorker, Glm52Worker};
-
 pub use remote::serve_rank_host;
-use tokio::sync::{mpsc, watch};
-use weights::{GLM52_EP_RANKS, Glm52RankLoadBundle, Glm52WeightManifest};
+use runner::Glm52PrefillBatch;
+use runner::Glm52RankPlacement;
+use runner::Glm52RankWorker;
+use runner::Glm52Worker;
+use tokio::sync::mpsc;
+use tokio::sync::watch;
+use weights::GLM52_EP_RANKS;
+use weights::Glm52RankLoadBundle;
+use weights::Glm52WeightManifest;
 
 use crate::config::GLM52_MAX_CONTEXT;
-use crate::model::{GLM52_MODEL_LEN_ALIGN, glm52_arena_bytes, glm52_pool_blocks};
+use crate::model::GLM52_MODEL_LEN_ALIGN;
+use crate::model::glm52_arena_bytes;
+use crate::model::glm52_pool_blocks;
 
-pub use config::{
-    GLM52_DENSE_LAYERS, GLM52_HIDDEN, GLM52_INDEX_TOPK, GLM52_LAYERS, GLM52_MOE_LAYERS,
-    GLM52_ROUTED_EXPERTS, GLM52_TOPK, GLM52_VOCAB, probe_config_json,
-};
+pub const GLM52_PREFILL_CHUNK_ALIGN: usize = GLM52_MODEL_LEN_ALIGN;
+pub const GLM52_DEFAULT_PREFILL_CHUNK_SIZE: usize = 16_384;
+
+/// Optional speculative decoder used by the GLM5.2 engine.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+pub enum Glm52Drafter {
+    None,
+    /// External DSpark checkpoint.
+    Dspark(PathBuf),
+    /// Checkpoint-native layer-78 multi-token prediction decoder.
+    NativeMtp,
+}
+
+impl Glm52Drafter {
+    fn enabled(&self) -> bool {
+        !matches!(self, Self::None)
+    }
+
+    fn is_dspark(&self) -> bool {
+        matches!(self, Self::Dspark(_))
+    }
+
+    fn is_mtp(&self) -> bool {
+        matches!(self, Self::NativeMtp)
+    }
+
+    fn dspark_path(&self) -> Option<&Path> {
+        match self {
+            Self::Dspark(path) => Some(path),
+            Self::None | Self::NativeMtp => None,
+        }
+    }
+}
+
+/// TP4 prefill-only configuration.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Glm52PrefillOnlyOptions {
+    pub chunk_size: usize,
+}
 
 /// GLM5.2 parallel shape. EP8 is the production layout today; TP4 is the
 /// GB300 bring-up target.
@@ -65,27 +119,28 @@ pub use config::{
 pub struct Glm52LaunchOptions {
     pub tp_size: usize,
     pub dp_size: usize,
-    /// DSpark drafter checkpoint dir (`RedHatAI/GLM-5.2-speculator.dspark`).
-    /// Enables speculative decoding for greedy AND sampled requests (the
-    /// verify span prefix-matches per-row sampled tokens — lossless): verify
-    /// spans ride the decode buckets, accepted tokens commit in batches,
-    /// per-request accept stats are logged on release.
-    pub dspark_draft_model_path: Option<std::path::PathBuf>,
+    /// Optional speculative decoder. DSpark enables lossless speculative
+    /// sampling from an external checkpoint; native MTP uses the checkpoint's
+    /// layer-78 decoder and currently supports single-node EP4 and EP8.
+    pub drafter: Glm52Drafter,
     /// Per-request context cap (`prompt + max_tokens - 1 <= max_model_len`).
     /// `None` sizes it from the post-weight-load free VRAM (fleet minimum);
     /// an explicit value is still validated against that budget so an
     /// impossible cap fails at launch, not at the first long request.
     pub max_model_len: Option<usize>,
+    /// Enables TP4 prefill-only serving.
+    pub prefill_only: Option<Glm52PrefillOnlyOptions>,
     /// vLLM-style kill switch: disable prefix matching outright (every
     /// prefill recomputes the full prompt). Prefix caching is also forced
-    /// off while the DSpark drafter is on — the draft lane needs the
-    /// aux-hidden captures a skipped prefix never produces.
+    /// off while a speculative decoder is on: DSpark needs aux-hidden
+    /// captures for every prefix row, while native MTP needs target hidden
+    /// states and uninterrupted MTP KV continuity.
     pub no_prefix_cache: bool,
     /// `Some` adds the pegaflow host tier under the prefix cache: sealed KV
     /// blocks flow to one shared pinned pool on request release, and a
     /// prompt whose prefix fell out of HBM restores from it at admission.
-    /// Requires the prefix cache (rejected at launch alongside the DSpark
-    /// drafter or `no_prefix_cache`).
+    /// Requires the prefix cache (rejected at launch alongside any
+    /// speculative decoder or `no_prefix_cache`).
     pub kv_offload: Option<Glm52KvOffloadOptions>,
     /// Launch-time MoE sharding topology. `Ep8` (default) is the
     /// high-throughput configuration: 32 whole experts per rank, DeepEP
@@ -98,6 +153,9 @@ pub struct Glm52LaunchOptions {
     /// four-GPU bring-up target using 16 attention heads per rank and 1/4
     /// intermediate MoE slices.
     pub moe_topo: Glm52MoeTopo,
+    /// Stage checkpoint bytes through pinned double buffers. Intended for
+    /// warm page-cache starts; cold network filesystems should leave it off.
+    pub weight_staging: bool,
     /// Export rank 0's already pre-captured whole-step decode graph during
     /// startup. EP8 and TP4 export bucket 1; TP8 exports its fixed bucket 8.
     /// The requested PNG gets a complete sibling `.dot` for machine
@@ -113,8 +171,8 @@ pub struct Glm52LaunchOptions {
 /// One `--rank-hosts` entry: `host:port=ranks` (e.g. `10.13.84.7:19000=4`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Glm52RankHostSpec {
-    pub addr: String,
-    pub ranks: usize,
+    addr: String,
+    ranks: usize,
 }
 
 impl std::str::FromStr for Glm52RankHostSpec {
@@ -170,7 +228,7 @@ impl Glm52MoeTopo {
     }
 
     #[must_use]
-    pub fn device_count(self) -> usize {
+    fn device_count(self) -> usize {
         match self {
             Self::Ep8 | Self::Tp8 => GLM52_EP_RANKS,
             Self::Ep4 | Self::Tp4 => 4,
@@ -202,7 +260,7 @@ impl Glm52MoeTopo {
     }
 
     #[must_use]
-    pub(crate) fn expected_ep_size(self) -> usize {
+    fn expected_ep_size(self) -> usize {
         match self {
             Self::Tp8 => GLM52_EP_RANKS,
             Self::Tp4 => 1,
@@ -211,20 +269,20 @@ impl Glm52MoeTopo {
     }
 
     #[must_use]
-    pub(crate) fn uses_ep_expert_bundles(self) -> bool {
+    fn uses_ep_expert_bundles(self) -> bool {
         !self.uses_tensor_replicated_moe()
     }
 
     /// Whole routed experts per rank of an expert-bundle topology (EP8 → 32,
     /// EP4 → 64). Meaningless for the tensor-replicated topologies.
     #[must_use]
-    pub(crate) fn ep_local_experts(self) -> usize {
+    fn ep_local_experts(self) -> usize {
         debug_assert!(self.uses_ep_expert_bundles());
         GLM52_ROUTED_EXPERTS / self.expected_ep_size()
     }
 
     #[must_use]
-    pub(crate) fn uses_tensor_replicated_moe(self) -> bool {
+    fn uses_tensor_replicated_moe(self) -> bool {
         matches!(self, Self::Tp8 | Self::Tp4)
     }
 }
@@ -386,14 +444,26 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
     let Glm52LaunchOptions {
         tp_size,
         dp_size,
-        dspark_draft_model_path,
+        drafter,
         max_model_len,
+        prefill_only,
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        weight_staging,
         dump_graph_png,
         rank_hosts,
     } = options;
+    if drafter.is_mtp() {
+        ensure!(
+            matches!(moe_topo, Glm52MoeTopo::Ep4 | Glm52MoeTopo::Ep8),
+            "GLM5.2 native MTP currently requires the single-node EP4 or EP8 topology"
+        );
+        ensure!(
+            rank_hosts.is_empty(),
+            "GLM5.2 native MTP currently requires all EP ranks in one process"
+        );
+    }
     if let Some(path) = &dump_graph_png {
         openinfer_core::cuda_graph::validate_graph_dump_request(path)?;
     }
@@ -420,14 +490,46 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             );
         }
     }
+    if let Some(prefill) = prefill_only {
+        ensure!(
+            moe_topo == Glm52MoeTopo::Tp4,
+            "GLM5.2 prefill-only mode requires the TP4 topology"
+        );
+        ensure!(
+            rank_hosts.is_empty(),
+            "GLM5.2 TP4 prefill-only mode is single-host; remote rank hosts are unsupported"
+        );
+        ensure!(
+            prefill.chunk_size > 0 && prefill.chunk_size.is_multiple_of(GLM52_PREFILL_CHUNK_ALIGN),
+            "GLM5.2 prefill chunk size {} must be a positive multiple of {}",
+            prefill.chunk_size,
+            GLM52_PREFILL_CHUNK_ALIGN,
+        );
+        ensure!(
+            !drafter.enabled(),
+            "GLM5.2 prefill-only mode is incompatible with speculative decoding"
+        );
+        ensure!(
+            !no_prefix_cache,
+            "GLM5.2 prefill-only mode requires prefix caching"
+        );
+        ensure!(
+            kv_offload.is_none(),
+            "GLM5.2 prefill-only mode does not support KV offload or an external P/D peer"
+        );
+        ensure!(
+            dump_graph_png.is_none(),
+            "GLM5.2 prefill-only mode does not expose a decode CUDA graph"
+        );
+    }
     // The offload tier extends the prefix cache (restored blocks surface as
     // matched prefix), so a config that disables prefix matching while asking
     // for offload is contradictory — fail loud instead of silently idling an
     // allocated multi-GiB pinned pool.
     ensure!(
-        kv_offload.is_none() || (dspark_draft_model_path.is_none() && !no_prefix_cache),
+        kv_offload.is_none() || (!drafter.enabled() && !no_prefix_cache),
         "GLM5.2 --kv-offload requires the prefix cache: drop --no-prefix-cache and the \
-         DSpark drafter (speculative decoding and prefix caching are mutually exclusive)"
+         drafter (speculative decoding and prefix caching are mutually exclusive)"
     );
     // The tp8 topology mirrors KV on every rank; the host tier's restore leg
     // H2Ds into ONE rank's arena, which would silently desync the other 7.
@@ -487,11 +589,13 @@ pub fn launch(model_path: &Path, options: Glm52LaunchOptions) -> Result<EngineHa
             ep_size: moe_topo.expected_ep_size(),
             rank_hosts,
         },
-        dspark_draft_model_path.as_deref(),
+        drafter,
         max_model_len,
+        prefill_only,
         no_prefix_cache,
         kv_offload,
         moe_topo,
+        weight_staging,
         dump_graph_png,
     )
 }
@@ -513,6 +617,15 @@ const GLM52_VRAM_RESERVE_BYTES: usize = 5 << 30;
 /// the probe. The drafter's cap-scaled buffers are in the exact ledger
 /// (`glm52_dspark_arena_bytes`), not here.
 const GLM52_DSPARK_VRAM_RESERVE_BYTES: usize = 5 << 30;
+
+/// Fixed prefill workspace reserve: the row-block-bounded MoE scratch
+/// (gathered fp8 routes + grouped W2 output), the attention/dense sub-tile
+/// buffers, the unpacked bf16 KV pool, and the GEMM workspaces.
+const GLM52_PREFILL_FIXED_SCRATCH_BYTES: usize = 3 << 30;
+
+/// Estimated scratch bytes per token row (chunk-scale activations, MLA
+/// front/query buffers, indexer carry, router logits).
+const GLM52_PREFILL_SCRATCH_BYTES_PER_TOKEN: usize = 160 << 10;
 
 /// The smallest cap worth serving with (the pre-refactor bring-up value);
 /// a budget below this is a misconfiguration, not a working engine.
@@ -538,14 +651,38 @@ struct Glm52ContextBudget {
 }
 
 /// Exact cap-scaled bytes a rank allocates for a candidate cap: the build
-/// arenas plus, when the drafter is enabled, the DSpark lane.
-fn glm52_cap_bytes(max_model_len: usize, dspark_enabled: bool) -> Result<usize> {
-    Ok(glm52_arena_bytes(max_model_len)?
-        + if dspark_enabled {
+/// arenas plus the selected speculative lane.
+fn glm52_cap_bytes(
+    max_model_len: usize,
+    drafter: &Glm52Drafter,
+    prefill_only: bool,
+) -> Result<usize> {
+    let pool_slots = if prefill_only {
+        1
+    } else {
+        model::GLM52_MAX_BATCH_PER_RANK
+    };
+    Ok(glm52_arena_bytes(max_model_len, pool_slots, prefill_only)?
+        + if drafter.is_dspark() {
             crate::dspark::glm52_dspark_arena_bytes(max_model_len)
+        } else if drafter.is_mtp() {
+            crate::mtp::glm52_mtp_arena_bytes(max_model_len)?
         } else {
             0
         })
+}
+
+fn glm52_prefill_scratch_reservation(
+    prefill_only: Option<Glm52PrefillOnlyOptions>,
+) -> Result<usize> {
+    let Some(prefill) = prefill_only else {
+        return Ok(0);
+    };
+    prefill
+        .chunk_size
+        .checked_mul(GLM52_PREFILL_SCRATCH_BYTES_PER_TOKEN)
+        .and_then(|bytes| bytes.checked_add(GLM52_PREFILL_FIXED_SCRATCH_BYTES))
+        .context("GLM5.2 prefill scratch reservation overflow")
 }
 
 /// Decide the per-request context cap from the post-weight-load VRAM budget.
@@ -557,14 +694,17 @@ fn glm52_cap_bytes(max_model_len: usize, dspark_enabled: bool) -> Result<usize> 
 fn derive_max_model_len(
     requested: Option<usize>,
     min_free_vram_bytes: usize,
-    dspark_enabled: bool,
+    drafter: &Glm52Drafter,
+    prefill_scratch_bytes: usize,
+    prefill_only: bool,
 ) -> Result<Glm52ContextBudget> {
     let reserve_bytes = GLM52_VRAM_RESERVE_BYTES
-        + if dspark_enabled {
+        + if drafter.is_dspark() {
             GLM52_DSPARK_VRAM_RESERVE_BYTES
         } else {
             0
-        };
+        }
+        + prefill_scratch_bytes;
     let budget_bytes = min_free_vram_bytes.saturating_sub(reserve_bytes);
     let max_model_len = if let Some(requested) = requested {
         ensure!(
@@ -583,7 +723,7 @@ fn derive_max_model_len(
             requested / GLM52_MODEL_LEN_ALIGN * GLM52_MODEL_LEN_ALIGN,
             requested.next_multiple_of(GLM52_MODEL_LEN_ALIGN),
         );
-        let required = glm52_cap_bytes(requested, dspark_enabled)?;
+        let required = glm52_cap_bytes(requested, drafter, prefill_only)?;
         ensure!(
             required <= budget_bytes,
             "GLM5.2 --max-model-len {requested} needs {} of cache per rank but only {} \
@@ -600,7 +740,8 @@ fn derive_max_model_len(
         let (mut lo, mut hi) = (0, GLM52_MAX_CONTEXT / GLM52_MODEL_LEN_ALIGN);
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
-            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, dspark_enabled)? <= budget_bytes {
+            if glm52_cap_bytes(mid * GLM52_MODEL_LEN_ALIGN, drafter, prefill_only)? <= budget_bytes
+            {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -619,7 +760,7 @@ fn derive_max_model_len(
     };
     Ok(Glm52ContextBudget {
         max_model_len,
-        arena_bytes: glm52_cap_bytes(max_model_len, dspark_enabled)?,
+        arena_bytes: glm52_cap_bytes(max_model_len, drafter, prefill_only)?,
         reserve_bytes,
         budget_bytes,
     })
@@ -661,16 +802,17 @@ struct LoadedGlm52Runtime {
 fn start_engine(
     model_path: &Path,
     options: &Glm52LoadOptions,
-    dspark_path: Option<&Path>,
+    drafter: Glm52Drafter,
     requested_max_model_len: Option<usize>,
+    prefill_only: Option<Glm52PrefillOnlyOptions>,
     no_prefix_cache: bool,
     kv_offload: Option<Glm52KvOffloadOptions>,
     moe_topo: Glm52MoeTopo,
+    weight_staging: bool,
     dump_graph_png: Option<PathBuf>,
 ) -> Result<EngineHandle> {
-    let dspark_enabled = dspark_path.is_some();
-    let startup = validate_startup(model_path, options, moe_topo)?;
-    let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo)?;
+    let startup = validate_startup(model_path, options, moe_topo, drafter.is_mtp())?;
+    let loaded = load_rank_weights_to_gpu(model_path, &startup, moe_topo, weight_staging)?;
     log::info!(
         "GLM5.2 load-weight startup complete: ranks={}, rank_plan_tensors={:?}, rank_gpu_tensors={:?}, rank_gpu_bytes={:?}",
         startup.device_ordinals.len(),
@@ -693,13 +835,24 @@ fn start_engine(
     let budget = derive_max_model_len(
         requested_max_model_len,
         min_free_vram_bytes.saturating_sub(qa_kva_twin_bytes),
-        dspark_enabled,
+        &drafter,
+        glm52_prefill_scratch_reservation(prefill_only)?,
+        prefill_only.is_some(),
     )?;
+    if let Some(prefill) = prefill_only {
+        ensure!(
+            prefill.chunk_size <= budget.max_model_len,
+            "GLM5.2 prefill chunk size {} exceeds max_model_len {}; lower \
+             --glm52-prefill-chunk-size or raise --max-model-len",
+            prefill.chunk_size,
+            budget.max_model_len,
+        );
+    }
     let max_model_len = budget.max_model_len;
     log::info!(
         "GLM5.2 max_model_len={max_model_len} ({}): min rank free VRAM {} after weights \
          (qa|kv_a twins {} charged), cap-scaled arenas {} across {} slots{}, reserve {}, \
-         budget {}",
+         budget {}{}",
         if requested_max_model_len.is_some() {
             "--max-model-len"
         } else {
@@ -709,13 +862,21 @@ fn start_engine(
         ByteSize(qa_kva_twin_bytes as u64),
         ByteSize(budget.arena_bytes as u64),
         model::GLM52_MAX_BATCH_PER_RANK,
-        if dspark_enabled {
-            " (dspark lane included)"
+        if drafter.enabled() {
+            " (draft lane included)"
         } else {
             ""
         },
         ByteSize(budget.reserve_bytes as u64),
         ByteSize(budget.budget_bytes as u64),
+        prefill_only.map_or_else(String::new, |prefill| format!(
+            ", prefill-only chunk {} (scratch reservation {})",
+            prefill.chunk_size,
+            ByteSize(
+                glm52_prefill_scratch_reservation(Some(prefill))
+                    .expect("validated prefill scratch reservation") as u64
+            ),
+        )),
     );
 
     let eos_token_ids = read_eos_token_ids(model_path)?;
@@ -728,21 +889,29 @@ fn start_engine(
     // down, and the launch error surfaces only after the ~100 s DeepEP
     // device timeout. The TP8 LL rendezvous rejecting a topology (poison
     // pill, NVLink probe) is a real failure landing exactly in this window.
-    let rank_arenas =
-        match build_rank_models(&loaded.workers, max_model_len, moe_topo, dspark_enabled) {
-            Ok(rank_arenas) => rank_arenas,
-            Err(err) => {
-                for worker in &loaded.workers {
-                    let _ = worker.request_shutdown();
-                }
-                return Err(err);
+    let rank_arenas = match build_rank_models(
+        &loaded.workers,
+        max_model_len,
+        moe_topo,
+        &drafter,
+        prefill_only.map(|options| options.chunk_size),
+    ) {
+        Ok(rank_arenas) => rank_arenas,
+        Err(err) => {
+            for worker in &loaded.workers {
+                let _ = worker.request_shutdown();
             }
-        };
+            return Err(err);
+        }
+    };
     let vllm_compat = kv_offload
         .as_ref()
         .and_then(|opts| opts.vllm_compat.clone());
     let post_comm_startup = || -> Result<Option<Vec<OffloadEngine>>> {
-        if let Some(dspark_path) = dspark_path {
+        if prefill_only.is_some() {
+            preflight_prefill_kernels(&loaded.workers)?;
+        }
+        if let Some(dspark_path) = drafter.dspark_path() {
             load_dspark_drafters(&loaded.workers, dspark_path)?;
         }
         ensure_post_build_headroom(&loaded.workers)?;
@@ -761,7 +930,12 @@ fn start_engine(
         }
     };
     let logical_ranks = moe_topo.logical_rank_count();
-    let kv_total_blocks = glm52_pool_blocks(max_model_len) - 1;
+    let kv_pool_slots = if prefill_only.is_some() {
+        1
+    } else {
+        model::GLM52_MAX_BATCH_PER_RANK
+    };
+    let kv_total_blocks = glm52_pool_blocks(max_model_len, kv_pool_slots) - 1;
     let (load_txs, load_rxs): (Vec<_>, Vec<_>) = (0..logical_ranks)
         .map(|_| {
             watch::channel(LoadSnapshot {
@@ -785,7 +959,8 @@ fn start_engine(
                 submit_rx,
                 loaded.workers,
                 &eos_token_ids,
-                dspark_enabled,
+                drafter,
+                prefill_only.map(|prefill| prefill.chunk_size),
                 max_model_len,
                 no_prefix_cache,
                 offload,
@@ -837,6 +1012,37 @@ fn start_engine(
             block_size: GLM52_MODEL_LEN_ALIGN,
         })
         .with_load_watches(load_rxs))
+}
+
+fn preflight_prefill_kernels(workers: &[Glm52Worker]) -> Result<()> {
+    let started = Instant::now();
+    let responses = workers
+        .iter()
+        .map(|worker| {
+            worker.prefill_chunk_async(Glm52PrefillBatch {
+                token_ids: vec![0],
+                positions: vec![0],
+                request_indptr: vec![0, 1],
+                block_indptr: vec![0, 1],
+                block_ids: vec![0],
+                padding_block: 1,
+                slot_mapping: vec![0],
+                output_rows: Vec::new(),
+                sampling: Vec::new(),
+                seed: 0,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (rank, response) in responses.into_iter().enumerate() {
+        response.recv().map_err(|_| {
+            anyhow::anyhow!("GLM5.2 rank {rank} dropped its prefill preflight response")
+        })??;
+    }
+    log::info!(
+        "GLM5.2 TP4 prefill kernel preflight completed on all ranks in {:.3}s",
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 /// Load the DSpark drafter on every rank (rank-local, ~3.8 GB bf16 each —
@@ -902,12 +1108,15 @@ fn build_rank_models(
     workers: &[Glm52Worker],
     max_model_len: usize,
     moe_topo: Glm52MoeTopo,
-    dspark_enabled: bool,
+    drafter: &Glm52Drafter,
+    prefill_chunk_size: Option<usize>,
 ) -> Result<Vec<Vec<KvArena>>> {
     let build_started = Instant::now();
     let responses = workers
         .iter()
-        .map(|worker| worker.build_model_async(max_model_len, moe_topo, dspark_enabled))
+        .map(|worker| {
+            worker.build_model_async(max_model_len, moe_topo, drafter.clone(), prefill_chunk_size)
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut rank_arenas = Vec::with_capacity(responses.len());
     for (rank, response) in responses.into_iter().enumerate() {
@@ -927,6 +1136,19 @@ fn build_rank_models(
     let tp_exchange = moe_topo
         .uses_tensor_replicated_moe()
         .then(|| std::sync::Arc::new(crate::moe_tp::Glm52TpExchange::new(moe_topo.device_count())));
+    if tp_exchange.is_some() {
+        // The prefill-only NCCL all-reduce moves ~200 MB per layer; NCCL's
+        // default channel count on this single-host NVLink topology comes up
+        // as 2 and caps the ring at ~46 GB/s (measured 8.7 ms per 16K-row
+        // all-reduce). 16..32 channels restores ~5x (measured 1.6 ms).
+        // Set BEFORE any worker thread initializes its communicator; user
+        // overrides win. Single-threaded here, so set_var is race-free.
+        for (key, value) in [("NCCL_MIN_NCHANNELS", "16"), ("NCCL_MAX_NCHANNELS", "32")] {
+            if std::env::var_os(key).is_none() {
+                unsafe { std::env::set_var(key, value) };
+            }
+        }
+    }
     let responses = workers
         .iter()
         .map(|worker| worker.setup_comm_async(unique_id, moe_topo, tp_exchange.clone()))
@@ -1090,6 +1312,7 @@ fn validate_startup(
     model_path: &Path,
     options: &Glm52LoadOptions,
     moe_topo: Glm52MoeTopo,
+    native_mtp: bool,
 ) -> Result<StartupValidation> {
     let config_path = model_path.join("config.json");
     let content = std::fs::read_to_string(&config_path)
@@ -1131,7 +1354,7 @@ fn validate_startup(
     );
 
     let manifest = Glm52WeightManifest::from_model_dir(model_path)?;
-    let rank_bundles = manifest.all_rank_load_bundles(moe_topo)?;
+    let rank_bundles = manifest.all_rank_load_bundles(moe_topo, native_mtp)?;
     let mut rank_tensor_counts = Vec::with_capacity(rank_bundles.len());
     let mut rank_expert_ranges = Vec::with_capacity(rank_bundles.len());
     for bundle in &rank_bundles {
@@ -1164,6 +1387,7 @@ fn load_rank_weights_to_gpu(
     model_path: &Path,
     startup: &StartupValidation,
     moe_topo: Glm52MoeTopo,
+    weight_staging: bool,
 ) -> Result<LoadedGlm52Runtime> {
     let spawn_started = Instant::now();
     log::info!(
@@ -1204,7 +1428,7 @@ fn load_rank_weights_to_gpu(
     );
     let load_results = workers
         .iter()
-        .map(|worker| worker.load_weights_async(model_path, moe_topo))
+        .map(|worker| worker.load_weights_async(model_path, moe_topo, weight_staging))
         .collect::<Result<Vec<_>>>()?;
     let mut reports = Vec::with_capacity(load_results.len());
     for (rank, rx) in load_results.into_iter().enumerate() {
@@ -1262,34 +1486,49 @@ mod max_model_len_tests {
     /// Free VRAM that budgets exactly a `cap`-token context (exact ledger +
     /// reserve) — inverted through the same `glm52_cap_bytes` the derivation
     /// uses, so the tests exercise the policy, not a parallel formula.
-    fn free_for(cap: usize, dspark: bool) -> usize {
+    fn free_for(cap: usize, drafter: &Glm52Drafter, prefill_scratch_bytes: usize) -> usize {
         let reserve = GLM52_VRAM_RESERVE_BYTES
-            + if dspark {
+            + if drafter.is_dspark() {
                 GLM52_DSPARK_VRAM_RESERVE_BYTES
             } else {
                 0
-            };
-        reserve + glm52_cap_bytes(cap, dspark).expect("cap bytes")
+            }
+            + prefill_scratch_bytes;
+        reserve + glm52_cap_bytes(cap, drafter, false).expect("cap bytes")
     }
 
     #[test]
     fn derived_cap_is_aligned_and_scales_with_free_vram() {
-        let cap = derive_max_model_len(None, free_for(10_048, false), false)
-            .expect("derive")
-            .max_model_len;
+        let cap = derive_max_model_len(
+            None,
+            free_for(10_048, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
+            0,
+            false,
+        )
+        .expect("derive")
+        .max_model_len;
         assert_eq!(cap, 10_048, "exact budget for an aligned cap derives it");
         assert!(cap.is_multiple_of(GLM52_MODEL_LEN_ALIGN));
-        let larger = derive_max_model_len(None, free_for(50_048, false), false)
-            .expect("derive")
-            .max_model_len;
+        let larger = derive_max_model_len(
+            None,
+            free_for(50_048, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
+            0,
+            false,
+        )
+        .expect("derive")
+        .max_model_len;
         assert!(larger > cap);
     }
 
     #[test]
     fn dspark_lane_shrinks_the_derived_cap() {
-        let free = free_for(50_048, false);
-        let plain = derive_max_model_len(None, free, false).expect("derive");
-        let dspark = derive_max_model_len(None, free, true).expect("derive");
+        let free = free_for(50_048, &Glm52Drafter::None, 0);
+        let plain =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("derive");
+        let dspark_drafter = Glm52Drafter::Dspark(PathBuf::from("draft"));
+        let dspark = derive_max_model_len(None, free, &dspark_drafter, 0, false).expect("derive");
         assert!(
             dspark.max_model_len < plain.max_model_len,
             "dspark cap-scaled cost must shrink the cap"
@@ -1297,22 +1536,53 @@ mod max_model_len_tests {
     }
 
     #[test]
+    fn native_mtp_lane_shrinks_the_derived_cap() {
+        let free = free_for(50_048, &Glm52Drafter::None, 0);
+        let plain =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("derive");
+        let native_mtp =
+            derive_max_model_len(None, free, &Glm52Drafter::NativeMtp, 0, false).expect("derive");
+        assert!(
+            native_mtp.max_model_len < plain.max_model_len,
+            "native MTP cap-scaled KV must shrink the target context cap"
+        );
+        assert!(
+            glm52_cap_bytes(50_048, &Glm52Drafter::NativeMtp, false).expect("MTP cap bytes")
+                > glm52_cap_bytes(50_048, &Glm52Drafter::None, false).expect("plain cap bytes"),
+            "native MTP must be represented in the exact memory ledger"
+        );
+    }
+
+    #[test]
     fn derived_cap_never_exceeds_the_checkpoint_ceiling() {
-        let budget = derive_max_model_len(None, usize::MAX / 2, false).expect("derive");
+        let budget = derive_max_model_len(None, usize::MAX / 2, &Glm52Drafter::None, 0, false)
+            .expect("derive");
         assert_eq!(budget.max_model_len, GLM52_MAX_CONTEXT);
     }
 
     #[test]
     fn too_little_vram_fails_instead_of_serving_a_toy_cap() {
-        let err = derive_max_model_len(None, free_for(1024, false), false)
-            .expect_err("sub-minimum cap must fail");
+        let err = derive_max_model_len(
+            None,
+            free_for(1024, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
+            0,
+            false,
+        )
+        .expect_err("sub-minimum cap must fail");
         assert!(err.to_string().contains("context cap"), "{err}");
     }
 
     #[test]
     fn unaligned_requested_cap_is_rejected_with_the_nearest_valid_values() {
-        let err = derive_max_model_len(Some(5000), free_for(100_032, false), false)
-            .expect_err("unaligned cap must fail, not silently round");
+        let err = derive_max_model_len(
+            Some(5000),
+            free_for(100_032, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
+            0,
+            false,
+        )
+        .expect_err("unaligned cap must fail, not silently round");
         let message = err.to_string();
         assert!(
             message.contains("4992") && message.contains("5056"),
@@ -1322,14 +1592,66 @@ mod max_model_len_tests {
 
     #[test]
     fn requested_cap_beyond_the_budget_fails_at_launch() {
-        let err = derive_max_model_len(Some(99_968), free_for(10_048, false), false)
-            .expect_err("over-budget cap must fail");
+        let err = derive_max_model_len(
+            Some(99_968),
+            free_for(10_048, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
+            0,
+            false,
+        )
+        .expect_err("over-budget cap must fail");
         assert!(err.to_string().contains("--max-model-len"), "{err}");
     }
 
     #[test]
     fn requested_cap_below_the_minimum_fails() {
-        derive_max_model_len(Some(1024), free_for(100_032, false), false)
-            .expect_err("sub-minimum cap must fail");
+        derive_max_model_len(
+            Some(1024),
+            free_for(100_032, &Glm52Drafter::None, 0),
+            &Glm52Drafter::None,
+            0,
+            false,
+        )
+        .expect_err("sub-minimum cap must fail");
+    }
+
+    #[test]
+    fn shared_prefill_pool_outgrows_eight_slot_decode_cap() {
+        let prefill = Glm52PrefillOnlyOptions {
+            chunk_size: GLM52_DEFAULT_PREFILL_CHUNK_SIZE,
+        };
+        let scratch =
+            glm52_prefill_scratch_reservation(Some(prefill)).expect("prefill reservation");
+        let free = free_for(100_032, &Glm52Drafter::None, 0);
+        let decode =
+            derive_max_model_len(None, free, &Glm52Drafter::None, 0, false).expect("decode budget");
+        let prefill = derive_max_model_len(None, free, &Glm52Drafter::None, scratch, true)
+            .expect("prefill budget");
+        assert!(
+            prefill.max_model_len > decode.max_model_len,
+            "one shared prefill pool must fit a larger per-request cap than eight decode maxima"
+        );
+        assert_eq!(prefill.reserve_bytes, GLM52_VRAM_RESERVE_BYTES + scratch);
+    }
+
+    #[test]
+    fn decode_pool_rounds_each_slots_dangling_token_page() {
+        let cap = 4096usize;
+        let pages_per_slot = (cap + 1).div_ceil(GLM52_MODEL_LEN_ALIGN);
+        assert_eq!(
+            glm52_pool_blocks(cap, model::GLM52_MAX_BATCH_PER_RANK),
+            model::GLM52_MAX_BATCH_PER_RANK * pages_per_slot + 1
+        );
+    }
+
+    #[test]
+    fn default_prefill_chunk_reservation_is_stable() {
+        let bytes = glm52_prefill_scratch_reservation(Some(Glm52PrefillOnlyOptions {
+            chunk_size: GLM52_DEFAULT_PREFILL_CHUNK_SIZE,
+        }))
+        .expect("prefill reservation");
+        // 3 GiB fixed (row-block MoE scratch + sub-tile buffers) plus
+        // 160 KiB x 16384 chunk rows of chunk-scale activations.
+        assert_eq!(bytes, 5_905_580_032);
     }
 }

@@ -1,12 +1,17 @@
 //! Device tensor types and CUDA context.
 
-use anyhow::{Result, anyhow};
-use cudarc::driver::sys::CUstream;
-use cudarc::driver::{CudaContext, CudaSlice, CudaStream};
-use half::bf16;
-use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::sync::Arc;
+
+use anyhow::Result;
+use anyhow::anyhow;
+use cudarc::driver::CudaContext;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::CudaStream;
+use cudarc::driver::sys::CUstream;
+use half::bf16;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::ffi;
 
@@ -138,8 +143,8 @@ impl AxisSpec {
 /// Erased tensor metadata for schedules, reports, and future instrumentation.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct TensorSpec {
-    pub dtype: String,
-    pub layout: String,
+    pub(crate) dtype: String,
+    pub(crate) layout: String,
     pub axes: Vec<AxisSpec>,
 }
 
@@ -183,7 +188,7 @@ pub struct TensorArg {
 }
 
 impl TensorArg {
-    pub fn new(name: impl Into<String>, spec: TensorSpec) -> Self {
+    fn new(name: impl Into<String>, spec: TensorSpec) -> Self {
         Self {
             name: name.into(),
             spec,
@@ -203,7 +208,7 @@ pub struct AttrSpec {
 }
 
 impl AttrSpec {
-    pub fn new(name: impl Into<String>, value: String) -> Self {
+    fn new(name: impl Into<String>, value: String) -> Self {
         Self {
             name: name.into(),
             value,
@@ -540,14 +545,6 @@ impl<const DIM: usize> GpuTensor<DIM> {
         Ok(Self { data, seq_len })
     }
 
-    pub const fn dim() -> usize {
-        DIM
-    }
-
-    pub fn num_elements(&self) -> usize {
-        DIM * self.seq_len
-    }
-
     pub fn from_device_matrix_rows(m: DeviceMatrix) -> Result<Self> {
         anyhow::ensure!(
             m.cols == DIM,
@@ -560,27 +557,11 @@ impl<const DIM: usize> GpuTensor<DIM> {
             seq_len: m.rows,
         })
     }
-
-    pub fn as_untyped(&self) -> HiddenStatesRef<'_> {
-        HiddenStatesRef {
-            data: &self.data,
-            hidden_dim: DIM,
-            seq_len: self.seq_len,
-        }
-    }
-
-    pub fn as_untyped_mut(&mut self) -> HiddenStatesMut<'_> {
-        HiddenStatesMut {
-            data: &mut self.data,
-            hidden_dim: DIM,
-            seq_len: self.seq_len,
-        }
-    }
 }
 
 /// bf16 weight matrix with compile-time dimensions: `[OUT, IN]` row-major.
 pub struct GpuWeight<const OUT: usize, const IN: usize> {
-    pub data: CudaSlice<bf16>,
+    pub(crate) data: CudaSlice<bf16>,
 }
 
 impl<const OUT: usize, const IN: usize> GpuWeight<OUT, IN> {
@@ -594,14 +575,6 @@ impl<const OUT: usize, const IN: usize> GpuWeight<OUT, IN> {
             m.cols,
         );
         Ok(Self { data: m.data })
-    }
-
-    pub fn as_untyped_ref(&self) -> DeviceMatrixRef<'_> {
-        DeviceMatrixRef {
-            data: &self.data,
-            rows: OUT,
-            cols: IN,
-        }
     }
 }
 
@@ -660,20 +633,6 @@ pub struct HiddenStatesRef<'a> {
     pub data: &'a CudaSlice<bf16>,
     pub hidden_dim: usize,
     pub seq_len: usize,
-}
-
-/// Non-owning mutable reference to `HiddenStates`-shaped data.
-pub struct HiddenStatesMut<'a> {
-    pub data: &'a mut CudaSlice<bf16>,
-    pub hidden_dim: usize,
-    pub seq_len: usize,
-}
-
-/// Non-owning reference to `DeviceMatrix`-shaped data.
-pub struct DeviceMatrixRef<'a> {
-    pub data: &'a CudaSlice<bf16>,
-    pub rows: usize,
-    pub cols: usize,
 }
 
 #[cfg(test)]

@@ -1,7 +1,9 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 use std::thread;
@@ -429,6 +431,23 @@ fn nvcc_accepts_gencode(nvcc: &str, compute: &str, sm: &str) -> bool {
             false
         }
     }
+}
+
+fn glm52_fp8_gemm_arch_args(normalized_sms: &[String], nvcc: &str) -> Option<Vec<String>> {
+    let mut args = Vec::new();
+    for sm in normalized_sms {
+        let numeric = sm_numeric_prefix(sm)?;
+        if !(100..120).contains(&numeric) {
+            continue;
+        }
+        let accelerated = format!("{numeric}a");
+        if !nvcc_accepts_gencode(nvcc, &accelerated, &accelerated) {
+            continue;
+        }
+        args.push("-gencode".to_string());
+        args.push(format!("arch=compute_{accelerated},code=sm_{accelerated}"));
+    }
+    (!args.is_empty()).then_some(args)
 }
 
 fn glm52_flashmla_sparse_arch_args(normalized_sms: &[String], nvcc: &str) -> Vec<String> {
@@ -1098,7 +1117,78 @@ fn generate_triton_artifacts(
 
     let func_name = func_name.expect("Triton generator did not print FUNC_NAME");
     let c_path = c_path.expect("Triton generator did not print C_PATH");
+    patch_triton_aot_per_device_handles(&c_path);
     (func_name, c_path)
+}
+
+fn patch_triton_aot_per_device_handles(c_path: &Path) {
+    let src = fs::read_to_string(c_path).expect("failed to read generated Triton C source");
+    let module_name = src
+        .lines()
+        .find_map(|line| line.strip_prefix("CUmodule "))
+        .and_then(|rest| rest.strip_suffix(" = NULL;"))
+        .map(str::to_string)
+        .expect("generated Triton C source should declare one CUmodule");
+    let function_name = src
+        .lines()
+        .find_map(|line| line.strip_prefix("CUfunction "))
+        .and_then(|rest| rest.strip_suffix(" = NULL;"))
+        .map(str::to_string)
+        .expect("generated Triton C source should declare one CUfunction");
+
+    let device_table_define = "#define OPENINFER_TRITON_DEVICE_TABLE_SIZE 16\n\n";
+    let device_helper = "\n\nstatic CUresult openinfer_triton_current_device(CUdevice *dev) {\n  CUresult err = cuCtxGetDevice(dev);\n  if (err != CUDA_SUCCESS) {\n    return err;\n  }\n  if (*dev < 0 || *dev >= OPENINFER_TRITON_DEVICE_TABLE_SIZE) {\n    return CUDA_ERROR_INVALID_DEVICE;\n  }\n  return CUDA_SUCCESS;\n}";
+
+    let patched = src
+        .replace(
+            &format!("CUmodule {module_name} = NULL;"),
+            &format!(
+                "{device_table_define}CUmodule {module_name}[OPENINFER_TRITON_DEVICE_TABLE_SIZE] = {{0}};"
+            ),
+        )
+        .replace(
+            &format!("CUfunction {function_name} = NULL;"),
+            &format!(
+                "CUfunction {function_name}[OPENINFER_TRITON_DEVICE_TABLE_SIZE] = {{0}};{device_helper}"
+            ),
+        )
+        .replace(
+            &format!("CUDA_CHECK(cuModuleUnload({module_name}));"),
+            &format!(
+                "CUdevice dev = 0;\n    CUDA_CHECK(openinfer_triton_current_device(&dev));\n    if ({module_name}[dev] != NULL) {{\n      CUDA_CHECK(cuModuleUnload({module_name}[dev]));\n      {module_name}[dev] = NULL;\n      {function_name}[dev] = NULL;\n    }}"
+            ),
+        );
+    let patched = patched
+        .replace(
+            &format!("cuModuleLoadData(&{module_name}, bin)"),
+            &format!("cuModuleLoadData(&{module_name}[dev], bin)"),
+        )
+        .replace(
+            &format!("cuModuleGetFunction(&{function_name}, {module_name}, "),
+            &format!("cuModuleGetFunction(&{function_name}[dev], {module_name}[dev], "),
+        )
+        .replace(
+            &format!("cuFuncSetCacheConfig({function_name}, "),
+            &format!("cuFuncSetCacheConfig({function_name}[dev], "),
+        )
+        .replace(
+            &format!("cuFuncSetAttribute({function_name}, "),
+            &format!("cuFuncSetAttribute({function_name}[dev], "),
+        )
+        .replace(
+            &format!("if ({function_name} == NULL)\n       load_"),
+            &format!("CUdevice dev = 0;\n    CUDA_CHECK(openinfer_triton_current_device(&dev));\n    if ({function_name}[dev] == NULL)\n       load_"),
+        )
+        .replace(
+            &format!("return cuLaunchKernel({function_name}, "),
+            &format!("return cuLaunchKernel({function_name}[dev], "),
+        )
+        .replace(
+            "int dev = 0;\n    void *bin =",
+            "CUdevice dev = 0;\n    CUDA_CHECK(openinfer_triton_current_device(&dev));\n    void *bin =",
+        );
+
+    fs::write(c_path, patched).expect("failed to patch generated Triton C source");
 }
 
 fn write_wrapper(generated_c: &Path, file_name: &str, wrapper_src: String) -> PathBuf {
@@ -1337,7 +1427,7 @@ fn main() {
     let moe_enabled = cfg!(feature = "moe");
     let glm52_enabled = cfg!(feature = "glm52");
     let kimi_k2_enabled = cfg!(feature = "kimi-k2");
-    let qwen35_enabled = cfg!(feature = "qwen35-4b");
+    let qwen35_enabled = cfg!(feature = "qwen35");
     if glm52_enabled {
         generate_glm52_trtllm_fmha_cubins(&crate_root(), &out_dir);
     }
@@ -1457,7 +1547,14 @@ fn main() {
             "-I".to_string(),
             csrc_dir.to_string_lossy().to_string(),
         ];
-        if stem == "glm52_flashmla_sparse" {
+        if stem == "glm52_fp8_gemm" {
+            if let Some(args) = glm52_fp8_gemm_arch_args(&nvcc_sm_targets, &nvcc) {
+                nvcc_args.extend(args);
+                nvcc_args.push("-DGLM52_FP8_GEMM_SM100A".to_string());
+            } else {
+                nvcc_args.extend(arch_args.clone());
+            }
+        } else if stem == "glm52_flashmla_sparse" {
             nvcc_args.extend(glm52_flashmla_sparse_arch_args(&nvcc_sm_targets, &nvcc));
         } else if stem == "glm52_deepgemm_mqa" {
             if let Some((mqa_args, mqa_define)) =
@@ -1592,6 +1689,21 @@ fn main() {
                     .join("kerutils/include")
                     .to_string_lossy()
                     .to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass.to_string_lossy().to_string(),
+                "-I".to_string(),
+                flashinfer.cutlass_util.to_string_lossy().to_string(),
+            ]);
+        } else if stem == "glm52_fp8_gemm" {
+            for dir in &flashinfer.cccl {
+                nvcc_args.extend(["-I".to_string(), dir.to_string_lossy().to_string()]);
+            }
+            nvcc_args.extend([
+                "--std=c++17".to_string(),
+                "--expt-relaxed-constexpr".to_string(),
+                "--expt-extended-lambda".to_string(),
+                "-I".to_string(),
+                flashinfer.include.to_string_lossy().to_string(),
                 "-I".to_string(),
                 flashinfer.cutlass.to_string_lossy().to_string(),
                 "-I".to_string(),
@@ -1808,7 +1920,7 @@ fn main() {
         compile_triton_aot_kernels(&cuda_include, &out_dir, &sm_targets);
     } else {
         println!(
-            "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35-4b` feature to build them (needs Python + Triton at build time)"
+            "cargo:warning=Qwen3.5 Triton AOT kernels disabled; enable the openinfer-kernels `qwen35` feature to build them (needs Python + Triton at build time)"
         );
     }
 

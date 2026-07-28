@@ -1,13 +1,17 @@
-use anyhow::{Result, anyhow, ensure};
-use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut};
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::ensure;
+use cudarc::driver::CudaSlice;
+use cudarc::driver::DevicePtr;
+use cudarc::driver::DevicePtrMut;
 use half::bf16;
 
 use crate::ffi;
 use crate::tensor::DeviceContext;
 
 pub const GLM52_INDEXER_HEAD_DIM: usize = 128;
-pub const GLM52_INDEXER_QUANT_BLOCK_SIZE: usize = 128;
-pub const GLM52_INDEXER_SCALE_BYTES_PER_TOKEN: usize = 4;
+const GLM52_INDEXER_QUANT_BLOCK_SIZE: usize = 128;
+const GLM52_INDEXER_SCALE_BYTES_PER_TOKEN: usize = 4;
 pub const GLM52_INDEXER_TOPK: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,11 +22,11 @@ pub struct Glm52IndexerCacheLayout {
 }
 
 impl Glm52IndexerCacheLayout {
-    pub fn min_block_stride_bytes(self) -> usize {
+    fn min_block_stride_bytes(self) -> usize {
         self.cache_block_size * (GLM52_INDEXER_HEAD_DIM + GLM52_INDEXER_SCALE_BYTES_PER_TOKEN)
     }
 
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.cache_blocks > 0,
             "GLM5.2 indexer cache_blocks must be positive"
@@ -55,7 +59,7 @@ pub struct Glm52IndexerCacheInsert {
 }
 
 impl Glm52IndexerCacheInsert {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.tokens > 0,
             "GLM5.2 indexer cache insert tokens must be positive"
@@ -122,7 +126,7 @@ pub struct Glm52IndexerLocalTopKToSlots {
 }
 
 impl Glm52IndexerLocalTopKToSlots {
-    pub fn validate(self) -> Result<()> {
+    fn validate(self) -> Result<()> {
         ensure!(
             self.num_tokens > 0,
             "GLM5.2 indexer local_topk_to_slots num_tokens must be positive"
@@ -292,10 +296,7 @@ pub fn glm52_indexer_weights_fold_launch(
     out: &mut CudaSlice<f32>,
 ) -> Result<()> {
     let heads = out.len();
-    ensure!(
-        heads > 0 && heads <= 1024,
-        "GLM5.2 indexer weights fold heads {heads} outside 1..=1024"
-    );
+    ensure!(heads > 0, "GLM5.2 indexer weights fold is empty");
     ensure!(
         weights.len() >= heads && q_scale.len() >= heads,
         "GLM5.2 indexer weights fold inputs too small: weights {}, q_scale {} (need {heads})",
@@ -319,4 +320,114 @@ pub fn glm52_indexer_weights_fold_launch(
     result
         .result()
         .map_err(|err| anyhow!("GLM5.2 indexer weights fold launch failed: {err}"))
+}
+
+/// Gather the paged fp8 indexer K cache into the compact unpaged layout
+/// (`[total_kv, 128]` fp8 + `[total_kv]` f32 scales) the unpaged MQA logits
+/// kernel consumes, and emit the position -> global-KV-slot LUT the top-k
+/// slot conversion reads. Request `r` gathers `seq_lens[r]` tokens through
+/// its `block_table` row into rows starting at `out_offsets[r]`.
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_indexer_k_gather_launch(
+    ctx: &DeviceContext,
+    num_requests: usize,
+    table_stride: usize,
+    block_size: usize,
+    block_stride_bytes: usize,
+    paged_cache: &CudaSlice<u8>,
+    block_table: &impl DevicePtr<i32>,
+    seq_lens: &impl DevicePtr<i32>,
+    out_offsets: &impl DevicePtr<i32>,
+    k_out: &mut CudaSlice<u8>,
+    scale_out: &mut CudaSlice<f32>,
+    slot_out: &mut CudaSlice<i32>,
+) -> Result<()> {
+    ensure!(
+        num_requests > 0
+            && table_stride > 0
+            && block_size > 0
+            && block_stride_bytes >= block_size * (GLM52_INDEXER_HEAD_DIM + 4)
+            && block_table.len() >= num_requests * table_stride
+            && seq_lens.len() >= num_requests
+            && out_offsets.len() >= num_requests,
+        "GLM5.2 indexer K gather shape is invalid"
+    );
+    let (cache_ptr, _cache_guard) = paged_cache.device_ptr(&ctx.stream);
+    let (table_ptr, _table_guard) = block_table.device_ptr(&ctx.stream);
+    let (lens_ptr, _lens_guard) = seq_lens.device_ptr(&ctx.stream);
+    let (offsets_ptr, _offsets_guard) = out_offsets.device_ptr(&ctx.stream);
+    let (k_ptr, _k_guard) = k_out.device_ptr_mut(&ctx.stream);
+    let (scale_ptr, _scale_guard) = scale_out.device_ptr_mut(&ctx.stream);
+    let (slot_ptr, _slot_guard) = slot_out.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_k_gather_cuda(
+            cache_ptr as *const u8,
+            table_ptr as *const i32,
+            lens_ptr as *const i32,
+            offsets_ptr as *const i32,
+            k_ptr as *mut u8,
+            scale_ptr as *mut f32,
+            slot_ptr as *mut i32,
+            num_requests as i32,
+            table_stride as i32,
+            block_size as i32,
+            block_stride_bytes as i64,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer K gather launch failed: {err}"))
+}
+
+/// Convert per-query top-k offsets (relative to the query's request segment)
+/// into global KV slots through the gather LUT; `-1`/out-of-range offsets
+/// stay `-1` and `topk_lens` counts the valid picks (same semantics as the
+/// paged block-table twin).
+#[allow(clippy::too_many_arguments)]
+pub fn glm52_indexer_topk_to_slots_lut_launch(
+    ctx: &DeviceContext,
+    rows: usize,
+    topk: usize,
+    topk_offsets: &impl DevicePtr<i32>,
+    context_lens: &impl DevicePtr<i32>,
+    cu_seqlen_ks: &impl DevicePtr<i32>,
+    slot_lut: &impl DevicePtr<i32>,
+    global_slots: &mut impl DevicePtrMut<i32>,
+    topk_lens: &mut impl DevicePtrMut<i32>,
+) -> Result<()> {
+    ensure!(
+        rows > 0
+            && topk > 0
+            && topk <= GLM52_INDEXER_TOPK
+            && topk_offsets.len() >= rows * topk
+            && context_lens.len() >= rows
+            && cu_seqlen_ks.len() >= rows
+            && slot_lut.len() > 0
+            && global_slots.len() >= rows * topk
+            && topk_lens.len() >= rows,
+        "GLM5.2 indexer top-k LUT conversion buffers are invalid"
+    );
+    let (offsets_ptr, _offsets_guard) = topk_offsets.device_ptr(&ctx.stream);
+    let (lens_ptr, _lens_guard) = context_lens.device_ptr(&ctx.stream);
+    let (ks_ptr, _ks_guard) = cu_seqlen_ks.device_ptr(&ctx.stream);
+    let (lut_ptr, _lut_guard) = slot_lut.device_ptr(&ctx.stream);
+    let (slots_ptr, _slots_guard) = global_slots.device_ptr_mut(&ctx.stream);
+    let (out_lens_ptr, _out_lens_guard) = topk_lens.device_ptr_mut(&ctx.stream);
+    let result = unsafe {
+        ffi::glm52_indexer_topk_to_slots_lut_cuda(
+            offsets_ptr as *const i32,
+            lens_ptr as *const i32,
+            ks_ptr as *const i32,
+            lut_ptr as *const i32,
+            slots_ptr as *mut i32,
+            out_lens_ptr as *mut i32,
+            rows as i32,
+            topk as i32,
+            ctx.stream.cu_stream(),
+        )
+    };
+    result
+        .result()
+        .map_err(|err| anyhow!("GLM5.2 indexer top-k LUT conversion launch failed: {err}"))
 }

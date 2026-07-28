@@ -6,12 +6,16 @@
 
 use openinfer_sample::SamplingParams;
 
-use crate::config::GLM52_VOCAB;
-use crate::model::{GLM52_DECODE_BUCKETS, GLM52_MAX_BATCH_PER_RANK, Glm52StepKv, Glm52StepShape};
-use crate::runner::{Glm52RowSample, Glm52StepFlags};
-
+use super::PAGE;
+use super::RankSlots;
 use super::slot::Glm52SlotState;
-use super::{PAGE, RankSlots};
+use crate::config::GLM52_VOCAB;
+use crate::model::GLM52_DECODE_BUCKETS;
+use crate::model::GLM52_MAX_BATCH_PER_RANK;
+use crate::model::Glm52StepKv;
+use crate::model::Glm52StepShape;
+use crate::runner::Glm52RowSample;
+use crate::runner::Glm52StepFlags;
 
 /// Build the all-padding step KV used while pre-capturing graph buckets.
 pub(super) fn padding_step_kv(
@@ -70,35 +74,7 @@ pub(super) fn plan_step_shapes(
     wants
         .iter()
         .map(|row| {
-            // Every active slot gets one row, then leftover capacity extends
-            // spans one row per slot per round (round-robin), so two
-            // mid-prefill slots on one rank drain in parallel instead of the
-            // lowest slot starving the later one down to a liveness row for
-            // its whole prefill.
-            let mut spans = [0usize; GLM52_MAX_BATCH_PER_RANK];
-            let mut used = 0usize;
-            for (slot, &want) in row.iter().enumerate() {
-                if want > 0 {
-                    // bucket >= this rank's capped demand >= its active count
-                    // by construction; a dropped active would stall forever.
-                    assert!(used < bucket, "bucket {bucket} smaller than active count");
-                    spans[slot] = 1;
-                    used += 1;
-                }
-            }
-            loop {
-                let mut gave = false;
-                for (slot, &want) in row.iter().enumerate() {
-                    if used < bucket && spans[slot] > 0 && spans[slot] < want {
-                        spans[slot] += 1;
-                        used += 1;
-                        gave = true;
-                    }
-                }
-                if !gave || used == bucket {
-                    break;
-                }
-            }
+            let spans = plan_prefill_spans(row, bucket);
             let mut slots: [u8; GLM52_MAX_BATCH_PER_RANK] = std::array::from_fn(|slot| slot as u8);
             let mut dst = 0usize;
             for (slot, &span) in spans.iter().enumerate() {
@@ -153,14 +129,14 @@ pub(super) fn launch_ahead_flags(
     leased_shapes: Option<&[Glm52StepShape]>,
     slots_changed: bool,
     pending_empty: bool,
-    dspark_enabled: bool,
+    drafter_enabled: bool,
     offload_enabled: bool,
     slots: &[RankSlots],
     max_model_len: usize,
 ) -> Glm52StepFlags {
     let consume = !slots_changed && leased_shapes == Some(shapes);
     let lease = pending_empty
-        && !dspark_enabled
+        && !drafter_enabled
         && !offload_enabled
         && slots
             .iter()
@@ -168,7 +144,11 @@ pub(super) fn launch_ahead_flags(
             .all(|active| {
                 takes_argmax(&active.req.params) && lease_ok(&active.state, max_model_len)
             });
-    Glm52StepFlags { consume, lease }
+    Glm52StepFlags {
+        consume,
+        lease,
+        eager: false,
+    }
 }
 
 /// Whether a request's committed rows take the fused argmax — the shared
@@ -177,7 +157,7 @@ pub(super) fn launch_ahead_flags(
 /// bf16-tied maxima stochastic, diverging from `select_batch`'s semantics).
 /// The SAME predicate gates lease-granting and sampling-row collection, which
 /// is what keeps "sampled row never rides a launch-ahead step" structural.
-fn takes_argmax(params: &SamplingParams) -> bool {
+pub(super) fn takes_argmax(params: &SamplingParams) -> bool {
     openinfer_sample::effectively_greedy(params, GLM52_VOCAB)
 }
 
@@ -237,12 +217,52 @@ pub(super) fn feed_wants(slots: &[RankSlots]) -> Vec<[usize; GLM52_MAX_BATCH_PER
         .collect()
 }
 
+/// Split one prefill launch across active requests without exceeding the
+/// large-M row budget. Every active request gets one row before remaining
+/// rows are distributed round-robin.
+pub(super) fn plan_prefill_spans(
+    wants: &[usize; GLM52_MAX_BATCH_PER_RANK],
+    max_rows: usize,
+) -> [usize; GLM52_MAX_BATCH_PER_RANK] {
+    assert!(max_rows > 0, "prefill row budget must be positive");
+    let mut spans = [0; GLM52_MAX_BATCH_PER_RANK];
+    let mut used = 0;
+    for (slot, &want) in wants.iter().enumerate() {
+        if want > 0 && used < max_rows {
+            spans[slot] = 1;
+            used += 1;
+        }
+    }
+    while used < max_rows {
+        let mut advanced = false;
+        for (slot, &want) in wants.iter().enumerate() {
+            if used == max_rows {
+                break;
+            }
+            if spans[slot] > 0 && spans[slot] < want {
+                spans[slot] += 1;
+                used += 1;
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    spans
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scheduler::ActiveRequest;
     use crate::scheduler::slot::Glm52StepOutcome;
-    use crate::scheduler::testkit::{EOS, commit, request, sampled, state, test_kv};
+    use crate::scheduler::testkit::EOS;
+    use crate::scheduler::testkit::commit;
+    use crate::scheduler::testkit::request;
+    use crate::scheduler::testkit::sampled;
+    use crate::scheduler::testkit::state;
+    use crate::scheduler::testkit::test_kv;
 
     fn shape(bucket: usize, active_rows: usize) -> Glm52StepShape {
         let mut slots = [0u8; GLM52_MAX_BATCH_PER_RANK];
@@ -626,5 +646,21 @@ mod tests {
             forwarded(&plan_step_shapes(&wants, false))[0],
             (8, vec![0, 3, 3, 3, 3, 6, 6, 6])
         );
+    }
+
+    #[test]
+    fn large_m_prefill_budget_is_shared_across_requests() {
+        let mut wants = [0; GLM52_MAX_BATCH_PER_RANK];
+        wants[0] = 20_000;
+        wants[3] = 20_000;
+        wants[6] = 4;
+        let spans = plan_prefill_spans(&wants, 16_384);
+        assert_eq!(spans.iter().sum::<usize>(), 16_384);
+        assert_eq!(spans[6], 4);
+        assert!(
+            spans[0].abs_diff(spans[3]) <= 1,
+            "long requests must share the remaining rows: {spans:?}"
+        );
+        assert_eq!(plan_prefill_spans(&wants, 2), [1, 0, 0, 1, 0, 0, 0, 0]);
     }
 }
