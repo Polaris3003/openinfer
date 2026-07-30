@@ -113,6 +113,24 @@ fn validate_qwen35_max_batch(model_type: ModelType, max_batch: usize) -> Result<
     Ok(())
 }
 
+fn validate_qwen3_projection_fusion(
+    model_type: ModelType,
+    qkv: cli::CliProjectionFusion,
+    gate_up: cli::CliProjectionFusion,
+) -> Result<()> {
+    #[cfg(feature = "qwen3")]
+    if matches!(model_type, ModelType::Qwen3) {
+        return Ok(());
+    }
+    #[cfg(not(feature = "qwen3"))]
+    let _ = model_type;
+    anyhow::ensure!(
+        qkv.is_auto() && gate_up.is_auto(),
+        "--qwen3-qkv-fusion/--qwen3-gate-up-fusion are supported only for Qwen3"
+    );
+    Ok(())
+}
+
 fn dispatch(
     cli: &Cli,
     model_type: ModelType,
@@ -160,6 +178,7 @@ fn main() -> Result<()> {
     debug!("Detected model type: {:?}", model_type);
     validate_qwen35_scheduler_policy(model_type, cli.qwen35_scheduler_policy)?;
     validate_qwen35_max_batch(model_type, cli.max_batch)?;
+    validate_qwen3_projection_fusion(model_type, cli.qwen3_qkv_fusion, cli.qwen3_gate_up_fusion)?;
     let load_start = Instant::now();
 
     // Shared tail for every scheduler-backed model: load the tokenizer, stamp
@@ -221,23 +240,28 @@ fn main() -> Result<()> {
                 .max_prefill_tokens
                 .filter(|&v| v > 0)
                 .unwrap_or(openinfer_qwen3::DEFAULT_MAX_PREFILL_TOKENS);
-            let handle = openinfer_qwen3::start_engine_with_offload(
+            let handle = openinfer_qwen3::launch_with_seed(
                 Path::new(&cli.model_path),
-                EngineLoadOptions {
-                    enable_cuda_graph: cli.cuda_graph,
-                    device_ordinals: vec![0],
-                    parallel_config: None,
-                    ep_backend: EpBackend::Nccl,
-                    seed: command_seed(&cli),
+                openinfer_qwen3::Qwen3LaunchOptions {
+                    device_ordinal: 0,
+                    tp_size: cli.tp_size,
+                    cuda_graph: cli.cuda_graph,
+                    dump_graph_png: None,
+                    offload: openinfer_qwen3::Qwen3OffloadOptions::disabled(),
+                    no_prefix_cache: false,
+                    max_prefill_tokens,
+                    memory: openinfer_qwen3::Qwen3MemoryOptions::default(),
+                    lora: None,
+                    decode_overlap: openinfer_qwen3::DecodeOverlap::Off,
+                    batch_invariant: false,
+                    projection_fusion: openinfer_qwen3::Qwen3ProjectionFusionOptions {
+                        qkv: cli.qwen3_qkv_fusion.resolve(),
+                        gate_up: cli.qwen3_gate_up_fusion.resolve(),
+                    },
+                    dflash_draft_model_path: None,
+                    enable_kv_events: false,
                 },
-                openinfer_qwen3::Qwen3OffloadOptions::disabled(),
-                false,
-                max_prefill_tokens,
-                openinfer_qwen3::Qwen3MemoryOptions::default(),
-                openinfer_qwen3::DecodeOverlap::Off,
-                false,
-                None,
-                false,
+                command_seed(&cli),
             )?;
             finish(handle, cli.cuda_graph)
         }

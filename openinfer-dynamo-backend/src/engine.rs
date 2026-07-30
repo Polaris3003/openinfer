@@ -156,6 +156,7 @@ impl OpeninferBackend {
             lora: None,
             decode_overlap: DecodeOverlap::Off,
             batch_invariant: false,
+            projection_fusion: openinfer_qwen3::Qwen3ProjectionFusionOptions::default(),
             // Speculative decoding is a standalone-server knob; the Dynamo
             // worker never drafts.
             dflash_draft_model_path: None,

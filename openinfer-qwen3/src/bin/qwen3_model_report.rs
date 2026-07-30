@@ -10,6 +10,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use clap::Parser;
+use clap::ValueEnum;
 use comfy_table::Cell;
 use comfy_table::Color;
 use comfy_table::ContentArrangement;
@@ -42,6 +43,8 @@ use openinfer_kernels::tensor::DeviceVec;
 use openinfer_kernels::tensor::HiddenStates;
 use openinfer_kernels::tensor::KernelCall;
 use openinfer_kernels::tensor::TensorSpec;
+use openinfer_qwen3::ProjectionFusionControl;
+use openinfer_qwen3::Qwen3ProjectionFusionOptions;
 use openinfer_qwen3::batch_decode_trace::HEAD_DIM_VALUE;
 use openinfer_qwen3::batch_decode_trace::KV_DIM_VALUE;
 use openinfer_qwen3::batch_decode_trace::MODEL;
@@ -51,12 +54,38 @@ use openinfer_qwen3::batch_decode_trace::NUM_Q_HEADS;
 use openinfer_qwen3::batch_decode_trace::PHASE_DECODE;
 use openinfer_qwen3::batch_decode_trace::RMS_NORM_EPS;
 use openinfer_qwen3::batch_decode_trace::normalize_call_site;
-use openinfer_qwen3::batch_decode_trace::trace_decode_kernel_calls;
+use openinfer_qwen3::batch_decode_trace::trace_decode_kernel_calls_with_projection_fusion;
 use openinfer_qwen3::kernel_bench::L2CacheClear;
 use openinfer_qwen3::kernel_bench::build_split_kv_csr;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 32;
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum CliProjectionFusion {
+    #[default]
+    Auto,
+    Split,
+    Fused,
+}
+
+impl CliProjectionFusion {
+    const fn resolve(self) -> ProjectionFusionControl {
+        match self {
+            Self::Auto => ProjectionFusionControl::Auto,
+            Self::Split => ProjectionFusionControl::Split,
+            Self::Fused => ProjectionFusionControl::ForceFused,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Split => "split",
+            Self::Fused => "fused",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(about = "Qwen3-4B model-level operator report")]
@@ -78,6 +107,12 @@ struct Cli {
     /// Numeric policy to trace + measure under, matching production: `tuned` | `pin` | `per-token`.
     #[arg(long, default_value = "tuned")]
     policy: String,
+    /// QKV projection topology used by the traced production DAG.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    qkv_fusion: CliProjectionFusion,
+    /// Gate/up projection topology, independently selectable from QKV.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    gate_up_fusion: CliProjectionFusion,
 }
 
 #[derive(Clone, Serialize)]
@@ -111,6 +146,8 @@ struct ReportConfig {
     tp_world_size: usize,
     iters: u64,
     numeric_policy: String,
+    qkv_fusion: String,
+    gate_up_fusion: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -196,7 +233,15 @@ fn main() -> Result<()> {
     let policy = parse_policy(&cli.policy)?;
     set_numeric_policy(policy);
 
-    let schedule = trace_decode_kernel_calls(&cli.model_path, cli.batch_size, cli.kv_len)?;
+    let schedule = trace_decode_kernel_calls_with_projection_fusion(
+        &cli.model_path,
+        cli.batch_size,
+        cli.kv_len,
+        Qwen3ProjectionFusionOptions {
+            qkv: cli.qkv_fusion.resolve(),
+            gate_up: cli.gate_up_fusion.resolve(),
+        },
+    )?;
     reset_numeric_policy_counters();
     let catalog = measure_catalog(&schedule, cli.iters, policy)
         .with_context(|| "failed to build strict measured catalog")?;
@@ -226,13 +271,17 @@ fn main() -> Result<()> {
         policy,
         pin_served_count,
         per_token_served_count,
+        cli.qkv_fusion.label(),
+        cli.gate_up_fusion.label(),
     )?;
     let out = cli.out.unwrap_or_else(|| {
         // Key the default path on the policy too: pin/tuned/per-token runs differ, so without it a
         // later run silently overwrites an earlier one's JSON/DOT.
         PathBuf::from(format!(
-            "target/model_reports/{MODEL}/decode-{}-bs{}-kv{}.json",
+            "target/model_reports/{MODEL}/decode-{}-qkv-{}-gate-up-{}-bs{}-kv{}.json",
             policy_name(policy),
+            cli.qkv_fusion.label(),
+            cli.gate_up_fusion.label(),
             cli.batch_size,
             cli.kv_len
         ))
@@ -335,6 +384,8 @@ fn compose_report(
     policy: NumericPolicy,
     pin_served_count: u64,
     per_token_served_count: u64,
+    qkv_fusion: &str,
+    gate_up_fusion: &str,
 ) -> Result<ModelReport> {
     let mut op_rows: BTreeMap<String, Accum> = BTreeMap::new();
     let mut site_rows: BTreeMap<String, (String, Accum)> = BTreeMap::new();
@@ -437,7 +488,7 @@ fn compose_report(
         .any(|entry| matches!(entry.measure, Measure::Excluded(_)));
 
     Ok(ModelReport {
-        schema: 3,
+        schema: 4,
         report_type: "model_operator_report".to_string(),
         model: MODEL.to_string(),
         phase: PHASE_DECODE.to_string(),
@@ -448,6 +499,8 @@ fn compose_report(
             tp_world_size: 1,
             iters,
             numeric_policy: policy_name(policy).to_string(),
+            qkv_fusion: qkv_fusion.to_string(),
+            gate_up_fusion: gate_up_fusion.to_string(),
         },
         schedule_source:
             "runtime trace: Qwen3Model::batch_decode eager DAG with CUDA Graph disabled".to_string(),
@@ -502,7 +555,9 @@ fn measure_call(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
         "qk_norm_rope_batch_decode" => measure_qk_norm_rope(call, iters),
         "gemm" => measure_gemm(call, iters),
         "fused_add_rms_norm_batch" => measure_fused_add_rms_norm(call, iters),
+        "silu_mul_batch" => measure_silu_mul(call, iters),
         "silu_mul_fused_batch" => measure_silu_mul_fused(call, iters),
+        "split_qkv" => measure_split_qkv(call, iters),
         other => bail!("no benchmark provider for op `{other}`"),
     }
 }
@@ -608,6 +663,54 @@ fn measure_silu_mul_fused(call: &KernelCall, iters: u64) -> Result<LatencyStats>
     let mut out = HiddenStates::zeros(&ctx, inter, batch)?;
     measure_loop(&ctx, iters, || {
         ops::silu_mul_fused_batch_into(&ctx, &gate_up, &mut out)?;
+        Ok(())
+    })
+}
+
+fn measure_silu_mul(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let gate = input(call, "gate")?;
+    let up = input(call, "up")?;
+    let out = output(call, "out")?;
+    let inter = axis(out, "intermediate")?;
+    let batch = axis(out, "batch")?;
+    anyhow::ensure!(
+        axis(gate, "intermediate")? == inter && axis(up, "intermediate")? == inter,
+        "gate/up axes must match output intermediate"
+    );
+    anyhow::ensure!(
+        axis(gate, "batch")? == batch && axis(up, "batch")? == batch,
+        "gate/up batch axes must match output"
+    );
+    let ctx = DeviceContext::new()?;
+    let gate = HiddenStates::zeros(&ctx, inter, batch)?;
+    let up = HiddenStates::zeros(&ctx, inter, batch)?;
+    let mut out = HiddenStates::zeros(&ctx, inter, batch)?;
+    measure_loop(&ctx, iters, || {
+        ops::silu_mul_batch_into(&ctx, &gate, &up, &mut out)?;
+        Ok(())
+    })
+}
+
+fn measure_split_qkv(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let qkv = input(call, "qkv")?;
+    let q = output(call, "q")?;
+    let k = output(call, "k")?;
+    let v = output(call, "v")?;
+    let q_dim = axis(q, "q_dim")?;
+    let kv_dim = axis(k, "kv_dim")?;
+    let batch = axis(qkv, "batch")?;
+    anyhow::ensure!(axis(v, "kv_dim")? == kv_dim, "K/V dimensions must match");
+    anyhow::ensure!(
+        axis(qkv, "out_total")? == q_dim + 2 * kv_dim,
+        "QKV dimension must equal Q + 2*KV"
+    );
+    let ctx = DeviceContext::new()?;
+    let qkv = HiddenStates::zeros(&ctx, q_dim + 2 * kv_dim, batch)?;
+    let mut q = HiddenStates::zeros(&ctx, q_dim, batch)?;
+    let mut k = HiddenStates::zeros(&ctx, kv_dim, batch)?;
+    let mut v = HiddenStates::zeros(&ctx, kv_dim, batch)?;
+    measure_loop(&ctx, iters, || {
+        ops::split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
         Ok(())
     })
 }
@@ -863,13 +966,15 @@ fn describe_call(call: &KernelCall) -> String {
 fn print_text_report(report: &ModelReport, out: &Path, dot_out: &Path) {
     println!("{MODEL} decode operator report");
     println!(
-        "config: bs={} kv_len={} layers={} tp={} iters={} policy={}",
+        "config: bs={} kv_len={} layers={} tp={} iters={} policy={} qkv={} gate_up={}",
         report.config.batch_size,
         report.config.kv_len,
         report.config.layers,
         report.config.tp_world_size,
         report.config.iters,
-        report.config.numeric_policy
+        report.config.numeric_policy,
+        report.config.qkv_fusion,
+        report.config.gate_up_fusion
     );
     println!("json: {}", out.display());
     println!("dot:  {}", dot_out.display());

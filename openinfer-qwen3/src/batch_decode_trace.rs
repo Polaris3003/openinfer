@@ -31,6 +31,21 @@ pub fn trace_decode_kernel_calls(
     batch_size: usize,
     kv_len: usize,
 ) -> Result<Vec<KernelCall>> {
+    trace_decode_kernel_calls_with_projection_fusion(
+        model_path,
+        batch_size,
+        kv_len,
+        crate::Qwen3ProjectionFusionOptions::default(),
+    )
+}
+
+#[cfg(feature = "kernel-call-trace")]
+pub fn trace_decode_kernel_calls_with_projection_fusion(
+    model_path: &str,
+    batch_size: usize,
+    kv_len: usize,
+    projection_fusion: crate::Qwen3ProjectionFusionOptions,
+) -> Result<Vec<KernelCall>> {
     anyhow::ensure!(batch_size > 0, "batch_size must be greater than zero");
     anyhow::ensure!(kv_len > 0, "kv_len must be greater than zero");
 
@@ -40,6 +55,7 @@ pub fn trace_decode_kernel_calls(
             enable_cuda_graph: false,
             tensor_parallel: None,
             device_ordinal: 0,
+            projection_fusion,
             ..Default::default()
         },
     )?;
@@ -93,6 +109,8 @@ pub fn trace_decode_kernel_calls(
         kv_mgr.pool().padding_block_id(),
         model.local_num_attention_heads(),
         model.config().max_position_embeddings,
+        model.fused_qkv(crate::projection_fusion::ProjectionPhase::Decode),
+        model.fused_gate_up(crate::projection_fusion::ProjectionPhase::Decode),
     )?;
     // This trace path bypasses the serving executor (which warms the pinned shapes at startup);
     // warm here, outside `collect_result` below so it isn't recorded as a kernel call.

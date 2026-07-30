@@ -183,6 +183,16 @@ pub(crate) fn run_info(
     load_ms: f64,
     cuda_graph: bool,
 ) -> RunInfo {
+    #[cfg(feature = "qwen3")]
+    let qwen3_projection_fusion = matches!(model_type, ModelType::Qwen3).then(|| {
+        format!(
+            "qkv={},gate_up={}",
+            cli.qwen3_qkv_fusion.label(),
+            cli.qwen3_gate_up_fusion.label()
+        )
+    });
+    #[cfg(not(feature = "qwen3"))]
+    let qwen3_projection_fusion = None;
     RunInfo {
         command,
         model_path: cli.model_path.clone(),
@@ -190,6 +200,8 @@ pub(crate) fn run_info(
         cuda_graph,
         load_ms,
         label: cli.label.clone(),
+        tp_size: cli.tp_size,
+        qwen3_projection_fusion,
     }
 }
 

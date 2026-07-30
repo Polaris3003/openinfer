@@ -57,6 +57,8 @@ use std::path::Path;
 
 use openinfer_core::engine::TokenLogprob;
 use openinfer_core::sampler::SamplingParams;
+use openinfer_qwen3::ProjectionFusionControl;
+use openinfer_qwen3::Qwen3ProjectionFusionOptions;
 use openinfer_qwen3::runtime::DecodePlan;
 use openinfer_qwen3::runtime::DecodeStepItem;
 use openinfer_qwen3::runtime::PrefillPlan;
@@ -112,6 +114,49 @@ const HEAD_K: usize = 8;
 /// the golden's sequence count. The eager pass reuses the larger size purely as
 /// a count of concurrent mixed-length requests (eager does not pad).
 const BUCKET_STRADDLES: [usize; 2] = [9, 5];
+const FUSION_ENV: &str = "OPENINFER_QWEN3_PROJECTION_FUSION";
+const TP_SIZE_ENV: &str = "OPENINFER_GOLDEN_TP_SIZE";
+
+fn projection_fusion_options() -> (Qwen3ProjectionFusionOptions, &'static str) {
+    use ProjectionFusionControl::ForceFused;
+    use ProjectionFusionControl::Split;
+    match std::env::var(FUSION_ENV).as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("auto") => {
+            (Qwen3ProjectionFusionOptions::default(), "auto")
+        }
+        Ok("split") => (Qwen3ProjectionFusionOptions::split(), "split"),
+        Ok("qkv") => (
+            Qwen3ProjectionFusionOptions {
+                qkv: ForceFused,
+                gate_up: Split,
+            },
+            "qkv-only",
+        ),
+        Ok("gate-up") => (
+            Qwen3ProjectionFusionOptions {
+                qkv: Split,
+                gate_up: ForceFused,
+            },
+            "gate-up-only",
+        ),
+        Ok("both") => (Qwen3ProjectionFusionOptions::force_fused(), "both"),
+        Ok(other) => panic!("{FUSION_ENV} must be auto|split|qkv|gate-up|both, got `{other}`"),
+        Err(error) => panic!("read {FUSION_ENV}: {error}"),
+    }
+}
+
+fn build_executor(model_path: &str, enable_cuda_graph: bool, devices: &[usize]) -> Qwen3Executor {
+    let (fusion, mode) = projection_fusion_options();
+    Qwen3Executor::from_runtime_with_projection_fusion_options(
+        model_path,
+        enable_cuda_graph,
+        devices,
+        fusion,
+    )
+    .unwrap_or_else(|e| {
+        panic!("build {mode} executor graph={enable_cuda_graph} on {devices:?}: {e:#}")
+    })
+}
 
 fn model_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
@@ -551,8 +596,7 @@ fn cuda_device_count() -> usize {
 /// — over a given device set, with `label` prefixing every report line.
 fn run_eager_suite(golden: &Golden, model_path: &str, devices: &[usize], label: &str) {
     let all: Vec<usize> = (0..golden.num_seqs).collect();
-    let mut ex = Qwen3Executor::from_runtime(model_path, false, devices)
-        .unwrap_or_else(|e| panic!("build eager executor on {devices:?}: {e:#}"));
+    let mut ex = build_executor(model_path, false, devices);
     // The determinism and isolation passes need bit-replayable prefill: a
     // prefix-cache hit shrinks the prefill GEMM to the uncached suffix,
     // which drifts logits by bf16 ULPs. Caching gets its own pass below.
@@ -615,17 +659,64 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     };
     let all: Vec<usize> = (0..golden.num_seqs).collect();
 
-    // Debug knob: skip the single-GPU passes and run only the TP=2 suite.
-    // The full gate builds TP executors after single-GPU executors in the
-    // same process; running with this set isolates the TP pass from any
-    // state they leave behind.
-    if std::env::var("OPENINFER_GOLDEN_TP_ONLY").is_ok() {
-        let gpus = cuda_device_count();
+    // The validation suite needs one process per exact (fusion, TP) cell so a
+    // skipped TP2 pass can never be mistaken for a successful matrix cell.
+    // Keep OPENINFER_GOLDEN_TP_ONLY as a backwards-compatible TP2 alias.
+    let requested_tp = match std::env::var(TP_SIZE_ENV) {
+        Ok(value) => Some(
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("{TP_SIZE_ENV} must be 1 or 2, got `{value}`")),
+        ),
+        Err(std::env::VarError::NotPresent) => {
+            std::env::var("OPENINFER_GOLDEN_TP_ONLY").ok().map(|_| 2)
+        }
+        Err(error) => panic!("read {TP_SIZE_ENV}: {error}"),
+    };
+    if let Some(tp_size) = requested_tp {
         assert!(
-            gpus >= 2,
-            "OPENINFER_GOLDEN_TP_ONLY needs >=2 GPUs, have {gpus}"
+            matches!(tp_size, 1 | 2),
+            "{TP_SIZE_ENV} must be 1 or 2, got {tp_size}"
         );
+        if tp_size == 1 {
+            run_eager_suite(&golden, &model_path, &[0], "tp1 ");
+            assert!(
+                decode_group_compiled(&model_path),
+                "{TP_SIZE_ENV}=1 requires the CUDA-graph GQA group to be compiled"
+            );
+            let mut ex = build_executor(&model_path, true, &[0]);
+            ex.set_prefix_cache_enabled(false);
+            for n in BUCKET_STRADDLES {
+                let (batched, _) = run(&golden, &mut ex, &all[..n], true);
+                report_and_assert(&format!("tp1 batched cuda-graph ({n} padded)"), &batched);
+            }
+            ex.set_prefix_cache_enabled(true);
+            let n = BUCKET_STRADDLES[1];
+            let _ = run(&golden, &mut ex, &all[..n], true);
+            let (cached, _) = run(&golden, &mut ex, &all[..n], true);
+            assert!(
+                cached.cached_tokens > 0,
+                "tp1 cuda-graph cached replay matched no prefix blocks"
+            );
+            report_and_assert(
+                &format!("tp1 batched cuda-graph cached replay ({n})"),
+                &cached,
+            );
+            return;
+        }
+        let gpus = cuda_device_count();
+        assert!(gpus >= 2, "{TP_SIZE_ENV}=2 needs >=2 GPUs, have {gpus}");
         run_eager_suite(&golden, &model_path, &[0, 1], "tp2 ");
+        assert!(
+            decode_group_compiled(&model_path),
+            "{TP_SIZE_ENV}=2 requires the CUDA-graph GQA group to be compiled"
+        );
+        let mut ex = build_executor(&model_path, true, &[0, 1]);
+        ex.set_prefix_cache_enabled(false);
+        for n in BUCKET_STRADDLES {
+            let (batched, _) = run(&golden, &mut ex, &all[..n], true);
+            report_and_assert(&format!("tp2 batched cuda-graph ({n} padded)"), &batched);
+        }
         return;
     }
 
@@ -639,8 +730,7 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     // this path is where padding-slot leaks (and graph pointer/buffer bugs)
     // surface. Run the bucket straddles, which maximise the padding-slot count.
     if decode_group_compiled(&model_path) {
-        let mut ex = Qwen3Executor::from_runtime(&model_path, true, &[0])
-            .expect("build cuda-graph executor");
+        let mut ex = build_executor(&model_path, true, &[0]);
         ex.set_prefix_cache_enabled(false);
         for n in BUCKET_STRADDLES {
             let (batched, _) = run(&golden, &mut ex, &all[..n], true);
@@ -677,8 +767,7 @@ fn pega_logprobs_match_hf_golden_within_bf16_tolerance() {
     // TP=2, graph on: replay the pre-captured decode graphs against the same
     // golden, so a bad shard, pointer, or collective in a capture drifts logits.
     if decode_group_compiled(&model_path) {
-        let mut ex = Qwen3Executor::from_runtime(&model_path, true, &[0, 1])
-            .expect("build cuda-graph TP executor");
+        let mut ex = build_executor(&model_path, true, &[0, 1]);
         ex.set_prefix_cache_enabled(false);
         for n in BUCKET_STRADDLES {
             let (batched, _) = run(&golden, &mut ex, &all[..n], true);

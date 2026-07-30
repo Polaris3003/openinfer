@@ -74,6 +74,16 @@ pub(crate) fn render_run_summary(report: &RunInfo) -> Table {
         value_cell(report.cuda_graph.to_string()),
     ]);
     table.add_row(vec![
+        key_cell("tp_size"),
+        value_cell(report.tp_size.to_string()),
+    ]);
+    if let Some(fusion) = &report.qwen3_projection_fusion {
+        table.add_row(vec![
+            key_cell("projection_fusion"),
+            value_cell(fusion.clone()),
+        ]);
+    }
+    table.add_row(vec![
         key_cell("load_ms"),
         numeric_cell(format_duration_ms(report.load_ms)),
     ]);

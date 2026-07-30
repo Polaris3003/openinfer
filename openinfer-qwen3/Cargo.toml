@@ -61,5 +61,9 @@ name = "qwen3_model_report"
 path = "src/bin/qwen3_model_report.rs"
 required-features = ["kernel-report"]
 
+[[bin]]
+name = "qwen3_projection_report"
+path = "src/bin/qwen3_projection_report.rs"
+
 [lints]
 workspace = true
