@@ -55,6 +55,7 @@ use openinfer_qwen3::batch_decode_trace::PHASE_DECODE;
 use openinfer_qwen3::batch_decode_trace::RMS_NORM_EPS;
 use openinfer_qwen3::batch_decode_trace::normalize_call_site;
 use openinfer_qwen3::batch_decode_trace::trace_decode_kernel_calls_with_projection_fusion;
+use openinfer_qwen3::batch_decode_trace::trace_decode_topology_calls_with_projection_fusion;
 use openinfer_qwen3::kernel_bench::L2CacheClear;
 use openinfer_qwen3::kernel_bench::build_split_kv_csr;
 use serde::Serialize;
@@ -113,6 +114,10 @@ struct Cli {
     /// Gate/up projection topology, independently selectable from QKV.
     #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
     gate_up_fusion: CliProjectionFusion,
+    /// Reuse one physical KV page table across synthetic rows. Topology-only:
+    /// preserves batch/sequence tensor shapes but does not model KV data locality.
+    #[arg(long)]
+    shared_kv_pages: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -148,6 +153,7 @@ struct ReportConfig {
     numeric_policy: String,
     qkv_fusion: String,
     gate_up_fusion: String,
+    shared_kv_pages: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -233,15 +239,25 @@ fn main() -> Result<()> {
     let policy = parse_policy(&cli.policy)?;
     set_numeric_policy(policy);
 
-    let schedule = trace_decode_kernel_calls_with_projection_fusion(
-        &cli.model_path,
-        cli.batch_size,
-        cli.kv_len,
-        Qwen3ProjectionFusionOptions {
-            qkv: cli.qkv_fusion.resolve(),
-            gate_up: cli.gate_up_fusion.resolve(),
-        },
-    )?;
+    let projection_fusion = Qwen3ProjectionFusionOptions {
+        qkv: cli.qkv_fusion.resolve(),
+        gate_up: cli.gate_up_fusion.resolve(),
+    };
+    let schedule = if cli.shared_kv_pages {
+        trace_decode_topology_calls_with_projection_fusion(
+            &cli.model_path,
+            cli.batch_size,
+            cli.kv_len,
+            projection_fusion,
+        )
+    } else {
+        trace_decode_kernel_calls_with_projection_fusion(
+            &cli.model_path,
+            cli.batch_size,
+            cli.kv_len,
+            projection_fusion,
+        )
+    }?;
     reset_numeric_policy_counters();
     let catalog = measure_catalog(&schedule, cli.iters, policy)
         .with_context(|| "failed to build strict measured catalog")?;
@@ -273,12 +289,18 @@ fn main() -> Result<()> {
         per_token_served_count,
         cli.qkv_fusion.label(),
         cli.gate_up_fusion.label(),
+        cli.shared_kv_pages,
     )?;
     let out = cli.out.unwrap_or_else(|| {
         // Key the default path on the policy too: pin/tuned/per-token runs differ, so without it a
         // later run silently overwrites an earlier one's JSON/DOT.
+        let kv_mode = if cli.shared_kv_pages {
+            "shared-kv"
+        } else {
+            "independent-kv"
+        };
         PathBuf::from(format!(
-            "target/model_reports/{MODEL}/decode-{}-qkv-{}-gate-up-{}-bs{}-kv{}.json",
+            "target/model_reports/{MODEL}/decode-{}-qkv-{}-gate-up-{}-{kv_mode}-bs{}-kv{}.json",
             policy_name(policy),
             cli.qkv_fusion.label(),
             cli.gate_up_fusion.label(),
@@ -386,6 +408,7 @@ fn compose_report(
     per_token_served_count: u64,
     qkv_fusion: &str,
     gate_up_fusion: &str,
+    shared_kv_pages: bool,
 ) -> Result<ModelReport> {
     let mut op_rows: BTreeMap<String, Accum> = BTreeMap::new();
     let mut site_rows: BTreeMap<String, (String, Accum)> = BTreeMap::new();
@@ -488,7 +511,7 @@ fn compose_report(
         .any(|entry| matches!(entry.measure, Measure::Excluded(_)));
 
     Ok(ModelReport {
-        schema: 4,
+        schema: 5,
         report_type: "model_operator_report".to_string(),
         model: MODEL.to_string(),
         phase: PHASE_DECODE.to_string(),
@@ -501,6 +524,7 @@ fn compose_report(
             numeric_policy: policy_name(policy).to_string(),
             qkv_fusion: qkv_fusion.to_string(),
             gate_up_fusion: gate_up_fusion.to_string(),
+            shared_kv_pages,
         },
         schedule_source:
             "runtime trace: Qwen3Model::batch_decode eager DAG with CUDA Graph disabled".to_string(),
@@ -771,7 +795,7 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
     let v = HiddenStates::zeros(&ctx, KV_DIM_VALUE, batch)?;
     let mut out = HiddenStates::zeros(&ctx, q_dim, batch)?;
     let kv_buffer: CudaSlice<bf16> = ctx.stream.alloc_zeros(total_pages * layout.page_stride)?;
-    let (page_indices, page_indptr) = page_tables(batch, pages_per_request);
+    let (page_indices, page_indptr) = page_tables(batch, pages_per_request, total_pages)?;
     let last_page_len_value = match kv_len % page_size {
         0 => page_size,
         rem => rem,
@@ -862,17 +886,27 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
     }
 }
 
-fn page_tables(batch: usize, pages_per_request: usize) -> (Vec<i32>, Vec<i32>) {
+fn page_tables(
+    batch: usize,
+    pages_per_request: usize,
+    total_pages: usize,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    anyhow::ensure!(
+        total_pages >= pages_per_request,
+        "KV buffer has {total_pages} pages but one request needs {pages_per_request}"
+    );
+    let physical_requests = total_pages / pages_per_request;
     let mut page_indices = Vec::with_capacity(batch * pages_per_request);
     let mut page_indptr = Vec::with_capacity(batch + 1);
     page_indptr.push(0);
     for request_idx in 0..batch {
+        let physical_request = request_idx % physical_requests;
         for page_offset in 0..pages_per_request {
-            page_indices.push((request_idx * pages_per_request + page_offset) as i32);
+            page_indices.push((physical_request * pages_per_request + page_offset) as i32);
         }
         page_indptr.push(page_indices.len() as i32);
     }
-    (page_indices, page_indptr)
+    Ok((page_indices, page_indptr))
 }
 
 fn measure_loop(
@@ -966,7 +1000,7 @@ fn describe_call(call: &KernelCall) -> String {
 fn print_text_report(report: &ModelReport, out: &Path, dot_out: &Path) {
     println!("{MODEL} decode operator report");
     println!(
-        "config: bs={} kv_len={} layers={} tp={} iters={} policy={} qkv={} gate_up={}",
+        "config: bs={} kv_len={} layers={} tp={} iters={} policy={} qkv={} gate_up={} shared_kv_pages={}",
         report.config.batch_size,
         report.config.kv_len,
         report.config.layers,
@@ -974,7 +1008,8 @@ fn print_text_report(report: &ModelReport, out: &Path, dot_out: &Path) {
         report.config.iters,
         report.config.numeric_policy,
         report.config.qkv_fusion,
-        report.config.gate_up_fusion
+        report.config.gate_up_fusion,
+        report.config.shared_kv_pages
     );
     println!("json: {}", out.display());
     println!("dot:  {}", dot_out.display());
@@ -1149,4 +1184,18 @@ fn dot_escape(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_tables;
+
+    #[test]
+    fn shared_page_tables_stay_within_the_physical_buffer() {
+        let (indices, indptr) = page_tables(64, 2, 3).expect("shared page table");
+        assert_eq!(indices.len(), 128);
+        assert_eq!(indptr.len(), 65);
+        assert!(indices.iter().all(|&page| page == 0 || page == 1));
+        assert_eq!(&indices[..4], &[0, 1, 0, 1]);
+    }
 }

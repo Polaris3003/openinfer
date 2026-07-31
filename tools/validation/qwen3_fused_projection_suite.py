@@ -563,6 +563,7 @@ class Suite:
                         qkv,
                         "--gate-up-fusion",
                         gate_up,
+                        "--shared-kv-pages",
                         "--iters",
                         str(self.args.topology_iters),
                         "--out",

@@ -725,8 +725,8 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - validation suite `--help` 与完整 `--dry-run`：通过；完整矩阵展开为
   103 个命令（20 个正确性/预检、3 个 rank numerical report、16 个
   topology report、64 个 E2E benchmark）。
-- validation suite Python 单测：6/6 通过，覆盖 Qwen3 unit package 精确作用域、
-  projection report feature、phase-specific 2%/3%
+- validation suite Python 单测：7/7 通过，覆盖 Qwen3 unit package 精确作用域、
+  projection report feature、topology shared-KV mode、phase-specific 2%/3%
   threshold、重复方向不一致 fail-closed、旧 q/v-only fixture fail-closed，
   以及完整 synthetic 103-command 证据到最终 Markdown/decision table 的汇总。
 - 完整 dry-run 复核仍为 `103 = 20 correctness + 3 projection + 16
@@ -797,6 +797,23 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   dependencies 的 `kernel-report` feature。
 - binary 自带 example 同步加入 feature，避免人工复现命令再次失败。
 
+### Step 14 — Topology trace 的 KV 容量去耦
+
+- AutoDL 运行 `batch=64, kv_len=2048` topology cell 时，trace harness 为
+  64 个 synthetic request 各分配 2 个 Qwen3 KV blocks，超过当前 pool，
+  在收集 DAG 前报 `allocation failed: needed 128 blocks`。
+- topology report 只消费 batch/sequence shape 与记录的 operator calls，
+  不验证 request-local KV 内容；真实正确性和性能由 HF/LoRA/E2E gate
+  负责。
+- suite 通过显式 `--shared-kv-pages` 让 trace harness 只分配“一张目标长度
+  页表 + padding block”，所有 synthetic rows 共享有效物理页表；仍以真实
+  `batch=64, kv_len=2048` 调用 production `batch_decode`，所以 DAG、
+  tensor shape 与 launch topology 不缩水。report schema/config 记录该模式，
+  默认 standalone model report 继续使用独立 KV。
+- 共享仅存在于 `kernel-call-trace` harness；serving executor、HF/LoRA 和
+  benchmark 仍使用独立 request KV。新增容量公式回归，确认 2048/1024
+  只需 3 个物理 blocks，且不乘 batch。
+
 ## Debrief
 
 - **Outcome**:
@@ -816,6 +833,8 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   - optional CLI dependency 与 Cargo binary target 必须成对声明 feature
     boundary；否则看似无关的 integration test 也会在编译 package targets
     时失败。
+  - topology/shape trace 不应继承 serving admission 的完整状态成本；可以
+    共享无语义 payload，但必须把这种别名严格限制在非正确性、非性能 harness。
 - **Lessons learned**:
   - 专项验证的 preflight 必须与被验证产品面的 feature/package closure 一致；
     全 workspace 健康度可以是独立 CI，但不能成为 Qwen3 优化报告的隐藏前置条件。

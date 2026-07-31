@@ -1032,6 +1032,11 @@ force/split 模式下 requested 等于实际。
   `projection-report` feature 管理，binary 声明 required feature，suite
   显式启用；默认 HF/LoRA/lib 构建不再误编译缺少 optional dependency 的
   report target。
+- decode topology trace 不再按 `batch × kv_len` 分配 request-local KV；
+  suite 显式传 `--shared-kv-pages`，让 synthetic rows 共享一张目标长度的
+  有效页表，使 bs64/kv2048 保持真实 operator shape 而无需 128 个物理
+  blocks。report config 自描述该模式；默认 standalone report、正确性和
+  E2E 性能路径仍使用独立 KV。
 - 结果：产出代码完成；本机无 CUDA/nvcc，真实报告仍待 Linux TP2 主机。
 
 ## Debrief

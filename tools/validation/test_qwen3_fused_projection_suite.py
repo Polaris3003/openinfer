@@ -119,6 +119,31 @@ class CommandScopeTests(unittest.TestCase):
             feature_index = command.index("--features")
             self.assertEqual(command[feature_index + 1], "projection-report")
 
+    def test_topology_reports_use_shared_kv_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = types.SimpleNamespace(
+                output_dir=directory,
+                model_path="models/Qwen3-4B",
+                topology_batches=[64],
+                topology_kv_len=2_048,
+                topology_iters=32,
+                dry_run=True,
+            )
+            suite = SUITE.Suite(args)
+            suite.logs_dir.mkdir()
+            suite.raw_dir.mkdir()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(suite.topology_reports())
+
+            self.assertEqual(len(suite.manifest["commands"]), len(SUITE.MODES))
+            self.assertTrue(
+                all(
+                    "--shared-kv-pages" in entry["command"]
+                    for entry in suite.manifest["commands"]
+                )
+            )
+
 
 class EndToEndSummaryTests(unittest.TestCase):
     def test_complete_synthetic_matrix_generates_enable_decisions(self):
