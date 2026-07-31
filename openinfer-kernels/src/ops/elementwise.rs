@@ -917,6 +917,27 @@ mod tests {
         Ok(host)
     }
 
+    fn assert_bf16_bits_eq(actual: &[bf16], expected: &[bf16], context: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{context}: element count mismatch"
+        );
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{context}: BF16 bits mismatch at index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn bitwise_comparison_accepts_identical_bf16_nan_payloads() {
+        let payload = bf16::from_bits(0x7fc1);
+        assert_bf16_bits_eq(&[payload], &[payload], "equal NaN payload");
+    }
+
     #[test]
     fn silu_mul_fused_matches_split_bf16_rounding() -> Result<()> {
         let ctx = DeviceContext::new()?;
@@ -995,14 +1016,20 @@ mod tests {
                 let src = token * qkv_dim;
                 let q_start = token * q_dim;
                 let kv_start = token * kv_dim;
-                assert_eq!(&q_host[q_start..q_start + q_dim], &source[src..src + q_dim]);
-                assert_eq!(
-                    &k_host[kv_start..kv_start + kv_dim],
-                    &source[src + q_dim..src + q_dim + kv_dim]
+                assert_bf16_bits_eq(
+                    &q_host[q_start..q_start + q_dim],
+                    &source[src..src + q_dim],
+                    &format!("Q q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
                 );
-                assert_eq!(
+                assert_bf16_bits_eq(
+                    &k_host[kv_start..kv_start + kv_dim],
+                    &source[src + q_dim..src + q_dim + kv_dim],
+                    &format!("K q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+                assert_bf16_bits_eq(
                     &v_host[kv_start..kv_start + kv_dim],
-                    &source[src + q_dim + kv_dim..src + qkv_dim]
+                    &source[src + q_dim + kv_dim..src + qkv_dim],
+                    &format!("V q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
                 );
             }
         }

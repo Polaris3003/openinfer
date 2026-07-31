@@ -771,6 +771,20 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - 本机可完成格式、metadata、Python suite 与 dry-run 检查；Linux CUDA
   type-check 仍以 AutoDL 重跑 scoped unit gate 为准。
 
+### Step 12 — QKV bitwise-copy gate 的 NaN 比较修复
+
+- 编译面修复后，AutoDL 进入
+  `split_qkv_is_a_bitwise_copy_for_tp_shapes_and_tails` 并在首个 Q slice
+  `assert_eq!` 失败。
+- 测试输入从任意 `u16` payload 构造 BF16，覆盖 NaN payload；Rust `bf16`
+  的 `PartialEq` 遵守 IEEE 语义，即使 payload 相同也满足 `NaN != NaN`。
+  因此原 slice equality 不能证明或否定 bitwise copy。
+- 保留任意 payload 覆盖，将 Q/K/V 断言改为逐元素比较 `to_bits()`，错误
+  信息带 segment、shape、token 与局部 index；另加相同 NaN payload 的
+  CPU 回归测试，固定测试契约。
+- 不修改 CUDA split kernel、输入分布或正确性阈值；AutoDL 需重跑 operator
+  gate，只有按位断言通过后才能认为 kernel copy 正确。
+
 ## Debrief
 
 - **Outcome**:
@@ -785,6 +799,8 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   - 新 kernel operator 只在 kernels crate 导出不足以覆盖使用
     `openinfer_core::ops` facade 的模型路径；lib 与 report binary 都必须在
     Linux 编译面验证。
+  - “bitwise”测试不能使用浮点 `PartialEq`；任意 bit-pattern fixture 会包含
+    NaN，相同 payload 也会按 IEEE 规则比较为不等。
 - **Lessons learned**:
   - 专项验证的 preflight 必须与被验证产品面的 feature/package closure 一致；
     全 workspace 健康度可以是独立 CI，但不能成为 Qwen3 优化报告的隐藏前置条件。

@@ -1025,6 +1025,9 @@ force/split 模式下 requested 等于实际。
 - AutoDL scoped unit gate 暴露 `split_qkv_into` 只从 kernels crate 导出、
   未进入 `openinfer_core::ops` facade 的编译遗漏；补充统一 re-export 后，
   prefill、unified forward 与 topology report 共享同一 operator 入口。
+- QKV copy gate 的任意 BF16 payload 包含 NaN；原 slice `PartialEq` 会把
+  bit-identical NaN 判为不等。Q/K/V 断言已改为逐元素 `to_bits()`，保留
+  全 payload 覆盖并增加 equal-NaN-payload 回归测试。
 - 结果：产出代码完成；本机无 CUDA/nvcc，真实报告仍待 Linux TP2 主机。
 
 ## Debrief
