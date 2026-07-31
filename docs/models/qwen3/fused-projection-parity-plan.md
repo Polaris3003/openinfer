@@ -757,6 +757,20 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - Qwen3 TP2 仍使用其正常 NCCL collective；本修复只移除 DeepEP 2.30.4
   这一无关构建门禁，不绕过 TP 通信或任何 HF/LoRA/operator gate。
 
+### Step 11 — Linux Qwen3 编译面修复
+
+- AutoDL 首次执行 scoped unit gate 后，`openinfer-qwen3` 在 prefill 与
+  unified forward 的 `ops::split_qkv_into` 调用处报 `E0425`；后续
+  `qwen3_model_report` topology binary 也使用同一路径，尚未执行到。
+- 根因是 operator 已从 `openinfer-kernels::ops` 导出，但遗漏了
+  `openinfer-core::ops` facade re-export；Qwen3 其他常规 GPU operator
+  均通过该 facade 使用。
+- 在 core facade 补一个统一 re-export，同时修复 lib 与
+  `kernel-report` binary 三个调用面；不复制 wrapper、不改变 kernel ABI
+  或运行时行为。
+- 本机可完成格式、metadata、Python suite 与 dry-run 检查；Linux CUDA
+  type-check 仍以 AutoDL 重跑 scoped unit gate 为准。
+
 ## Debrief
 
 - **Outcome**:
@@ -768,6 +782,9 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
     无关 workspace member 激活共享 `openinfer-kernels/moe`，改变构建依赖边界。
   - 本机静态检查不能替代 Linux CUDA TP2 实跑，尤其不能证明 NCCL
     communicator、CUDA Graph capture 或 fused GEMM 数值结果。
+  - 新 kernel operator 只在 kernels crate 导出不足以覆盖使用
+    `openinfer_core::ops` facade 的模型路径；lib 与 report binary 都必须在
+    Linux 编译面验证。
 - **Lessons learned**:
   - 专项验证的 preflight 必须与被验证产品面的 feature/package closure 一致；
     全 workspace 健康度可以是独立 CI，但不能成为 Qwen3 优化报告的隐藏前置条件。

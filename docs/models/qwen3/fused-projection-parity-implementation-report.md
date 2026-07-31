@@ -1022,6 +1022,9 @@ force/split 模式下 requested 等于实际。
   门禁只选择 `openinfer-kernels`、`openinfer-qwen3`、`openinfer-server`，
   避免 `--workspace` 将 GLM/Kimi 的 `moe`/DeepEP 2.30.4 构建依赖带入
   Qwen3 专项验证。
+- AutoDL scoped unit gate 暴露 `split_qkv_into` 只从 kernels crate 导出、
+  未进入 `openinfer_core::ops` facade 的编译遗漏；补充统一 re-export 后，
+  prefill、unified forward 与 topology report 共享同一 operator 入口。
 - 结果：产出代码完成；本机无 CUDA/nvcc，真实报告仍待 Linux TP2 主机。
 
 ## Debrief
