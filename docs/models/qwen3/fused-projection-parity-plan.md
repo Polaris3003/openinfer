@@ -725,8 +725,8 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - validation suite `--help` 与完整 `--dry-run`：通过；完整矩阵展开为
   103 个命令（20 个正确性/预检、3 个 rank numerical report、16 个
   topology report、64 个 E2E benchmark）。
-- validation suite Python 单测：5/5 通过，覆盖 Qwen3 unit package 精确作用域、
-  phase-specific 2%/3%
+- validation suite Python 单测：6/6 通过，覆盖 Qwen3 unit package 精确作用域、
+  projection report feature、phase-specific 2%/3%
   threshold、重复方向不一致 fail-closed、旧 q/v-only fixture fail-closed，
   以及完整 synthetic 103-command 证据到最终 Markdown/decision table 的汇总。
 - 完整 dry-run 复核仍为 `103 = 20 correctness + 3 projection + 16
@@ -785,6 +785,18 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - 不修改 CUDA split kernel、输入分布或正确性阈值；AutoDL 需重跑 operator
   gate，只有按位断言通过后才能认为 kernel copy 正确。
 
+### Step 13 — Projection report binary 的 feature 边界
+
+- AutoDL 单独编译 HF gate 时，Cargo 同时构建没有 `required-features` 的
+  package binary；`qwen3_projection_report` 使用 optional `clap`，但默认
+  feature 未启用它，因而报 unresolved import 和缺失 derive attributes。
+- 新增最小 `projection-report = ["dep:clap"]` feature，并将该 binary 标记
+  为 required feature；HF/LoRA/default lib 构建会跳过它。
+- validation suite 的 projection rank 命令显式传
+  `--features projection-report`；不复用会额外拉入 CUPTI/trace/report
+  dependencies 的 `kernel-report` feature。
+- binary 自带 example 同步加入 feature，避免人工复现命令再次失败。
+
 ## Debrief
 
 - **Outcome**:
@@ -801,6 +813,9 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
     Linux 编译面验证。
   - “bitwise”测试不能使用浮点 `PartialEq`；任意 bit-pattern fixture 会包含
     NaN，相同 payload 也会按 IEEE 规则比较为不等。
+  - optional CLI dependency 与 Cargo binary target 必须成对声明 feature
+    boundary；否则看似无关的 integration test 也会在编译 package targets
+    时失败。
 - **Lessons learned**:
   - 专项验证的 preflight 必须与被验证产品面的 feature/package closure 一致；
     全 workspace 健康度可以是独立 CI，但不能成为 Qwen3 优化报告的隐藏前置条件。

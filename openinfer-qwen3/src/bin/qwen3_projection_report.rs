@@ -10,7 +10,8 @@ use openinfer_qwen3::projection_report::generate_projection_report;
 #[derive(Debug, Parser)]
 #[command(
     about = "Compare real-weight Qwen3 split/fused projections for one TP rank",
-    after_help = "Example:\n  cargo run --release -p openinfer-qwen3 --bin \
+    after_help = "Example:\n  cargo run --release -p openinfer-qwen3 \
+                  --features projection-report --bin \
                   qwen3_projection_report -- --model-path models/Qwen3-4B \
                   --tp-size 2 --rank 0 --shapes 1,8,32,128,1024 --out report.json"
 )]

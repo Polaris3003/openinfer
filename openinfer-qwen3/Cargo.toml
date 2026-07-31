@@ -42,6 +42,7 @@ kernel-report = [
   "dep:toml",
   "kernel-call-trace",
 ]
+projection-report = ["dep:clap"]
 test-fixtures = []
 
 [dev-dependencies]
@@ -64,6 +65,7 @@ required-features = ["kernel-report"]
 [[bin]]
 name = "qwen3_projection_report"
 path = "src/bin/qwen3_projection_report.rs"
+required-features = ["projection-report"]
 
 [lints]
 workspace = true

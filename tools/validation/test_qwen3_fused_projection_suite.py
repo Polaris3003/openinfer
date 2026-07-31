@@ -1,6 +1,9 @@
+import contextlib
 import importlib.util
+import io
 import pathlib
 import tempfile
+import types
 import unittest
 
 
@@ -94,6 +97,27 @@ class CommandScopeTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("--workspace", command)
+
+    def test_projection_report_command_enables_its_cli_feature(self):
+        with tempfile.TemporaryDirectory() as directory:
+            args = types.SimpleNamespace(
+                output_dir=directory,
+                model_path="models/Qwen3-4B",
+                tp_sizes=[1],
+                projection_warmup=2,
+                projection_iters=5,
+                dry_run=True,
+            )
+            suite = SUITE.Suite(args)
+            suite.logs_dir.mkdir()
+            suite.raw_dir.mkdir()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(suite.projection_reports())
+
+            command = suite.manifest["commands"][0]["command"]
+            feature_index = command.index("--features")
+            self.assertEqual(command[feature_index + 1], "projection-report")
 
 
 class EndToEndSummaryTests(unittest.TestCase):

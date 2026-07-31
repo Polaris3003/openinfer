@@ -498,6 +498,8 @@ class Suite:
                         "--release",
                         "-p",
                         "openinfer-qwen3",
+                        "--features",
+                        "projection-report",
                         "--bin",
                         "qwen3_projection_report",
                         "--",
