@@ -584,7 +584,11 @@ TP2 prefill/unified: both split
 
 ```bash
 cargo fmt --all --check
-cargo test --release --workspace --lib
+cargo test --release \
+  -p openinfer-kernels \
+  -p openinfer-qwen3 \
+  -p openinfer-server \
+  --lib
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   cargo test --release -p openinfer-qwen3 --test hf_golden_gate -- --nocapture
 OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
@@ -693,7 +697,7 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   metadata。`N<=32` 使用与 executor 一致的 all-layer cold-weight rotation。
 - `tools/validation/qwen3_fused_projection_suite.py` 统一编排：
   - 五 projection LoRA fixture fail-closed 预检；
-  - operator、workspace lib、HF/LoRA 的四 mode × TP1/TP2 精确矩阵；
+  - Qwen3 scoped unit、operator、HF/LoRA 的四 mode × TP1/TP2 精确矩阵；
   - projection rank reports 与四 mode decode topology reports；
   - 32 个唯一 E2E cell 的两次对称交错复测（实际 64 个 benchmark 进程）；
   - commit/model hash、driver/CUDA、逐 benchmark clocks/power/peak-HBM、
@@ -721,9 +725,12 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - validation suite `--help` 与完整 `--dry-run`：通过；完整矩阵展开为
   103 个命令（20 个正确性/预检、3 个 rank numerical report、16 个
   topology report、64 个 E2E benchmark）。
-- validation suite Python 单测：4/4 通过，覆盖 phase-specific 2%/3%
+- validation suite Python 单测：5/5 通过，覆盖 Qwen3 unit package 精确作用域、
+  phase-specific 2%/3%
   threshold、重复方向不一致 fail-closed、旧 q/v-only fixture fail-closed，
   以及完整 synthetic 103-command 证据到最终 Markdown/decision table 的汇总。
+- 完整 dry-run 复核仍为 `103 = 20 correctness + 3 projection + 16
+  topology + 64 benchmark`，manifest 中没有任何 `--workspace` 参数。
 - 当前 fixture 预检：按预期失败，明确缺少 `k_proj/gate_proj/up_proj`；
   这是待补产物，不是已通过 gate。
 - `OPENINFER_CUDA_SM=120 cargo check --release -p openinfer-qwen3 --lib`：
@@ -737,11 +744,35 @@ OPENINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - 当前机器无 `nvcc`/CUDA GPU，因此 operator/HF/LoRA/TP/CUDA Graph 与
   性能矩阵均未执行；这些项目保持“待验证”，不会据此填充生产白名单。
 
+### Step 10 — 收敛 Qwen3 验证门禁作用域
+
+- GPU 主机首次执行暴露出 `cargo test --release --workspace --lib` 会编译
+  GLM5.2/Kimi-K2，并通过 `openinfer-kernels/moe` 拉入 DeepEP shim，导致
+  Qwen3 专项验证额外要求 `OPENINFER_NCCL_ROOT` 指向 NCCL ≥ 2.30.4。
+- 将该门禁改为单个 Cargo invocation，只选择 `openinfer-kernels`、
+  `openinfer-qwen3`、`openinfer-server` 三个 Qwen3 直接相关 package；
+  保留 kernel/model/server 三层 lib tests，不再编译无关模型 feature。
+- 汇总键由 `workspace-lib` 改为 `qwen3-unit`，并新增命令作用域单测，
+  精确断言 package 集合且禁止 `--workspace` 回归。
+- Qwen3 TP2 仍使用其正常 NCCL collective；本修复只移除 DeepEP 2.30.4
+  这一无关构建门禁，不绕过 TP 通信或任何 HF/LoRA/operator gate。
+
 ## Debrief
 
-等待执行完成后填写：
-
-- **Outcome**：实际启用了哪些 `(projection, phase, TP)`；
-- **Pitfalls encountered**：数值分叉、算法选择、graph/LoRA/buffer 问题及根因；
-- **Lessons learned**：哪些结论可推广，哪些仅适用于 Qwen3-4B/当前 GPU；
-- **Follow-ups**：其他 Qwen3 size、TP>2、Pin/PerToken、Green Context 是否值得单独立项。
+- **Outcome**:
+  - 融合候选与 103-command fail-closed 验证套件已实现；生产白名单仍为空。
+  - Qwen3 unit 门禁已收敛到 kernel/model/server 三个相关 package，不再要求
+    为无关 GLM/Kimi DeepEP 安装 NCCL ≥ 2.30.4。
+- **Pitfalls encountered**:
+  - `cargo test --workspace` 不只是“多跑一些测试”；Cargo feature union 会让
+    无关 workspace member 激活共享 `openinfer-kernels/moe`，改变构建依赖边界。
+  - 本机静态检查不能替代 Linux CUDA TP2 实跑，尤其不能证明 NCCL
+    communicator、CUDA Graph capture 或 fused GEMM 数值结果。
+- **Lessons learned**:
+  - 专项验证的 preflight 必须与被验证产品面的 feature/package closure 一致；
+    全 workspace 健康度可以是独立 CI，但不能成为 Qwen3 优化报告的隐藏前置条件。
+  - 门禁作用域也需要结构化回归测试，不能只依赖文档约定。
+- **Follow-ups**:
+  - 在 AutoDL 双卡主机重新运行完整 suite，根据真实报告决定各
+    `(projection, phase, TP)` 是否进入白名单。
+  - 其他 Qwen3 size、TP>2、Pin/PerToken 和 Green Context 仍需独立证据。

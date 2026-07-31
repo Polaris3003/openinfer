@@ -75,6 +75,27 @@ class FixtureTests(unittest.TestCase):
                 SUITE.check_lora_fixture(pathlib.Path(handle.name))
 
 
+class CommandScopeTests(unittest.TestCase):
+    def test_qwen3_unit_gate_does_not_build_unrelated_model_crates(self):
+        command = SUITE.qwen3_unit_test_command()
+        self.assertEqual(
+            command,
+            [
+                "cargo",
+                "test",
+                "--release",
+                "-p",
+                "openinfer-kernels",
+                "-p",
+                "openinfer-qwen3",
+                "-p",
+                "openinfer-server",
+                "--lib",
+            ],
+        )
+        self.assertNotIn("--workspace", command)
+
+
 class EndToEndSummaryTests(unittest.TestCase):
     def test_complete_synthetic_matrix_generates_enable_decisions(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -94,7 +115,7 @@ class EndToEndSummaryTests(unittest.TestCase):
                 commands.append(entry)
                 return entry
 
-            for gate in ("lora-fixture-targets", "workspace-lib", "qkv-split", "swiglu"):
+            for gate in ("lora-fixture-targets", "qwen3-unit", "qkv-split", "swiglu"):
                 add_entry(gate, {"kind": "correctness", "gate": gate})
             for gate in ("hf_golden_gate", "lora_golden_gate"):
                 for tp in (1, 2):

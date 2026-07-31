@@ -46,6 +46,7 @@ DECODE_SHAPES = (1, 2, 4, 8, 16, 32, 64)
 PREFILL_SHAPES = (128, 512, 1_024, 2_048, 4_096, 8_192, 10_000)
 SCHEMA = 1
 REQUIRED_LORA_TARGETS = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}
+QWEN3_UNIT_PACKAGES = ("openinfer-kernels", "openinfer-qwen3", "openinfer-server")
 
 
 def utc_now() -> str:
@@ -98,6 +99,14 @@ def check_lora_fixture(path: pathlib.Path) -> None:
 
 def command_text(command: Iterable[str]) -> str:
     return shlex.join(str(part) for part in command)
+
+
+def qwen3_unit_test_command() -> list[str]:
+    command = ["cargo", "test", "--release"]
+    for package in QWEN3_UNIT_PACKAGES:
+        command.extend(["-p", package])
+    command.append("--lib")
+    return command
 
 
 def probe(command: list[str]) -> dict[str, Any]:
@@ -395,9 +404,9 @@ class Suite:
                 {"kind": "correctness", "gate": "lora-fixture-targets"},
             ),
             (
-                "unit-workspace",
-                ["cargo", "test", "--release", "--workspace", "--lib"],
-                {"kind": "correctness", "gate": "workspace-lib"},
+                "unit-qwen3",
+                qwen3_unit_test_command(),
+                {"kind": "correctness", "gate": "qwen3-unit"},
             ),
             (
                 "operator-qkv-split",
@@ -680,7 +689,7 @@ def summarize_correctness(commands: list[dict[str, Any]], tp_sizes: list[int]) -
     entries = [entry for entry in commands if entry["metadata"].get("kind") == "correctness"]
     required = {
         ("lora-fixture-targets", None, None),
-        ("workspace-lib", None, None),
+        ("qwen3-unit", None, None),
         ("qkv-split", None, None),
         ("swiglu", None, None),
     }

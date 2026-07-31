@@ -1018,7 +1018,10 @@ force/split 模式下 requested 等于实际。
 - LoRA fixture loader 与 suite preflight 都要求 q/k/v/gate/up 五 target；
   当前 q/v-only committed fixture 按预期 fail closed。
 - 新增统一 suite 和 summary unit tests；完整 dry-run 展开 103 个命令，
-  保存 raw/log/manifest/summary/decision-table/report 六类证据。
+  保存 raw/log/manifest/summary/decision-table/report 六类证据。Qwen3 unit
+  门禁只选择 `openinfer-kernels`、`openinfer-qwen3`、`openinfer-server`，
+  避免 `--workspace` 将 GLM/Kimi 的 `moe`/DeepEP 2.30.4 构建依赖带入
+  Qwen3 专项验证。
 - 结果：产出代码完成；本机无 CUDA/nvcc，真实报告仍待 Linux TP2 主机。
 
 ## Debrief
