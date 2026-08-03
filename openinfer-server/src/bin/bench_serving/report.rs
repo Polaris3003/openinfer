@@ -11,6 +11,9 @@ pub(crate) struct RunInfo {
     pub(crate) cuda_graph: bool,
     pub(crate) load_ms: f64,
     pub(crate) label: Option<String>,
+    pub(crate) tp_size: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) qwen3_projection_fusion: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

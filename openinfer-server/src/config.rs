@@ -281,6 +281,19 @@ pub(crate) struct Args {
     /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
     #[arg(long, default_value_t = false)]
     pub batch_invariant: bool,
+
+    /// Qwen3 QKV projection fusion control. `auto` is fail-closed and enables
+    /// only measured production-whitelist entries; `fused` is a diagnostic A/B
+    /// override that rejects unsupported geometry/TP/runtime modes.
+    #[cfg(feature = "qwen3")]
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    pub qwen3_qkv_fusion: CliProjectionFusion,
+
+    /// Qwen3 gate/up projection fusion control; semantics match
+    /// `--qwen3-qkv-fusion`.
+    #[cfg(feature = "qwen3")]
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    pub qwen3_gate_up_fusion: CliProjectionFusion,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -310,6 +323,25 @@ pub(crate) enum CliDecodeOverlap {
     /// Green Context SM partition (SM-pinned streams).
     #[value(name = "green-ctx")]
     GreenCtx,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub(crate) enum CliProjectionFusion {
+    #[default]
+    Auto,
+    Split,
+    Fused,
+}
+
+impl CliProjectionFusion {
+    #[cfg(feature = "qwen3")]
+    pub(crate) const fn resolve(self) -> openinfer_qwen3::ProjectionFusionControl {
+        match self {
+            Self::Auto => openinfer_qwen3::ProjectionFusionControl::Auto,
+            Self::Split => openinfer_qwen3::ProjectionFusionControl::Split,
+            Self::Fused => openinfer_qwen3::ProjectionFusionControl::ForceFused,
+        }
+    }
 }
 
 impl CliDecodeOverlap {
@@ -410,6 +442,8 @@ fn consumed_args(model_type: ModelType) -> &'static [&'static str] {
             "decode_overlap",
             "decode_sm_pct",
             "batch_invariant",
+            "qwen3_qkv_fusion",
+            "qwen3_gate_up_fusion",
             "dflash_draft_model_path",
         ],
         #[cfg(feature = "qwen35")]

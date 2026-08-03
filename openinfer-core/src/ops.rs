@@ -80,6 +80,7 @@ pub use openinfer_kernels::ops::silu_mul_fused_batch_into;
 pub use openinfer_kernels::ops::single_decode_nhd_into;
 pub use openinfer_kernels::ops::single_prefill_nhd_causal_into;
 pub use openinfer_kernels::ops::single_prefill_nhd_noncausal_into;
+pub use openinfer_kernels::ops::split_qkv_into;
 pub use openinfer_kernels::ops::write_vec_into;
 pub use paged_plan::PrefillPagedPlan;
 #[cfg(feature = "kernel-call-trace")]

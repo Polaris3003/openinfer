@@ -745,6 +745,83 @@ pub fn silu_mul_fused_batch_into(
     Ok(())
 }
 
+/// Split contiguous `[Q; K; V]` projection output into compact Q/K/V tensors.
+///
+/// This is a BF16 bitwise copy. The checked shape boundary matters because a
+/// wrong local TP dimension would otherwise corrupt the following attention
+/// buffers and surface only at a later CUDA call.
+pub fn split_qkv_into(
+    ctx: &DeviceContext,
+    qkv: &HiddenStates,
+    q: &mut HiddenStates,
+    k: &mut HiddenStates,
+    v: &mut HiddenStates,
+) -> Result<()> {
+    anyhow::ensure!(
+        q.hidden_dim > 0 && k.hidden_dim > 0 && qkv.seq_len > 0,
+        "split_qkv requires non-empty Q, KV, and token dimensions; got q_dim={}, kv_dim={}, tokens={}",
+        q.hidden_dim,
+        k.hidden_dim,
+        qkv.seq_len
+    );
+    assert_eq!(k.hidden_dim, v.hidden_dim, "K/V dimensions must match");
+    assert_eq!(
+        qkv.hidden_dim,
+        q.hidden_dim + k.hidden_dim + v.hidden_dim,
+        "QKV input dimension must equal Q + K + V"
+    );
+    assert_eq!(qkv.seq_len, q.seq_len, "QKV/Q token count mismatch");
+    assert_eq!(qkv.seq_len, k.seq_len, "QKV/K token count mismatch");
+    assert_eq!(qkv.seq_len, v.seq_len, "QKV/V token count mismatch");
+
+    let q_dim = i32::try_from(q.hidden_dim)
+        .map_err(|_| anyhow!("Q dimension {} exceeds i32", q.hidden_dim))?;
+    let kv_dim = i32::try_from(k.hidden_dim)
+        .map_err(|_| anyhow!("KV dimension {} exceeds i32", k.hidden_dim))?;
+    let tokens = i32::try_from(qkv.seq_len)
+        .map_err(|_| anyhow!("QKV token count {} exceeds i32", qkv.seq_len))?;
+    i32::try_from(qkv.hidden_dim)
+        .map_err(|_| anyhow!("QKV dimension {} exceeds i32", qkv.hidden_dim))?;
+    i32::try_from(
+        qkv.hidden_dim
+            .checked_mul(qkv.seq_len)
+            .ok_or_else(|| anyhow!("QKV element count overflow"))?,
+    )
+    .map_err(|_| {
+        anyhow!(
+            "QKV element count {}×{} exceeds CUDA kernel i32 indexing",
+            qkv.hidden_dim,
+            qkv.seq_len
+        )
+    })?;
+
+    let (qkv_ptr, _gqkv) = qkv.data.device_ptr(&ctx.stream);
+    let (q_ptr, _gq) = q.data.device_ptr_mut(&ctx.stream);
+    let (k_ptr, _gk) = k.data.device_ptr_mut(&ctx.stream);
+    let (v_ptr, _gv) = v.data.device_ptr_mut(&ctx.stream);
+    let status = unsafe {
+        ffi::split_qkv_cuda(
+            qkv_ptr as *const ffi::Half,
+            q_ptr as *mut ffi::Half,
+            k_ptr as *mut ffi::Half,
+            v_ptr as *mut ffi::Half,
+            q_dim,
+            kv_dim,
+            tokens,
+            crate::tensor::active_cu_stream(ctx),
+        )
+    };
+    if status != 0 {
+        return Err(anyhow!(
+            "split_qkv CUDA launch failed: cuda_status={status}, q_dim={}, kv_dim={}, tokens={}",
+            q.hidden_dim,
+            k.hidden_dim,
+            qkv.seq_len
+        ));
+    }
+    Ok(())
+}
+
 /// Extract a single token's vector from a HiddenStates batch (GPU copy)
 pub fn extract_vec(
     ctx: &DeviceContext,
@@ -840,6 +917,27 @@ mod tests {
         Ok(host)
     }
 
+    fn assert_bf16_bits_eq(actual: &[bf16], expected: &[bf16], context: &str) {
+        assert_eq!(
+            actual.len(),
+            expected.len(),
+            "{context}: element count mismatch"
+        );
+        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "{context}: BF16 bits mismatch at index {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn bitwise_comparison_accepts_identical_bf16_nan_payloads() {
+        let payload = bf16::from_bits(0x7fc1);
+        assert_bf16_bits_eq(&[payload], &[payload], "equal NaN payload");
+    }
+
     #[test]
     fn silu_mul_fused_matches_split_bf16_rounding() -> Result<()> {
         let ctx = DeviceContext::new()?;
@@ -883,6 +981,57 @@ mod tests {
                 fused_value.to_bits(),
                 "fused/split silu_mul mismatch at index {idx}"
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn split_qkv_is_a_bitwise_copy_for_tp_shapes_and_tails() -> Result<()> {
+        let ctx = DeviceContext::new()?;
+        for (q_dim, kv_dim, tokens) in [
+            (4096, 1024, 1),
+            (4096, 1024, 8),
+            (4096, 1024, 128),
+            (2048, 512, 1),
+            (2048, 512, 8),
+            (2048, 512, 128),
+            // Deliberately not aligned to the 256-thread launch width.
+            (5, 3, 7),
+        ] {
+            let qkv_dim = q_dim + 2 * kv_dim;
+            let source: Vec<_> = (0..qkv_dim * tokens)
+                .map(|idx| bf16::from_bits((idx as u16).wrapping_mul(977).wrapping_add(13)))
+                .collect();
+            let qkv = hidden_from_host(&ctx, &source, qkv_dim, tokens)?;
+            let mut q = HiddenStates::zeros(&ctx, q_dim, tokens)?;
+            let mut k = HiddenStates::zeros(&ctx, kv_dim, tokens)?;
+            let mut v = HiddenStates::zeros(&ctx, kv_dim, tokens)?;
+
+            split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
+
+            let q_host = hidden_to_host(&ctx, &q)?;
+            let k_host = hidden_to_host(&ctx, &k)?;
+            let v_host = hidden_to_host(&ctx, &v)?;
+            for token in 0..tokens {
+                let src = token * qkv_dim;
+                let q_start = token * q_dim;
+                let kv_start = token * kv_dim;
+                assert_bf16_bits_eq(
+                    &q_host[q_start..q_start + q_dim],
+                    &source[src..src + q_dim],
+                    &format!("Q q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+                assert_bf16_bits_eq(
+                    &k_host[kv_start..kv_start + kv_dim],
+                    &source[src + q_dim..src + q_dim + kv_dim],
+                    &format!("K q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+                assert_bf16_bits_eq(
+                    &v_host[kv_start..kv_start + kv_dim],
+                    &source[src + q_dim + kv_dim..src + qkv_dim],
+                    &format!("V q_dim={q_dim} kv_dim={kv_dim} tokens={tokens} token={token}"),
+                );
+            }
         }
         Ok(())
     }

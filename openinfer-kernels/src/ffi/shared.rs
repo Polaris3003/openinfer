@@ -214,6 +214,19 @@ unsafe extern "C" {
         stream: CUstream,
     ) -> i32;
 
+    pub fn gemm_lt_algo_metadata_cuda(
+        M: i32,
+        N: i32,
+        K: i32,
+        out_algo_id: *mut i32,
+        out_tile_id: *mut i32,
+        out_stages_id: *mut i32,
+        out_splitk: *mut i32,
+        out_reduction_scheme: *mut i32,
+        out_swizzling: *mut i32,
+        out_custom_option: *mut i32,
+    ) -> i32;
+
     /// cuBLAS `cublasGemmStridedBatchedEx` (bf16, workspace-free, graph-safe).
     pub fn gemm_strided_batched_bf16_cuda(
         op_a: i32,
@@ -292,6 +305,16 @@ unsafe extern "C" {
         out: *mut Half,
         intermediate_size: i32,
         bs: i32,
+        stream: CUstream,
+    ) -> i32;
+    pub fn split_qkv_cuda(
+        qkv: *const Half,
+        q: *mut Half,
+        k: *mut Half,
+        v: *mut Half,
+        q_dim: i32,
+        kv_dim: i32,
+        tokens: i32,
         stream: CUstream,
     ) -> i32;
 

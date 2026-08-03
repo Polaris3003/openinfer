@@ -157,6 +157,7 @@ fn launch_options(draft: Option<PathBuf>) -> Qwen3LaunchOptions {
         lora: None,
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
+        projection_fusion: openinfer_qwen3::Qwen3ProjectionFusionOptions::default(),
         dflash_draft_model_path: draft,
         enable_kv_events: false,
     }

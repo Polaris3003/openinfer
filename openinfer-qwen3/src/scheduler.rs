@@ -193,8 +193,9 @@ pub(crate) fn start_qwen3(
     dflash_draft_model_path: Option<&str>,
     enable_kv_events: bool,
     dump_graph_png: Option<&Path>,
+    projection_fusion: crate::Qwen3ProjectionFusionOptions,
 ) -> Result<EngineHandle> {
-    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_projection_fusion(
         model_path,
         enable_cuda_graph,
         device_ordinals,
@@ -204,6 +205,8 @@ pub(crate) fn start_qwen3(
         dflash_draft_model_path,
         memory_options,
         enable_kv_events,
+        projection_fusion,
+        decode_overlap,
     )?;
     if let Some(path) = dump_graph_png {
         let summary = executor.dump_decode_graph_png(path)?;
@@ -239,8 +242,9 @@ pub(crate) fn start_qwen3_with_lora_control(
     no_prefix_cache: bool,
     max_prefill_tokens: usize,
     memory_options: Qwen3MemoryOptions,
+    projection_fusion: crate::Qwen3ProjectionFusionOptions,
 ) -> Result<EngineHandle> {
-    let mut executor = Qwen3Executor::from_runtime_with_lora_options(
+    let mut executor = Qwen3Executor::from_runtime_with_projection_fusion(
         model_path,
         enable_cuda_graph,
         device_ordinals,
@@ -252,6 +256,8 @@ pub(crate) fn start_qwen3_with_lora_control(
         // LoRA serving never emits KV events: the router-facing cache feed is
         // base-model single-rank only.
         false,
+        projection_fusion,
+        crate::DecodeOverlap::Off,
     )?;
     executor.set_no_prefix_cache(no_prefix_cache);
     Ok(start_with_executor_with_lora_control(

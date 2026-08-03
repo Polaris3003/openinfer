@@ -355,6 +355,8 @@ impl Qwen3Model {
             kv_dim,
             inter_dim,
             total_tokens,
+            self.fused_qkv(crate::projection_fusion::ProjectionPhase::PrefillUnified),
+            self.fused_gate_up(crate::projection_fusion::ProjectionPhase::PrefillUnified),
         )?;
         mark_peak()?;
 
@@ -411,14 +413,45 @@ impl Qwen3Model {
         // ── 2. QKV projections from fused qkv_proj [all tokens] ─────
         let q_dim_l = layer.attention.q_dim;
         let kv_dim_l = layer.attention.kv_dim;
-        ops::gemm_rows_into(
-            &self.ctx,
-            &layer.attention.qkv_proj,
-            0,
-            q_dim_l,
-            &bufs.normed,
-            &mut bufs.q_batch,
-        );
+        if self.fused_qkv(crate::projection_fusion::ProjectionPhase::PrefillUnified) {
+            let qkv_out = bufs
+                .qkv_out
+                .as_mut()
+                .expect("fused QKV plan requires qkv_out");
+            ops::gemm_into_checked(&self.ctx, &layer.attention.qkv_proj, &bufs.normed, qkv_out)?;
+            ops::split_qkv_into(
+                &self.ctx,
+                qkv_out,
+                &mut bufs.q_batch,
+                &mut bufs.k_batch,
+                &mut bufs.v_batch,
+            )?;
+        } else {
+            ops::gemm_rows_into(
+                &self.ctx,
+                &layer.attention.qkv_proj,
+                0,
+                q_dim_l,
+                &bufs.normed,
+                &mut bufs.q_batch,
+            );
+            ops::gemm_rows_into(
+                &self.ctx,
+                &layer.attention.qkv_proj,
+                q_dim_l,
+                kv_dim_l,
+                &bufs.normed,
+                &mut bufs.k_batch,
+            );
+            ops::gemm_rows_into(
+                &self.ctx,
+                &layer.attention.qkv_proj,
+                q_dim_l + kv_dim_l,
+                kv_dim_l,
+                &bufs.normed,
+                &mut bufs.v_batch,
+            );
+        }
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -427,14 +460,6 @@ impl Qwen3Model {
             &mut bufs.q_batch,
             0,
         )?;
-        ops::gemm_rows_into(
-            &self.ctx,
-            &layer.attention.qkv_proj,
-            q_dim_l,
-            kv_dim_l,
-            &bufs.normed,
-            &mut bufs.k_batch,
-        );
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -443,14 +468,6 @@ impl Qwen3Model {
             &mut bufs.k_batch,
             0,
         )?;
-        ops::gemm_rows_into(
-            &self.ctx,
-            &layer.attention.qkv_proj,
-            q_dim_l + kv_dim_l,
-            kv_dim_l,
-            &bufs.normed,
-            &mut bufs.v_batch,
-        );
         self.apply_lora_projection_ranges(
             layer_idx,
             lora_groups,
@@ -554,39 +571,78 @@ impl Qwen3Model {
             &mut bufs.normed,
         )?;
 
-        ops::gemm_rows_into(
-            &self.ctx,
-            &layer.mlp.gate_up_proj,
-            0,
-            self.local_intermediate_size(),
-            &bufs.normed,
-            &mut bufs.gate_out,
-        );
-        ops::gemm_rows_into(
-            &self.ctx,
-            &layer.mlp.gate_up_proj,
-            self.local_intermediate_size(),
-            self.local_intermediate_size(),
-            &bufs.normed,
-            &mut bufs.up_out,
-        );
-        self.apply_lora_projection_ranges(
-            layer_idx,
-            lora_groups,
-            |layer| layer.gate_proj.as_ref(),
-            &bufs.normed,
-            &mut bufs.gate_out,
-            0,
-        )?;
-        self.apply_lora_projection_ranges(
-            layer_idx,
-            lora_groups,
-            |layer| layer.up_proj.as_ref(),
-            &bufs.normed,
-            &mut bufs.up_out,
-            0,
-        )?;
-        ops::silu_mul_batch_into(&self.ctx, &bufs.gate_out, &bufs.up_out, &mut bufs.act_out)?;
+        let inter_dim = self.local_intermediate_size();
+        if self.fused_gate_up(crate::projection_fusion::ProjectionPhase::PrefillUnified) {
+            let gate_up_out = bufs
+                .gate_up_out
+                .as_mut()
+                .expect("fused gate/up plan requires gate_up_out");
+            ops::gemm_into_checked(
+                &self.ctx,
+                &layer.mlp.gate_up_proj,
+                &bufs.normed,
+                gate_up_out,
+            )?;
+            self.apply_lora_projection_ranges(
+                layer_idx,
+                lora_groups,
+                |layer| layer.gate_proj.as_ref(),
+                &bufs.normed,
+                gate_up_out,
+                0,
+            )?;
+            self.apply_lora_projection_ranges(
+                layer_idx,
+                lora_groups,
+                |layer| layer.up_proj.as_ref(),
+                &bufs.normed,
+                gate_up_out,
+                inter_dim,
+            )?;
+            ops::silu_mul_fused_batch_into(&self.ctx, gate_up_out, &mut bufs.act_out)?;
+        } else {
+            let gate_out = bufs
+                .gate_out
+                .as_mut()
+                .expect("split gate/up plan requires gate_out");
+            let up_out = bufs
+                .up_out
+                .as_mut()
+                .expect("split gate/up plan requires up_out");
+            ops::gemm_rows_into(
+                &self.ctx,
+                &layer.mlp.gate_up_proj,
+                0,
+                inter_dim,
+                &bufs.normed,
+                gate_out,
+            );
+            ops::gemm_rows_into(
+                &self.ctx,
+                &layer.mlp.gate_up_proj,
+                inter_dim,
+                inter_dim,
+                &bufs.normed,
+                up_out,
+            );
+            self.apply_lora_projection_ranges(
+                layer_idx,
+                lora_groups,
+                |layer| layer.gate_proj.as_ref(),
+                &bufs.normed,
+                gate_out,
+                0,
+            )?;
+            self.apply_lora_projection_ranges(
+                layer_idx,
+                lora_groups,
+                |layer| layer.up_proj.as_ref(),
+                &bufs.normed,
+                up_out,
+                0,
+            )?;
+            ops::silu_mul_batch_into(&self.ctx, gate_out, up_out, &mut bufs.act_out)?;
+        }
         ops::gemm_into(
             &self.ctx,
             &layer.mlp.down_proj,

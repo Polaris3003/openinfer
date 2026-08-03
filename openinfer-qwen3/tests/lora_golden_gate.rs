@@ -21,6 +21,8 @@ use std::path::Path;
 use openinfer_core::engine::LoadLoraAdapterRequest;
 use openinfer_core::engine::TokenLogprob;
 use openinfer_core::sampler::SamplingParams;
+use openinfer_qwen3::ProjectionFusionControl;
+use openinfer_qwen3::Qwen3ProjectionFusionOptions;
 use openinfer_qwen3::lora_fixtures::FixtureTensor;
 use openinfer_qwen3::lora_fixtures::{self as fixtures};
 use openinfer_qwen3::runtime::DecodePlan;
@@ -51,6 +53,37 @@ const HEAD_K: usize = 8;
 /// The LoRA replay must differ from the base replay by more than this (mean |top-1
 /// logprob| difference) — a silently ignored adapter fails here.
 const CROSS_CHECK_FLOOR: f32 = 0.05;
+const FUSION_ENV: &str = "OPENINFER_QWEN3_PROJECTION_FUSION";
+const TP_SIZE_ENV: &str = "OPENINFER_GOLDEN_TP_SIZE";
+const REQUIRED_TARGETS: &[&str] = &["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"];
+
+fn projection_fusion_options() -> (Qwen3ProjectionFusionOptions, &'static str) {
+    use ProjectionFusionControl::ForceFused;
+    use ProjectionFusionControl::Split;
+    match std::env::var(FUSION_ENV).as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("auto") => {
+            (Qwen3ProjectionFusionOptions::default(), "auto")
+        }
+        Ok("split") => (Qwen3ProjectionFusionOptions::split(), "split"),
+        Ok("qkv") => (
+            Qwen3ProjectionFusionOptions {
+                qkv: ForceFused,
+                gate_up: Split,
+            },
+            "qkv-only",
+        ),
+        Ok("gate-up") => (
+            Qwen3ProjectionFusionOptions {
+                qkv: Split,
+                gate_up: ForceFused,
+            },
+            "gate-up-only",
+        ),
+        Ok("both") => (Qwen3ProjectionFusionOptions::force_fused(), "both"),
+        Ok(other) => panic!("{FUSION_ENV} must be auto|split|qkv|gate-up|both, got `{other}`"),
+        Err(error) => panic!("read {FUSION_ENV}: {error}"),
+    }
+}
 
 fn model_path_or_skip() -> Option<String> {
     match std::env::var("OPENINFER_TEST_MODEL_PATH") {
@@ -228,6 +261,15 @@ impl Golden {
 }}"#,
             md["target_modules"]
         );
+        let target_modules: Vec<String> =
+            serde_json::from_str(&md["target_modules"]).expect("target_modules metadata");
+        for required in REQUIRED_TARGETS {
+            assert!(
+                target_modules.iter().any(|target| target == required),
+                "fixture target_modules is missing required projection `{required}`; regenerate \
+                 it with tools/accuracy/dump_qwen3_4b_lora_golden.py"
+            );
+        }
 
         let st = SafeTensors::deserialize(&bytes).expect("parse golden safetensors");
         let (prompt_tokens, _) = as_i32(&st, "prompt_tokens");
@@ -250,6 +292,26 @@ impl Golden {
                         data: t.data().to_vec(),
                     },
                 );
+            }
+        }
+        for target in &target_modules {
+            for side in ["lora_A", "lora_B"] {
+                let needle = format!(".{target}.{side}.weight");
+                let tensors: Vec<_> = adapter_tensors
+                    .iter()
+                    .filter(|(name, _)| name.ends_with(&needle))
+                    .collect();
+                assert_eq!(
+                    tensors.len(),
+                    36,
+                    "fixture must contain one {target}.{side} tensor per Qwen3-4B layer"
+                );
+                for (name, tensor) in tensors {
+                    assert!(
+                        tensor.data.iter().any(|&byte| byte != 0),
+                        "fixture tensor {name} is all-zero; target engagement would be unobservable"
+                    );
+                }
             }
         }
 
@@ -438,8 +500,11 @@ fn run_suite(
     label: &str,
 ) {
     let all: Vec<usize> = (0..golden.num_seqs).collect();
-    let mut ex = Qwen3Executor::from_runtime(model_path, false, devices)
-        .unwrap_or_else(|e| panic!("build executor on {devices:?}: {e:#}"));
+    let (fusion, mode) = projection_fusion_options();
+    let mut ex = Qwen3Executor::from_runtime_with_projection_fusion_options(
+        model_path, false, devices, fusion,
+    )
+    .unwrap_or_else(|e| panic!("build {mode} executor on {devices:?}: {e:#}"));
     ex.set_prefix_cache_enabled(false);
     ex.load_lora_adapter(&LoadLoraAdapterRequest {
         lora_name: ADAPTER_NAME.to_string(),
@@ -481,8 +546,31 @@ fn lora_logprobs_match_peft_golden_within_bf16_tolerance() {
     let golden = Golden::load();
     let adapter_dir = golden.write_adapter_dir();
 
-    run_suite(&golden, &model_path, adapter_dir.path(), &[0], "");
+    let requested_tp = match std::env::var(TP_SIZE_ENV) {
+        Ok(value) => Some(
+            value
+                .parse::<usize>()
+                .unwrap_or_else(|_| panic!("{TP_SIZE_ENV} must be 1 or 2, got `{value}`")),
+        ),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(error) => panic!("read {TP_SIZE_ENV}: {error}"),
+    };
+    if let Some(tp_size) = requested_tp {
+        assert!(
+            matches!(tp_size, 1 | 2),
+            "{TP_SIZE_ENV} must be 1 or 2, got {tp_size}"
+        );
+        if tp_size == 1 {
+            run_suite(&golden, &model_path, adapter_dir.path(), &[0], "tp1 ");
+            return;
+        }
+        let gpus = cuda_device_count();
+        assert!(gpus >= 2, "{TP_SIZE_ENV}=2 needs >=2 GPUs, have {gpus}");
+        run_suite(&golden, &model_path, adapter_dir.path(), &[0, 1], "tp2 ");
+        return;
+    }
 
+    run_suite(&golden, &model_path, adapter_dir.path(), &[0], "");
     if cuda_device_count() >= 2 {
         run_suite(&golden, &model_path, adapter_dir.path(), &[0, 1], "tp2 ");
     } else {

@@ -334,6 +334,10 @@ fn load_engine(args: &Args, model_type: ModelType) -> anyhow::Result<EngineHandl
                     lora,
                     decode_overlap: args.decode_overlap.resolve(args.decode_sm_pct),
                     batch_invariant: args.batch_invariant,
+                    projection_fusion: openinfer_qwen3::Qwen3ProjectionFusionOptions {
+                        qkv: args.qwen3_qkv_fusion.resolve(),
+                        gate_up: args.qwen3_gate_up_fusion.resolve(),
+                    },
                     dflash_draft_model_path,
                     // KV block events are a Dynamo-backend concern; the plain
                     // server never publishes them.

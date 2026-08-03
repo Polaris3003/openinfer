@@ -99,6 +99,37 @@ impl CliQwen35SchedulerPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, ValueEnum)]
+pub(crate) enum CliProjectionFusion {
+    #[default]
+    Auto,
+    Split,
+    Fused,
+}
+
+impl CliProjectionFusion {
+    #[cfg(feature = "qwen3")]
+    pub(crate) const fn resolve(self) -> openinfer_qwen3::ProjectionFusionControl {
+        match self {
+            Self::Auto => openinfer_qwen3::ProjectionFusionControl::Auto,
+            Self::Split => openinfer_qwen3::ProjectionFusionControl::Split,
+            Self::Fused => openinfer_qwen3::ProjectionFusionControl::ForceFused,
+        }
+    }
+
+    pub(crate) const fn is_auto(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Split => "split",
+            Self::Fused => "fused",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
     /// Measure one request shape end-to-end.
@@ -158,7 +189,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value_t = false)]
     pub(crate) cuda_profiler_capture: bool,
 
-    /// Tensor-parallel world size for Kimi-K2
+    /// Tensor-parallel world size for Qwen3 or Kimi-K2
     #[arg(long, default_value_t = 1)]
     pub(crate) tp_size: usize,
 
@@ -185,6 +216,15 @@ pub(crate) struct Cli {
     /// Qwen3.5 scheduler policy for prefill/decode balancing.
     #[arg(long, value_enum, default_value_t = CliQwen35SchedulerPolicy::Off)]
     pub(crate) qwen35_scheduler_policy: CliQwen35SchedulerPolicy,
+
+    /// Qwen3 QKV projection fusion control. `auto` enables only measured
+    /// production-whitelist entries; use `split`/`fused` for diagnostic A/B.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    pub(crate) qwen3_qkv_fusion: CliProjectionFusion,
+
+    /// Qwen3 gate/up projection fusion control; independent of QKV.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    pub(crate) qwen3_gate_up_fusion: CliProjectionFusion,
 
     #[command(subcommand)]
     pub(crate) command: Command,

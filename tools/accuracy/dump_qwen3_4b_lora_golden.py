@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Generate the PEFT LoRA golden for `tests/lora_golden_gate.rs`.
 
-A trained adapter is unnecessary: a seed-pinned random rank-1 q/v adapter perturbs
-every logit, so any application bug (transposed / missing / mis-scaled delta) shifts
-logprobs past the gate tolerances. One fixture carries the fixed sequences, base +
-LoRA top-K reference grids, and the adapter tensors themselves (`adapter/<name>`) —
-the gate reconstructs the exact PEFT directory, nothing reproduces RNG or PEFT
-versions at test time. The B matrices are calibrated into [MIN_EFFECT, MAX_EFFECT];
-outside that band the script refuses to write (a null fixture would let a silently
-dropped adapter pass).
+A trained adapter is unnecessary: a seed-pinned random rank-1
+q/k/v/gate/up adapter perturbs every logit, so any application bug (transposed,
+missing, mis-scaled, or written at the wrong combined-buffer row offset) shifts
+logprobs past the gate tolerances. One fixture carries the fixed sequences, base
++ LoRA top-K reference grids, and the adapter tensors themselves
+(`adapter/<name>`) — the gate reconstructs the exact PEFT directory, nothing
+reproduces RNG or PEFT versions at test time. The B matrices are calibrated into
+[MIN_EFFECT, MAX_EFFECT]; outside that band the script refuses to write (a null
+fixture would let a silently dropped adapter pass).
 
     uv run --no-project python tools/accuracy/dump_qwen3_4b_lora_golden.py \
         --model-path /data/models/Qwen3-4B \
@@ -38,7 +39,7 @@ TOP_K = 64
 
 RANK = 1
 ALPHA = 1
-TARGET_MODULES = ["q_proj", "v_proj"]
+TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"]
 # Mean |LoRA − base| logprob over the base top-K, averaged over all evaluated positions.
 # Below MIN the delta drowns in the gate tolerances; above MAX the model is perturbed
 # past anything resembling a fine-tune.
@@ -47,8 +48,8 @@ MIN_EFFECT = 0.1
 MAX_EFFECT = 2.0
 
 
-def tensor_name(layer: int, target: str, side: str) -> str:
-    return f"base_model.model.model.layers.{layer}.self_attn.{target}.{side}.weight"
+def tensor_name(layer: int, block: str, target: str, side: str) -> str:
+    return f"base_model.model.model.layers.{layer}.{block}.{target}.{side}.weight"
 
 
 def fill_lora_weights(
@@ -57,13 +58,20 @@ def fill_lora_weights(
     """Seed-pinned normal init for every lora_A/lora_B; returns canonical-name → tensor."""
     out = {}
     pat = re.compile(
-        r"layers\.(\d+)\.self_attn\.(q_proj|v_proj)\.lora_(A|B)\.default\.weight$"
+        r"layers\.(\d+)\.(self_attn|mlp)\."
+        r"(q_proj|k_proj|v_proj|gate_proj|up_proj)\."
+        r"lora_(A|B)\.default\.weight$"
     )
     for name, param in sorted(model.named_parameters()):
         m = pat.search(name)
         if m is None:
             continue
-        layer, target, side = int(m.group(1)), m.group(2), m.group(3)
+        layer, block, target, side = (
+            int(m.group(1)),
+            m.group(2),
+            m.group(3),
+            m.group(4),
+        )
         w = torch.randn(param.shape, generator=gen, dtype=torch.float32)
         if side == "A":
             w /= param.shape[1] ** 0.5
@@ -71,7 +79,18 @@ def fill_lora_weights(
             w *= b_scale
         with torch.no_grad():
             param.copy_(w.to(param.dtype))
-        out[tensor_name(layer, target, f"lora_{side}")] = w.to(torch.bfloat16)
+        out[tensor_name(layer, block, target, f"lora_{side}")] = w.to(torch.bfloat16)
+    seen_targets = {
+        name.split(".")[-3]
+        for name in out
+    }
+    assert seen_targets == set(TARGET_MODULES), (
+        f"LoRA target discovery mismatch: expected {TARGET_MODULES}, "
+        f"found {sorted(seen_targets)}"
+    )
+    assert len(out) == model.base_model.config.num_hidden_layers * len(TARGET_MODULES) * 2, (
+        f"expected A/B tensors for every layer and target, got {len(out)}"
+    )
     return out
 
 
@@ -187,6 +206,7 @@ def main() -> int:
         "top_k": str(TOP_K),
         "model": Path(args.model_path).name,
         "torch_version": torch.__version__,
+        "transformers_version": __import__("transformers").__version__,
         "peft_version": __import__("peft").__version__,
     }
     out = Path(args.out)
@@ -194,7 +214,7 @@ def main() -> int:
     save_file(tensors, str(out), metadata=meta)
     print(
         f"wrote {out}: {NUM_SEQS} seqs, {NUM_SEQS * (DECODE_TOKENS + 1)} positions, "
-        f"top{TOP_K}, adapter rank {RANK} q/v, effect {effect:.4f} nat"
+        f"top{TOP_K}, adapter rank {RANK} q/k/v/gate/up, effect {effect:.4f} nat"
     )
     return 0
 

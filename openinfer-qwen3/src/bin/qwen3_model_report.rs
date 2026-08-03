@@ -10,6 +10,7 @@ use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
 use clap::Parser;
+use clap::ValueEnum;
 use comfy_table::Cell;
 use comfy_table::Color;
 use comfy_table::ContentArrangement;
@@ -42,6 +43,8 @@ use openinfer_kernels::tensor::DeviceVec;
 use openinfer_kernels::tensor::HiddenStates;
 use openinfer_kernels::tensor::KernelCall;
 use openinfer_kernels::tensor::TensorSpec;
+use openinfer_qwen3::ProjectionFusionControl;
+use openinfer_qwen3::Qwen3ProjectionFusionOptions;
 use openinfer_qwen3::batch_decode_trace::HEAD_DIM_VALUE;
 use openinfer_qwen3::batch_decode_trace::KV_DIM_VALUE;
 use openinfer_qwen3::batch_decode_trace::MODEL;
@@ -51,12 +54,39 @@ use openinfer_qwen3::batch_decode_trace::NUM_Q_HEADS;
 use openinfer_qwen3::batch_decode_trace::PHASE_DECODE;
 use openinfer_qwen3::batch_decode_trace::RMS_NORM_EPS;
 use openinfer_qwen3::batch_decode_trace::normalize_call_site;
-use openinfer_qwen3::batch_decode_trace::trace_decode_kernel_calls;
+use openinfer_qwen3::batch_decode_trace::trace_decode_kernel_calls_with_projection_fusion;
+use openinfer_qwen3::batch_decode_trace::trace_decode_topology_calls_with_projection_fusion;
 use openinfer_qwen3::kernel_bench::L2CacheClear;
 use openinfer_qwen3::kernel_bench::build_split_kv_csr;
 use serde::Serialize;
 
 const DEFAULT_ITERS: u64 = 32;
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum CliProjectionFusion {
+    #[default]
+    Auto,
+    Split,
+    Fused,
+}
+
+impl CliProjectionFusion {
+    const fn resolve(self) -> ProjectionFusionControl {
+        match self {
+            Self::Auto => ProjectionFusionControl::Auto,
+            Self::Split => ProjectionFusionControl::Split,
+            Self::Fused => ProjectionFusionControl::ForceFused,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Split => "split",
+            Self::Fused => "fused",
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(about = "Qwen3-4B model-level operator report")]
@@ -78,6 +108,16 @@ struct Cli {
     /// Numeric policy to trace + measure under, matching production: `tuned` | `pin` | `per-token`.
     #[arg(long, default_value = "tuned")]
     policy: String,
+    /// QKV projection topology used by the traced production DAG.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    qkv_fusion: CliProjectionFusion,
+    /// Gate/up projection topology, independently selectable from QKV.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    gate_up_fusion: CliProjectionFusion,
+    /// Reuse one physical KV page table across synthetic rows. Topology-only:
+    /// preserves batch/sequence tensor shapes but does not model KV data locality.
+    #[arg(long)]
+    shared_kv_pages: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -111,6 +151,9 @@ struct ReportConfig {
     tp_world_size: usize,
     iters: u64,
     numeric_policy: String,
+    qkv_fusion: String,
+    gate_up_fusion: String,
+    shared_kv_pages: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -196,7 +239,25 @@ fn main() -> Result<()> {
     let policy = parse_policy(&cli.policy)?;
     set_numeric_policy(policy);
 
-    let schedule = trace_decode_kernel_calls(&cli.model_path, cli.batch_size, cli.kv_len)?;
+    let projection_fusion = Qwen3ProjectionFusionOptions {
+        qkv: cli.qkv_fusion.resolve(),
+        gate_up: cli.gate_up_fusion.resolve(),
+    };
+    let schedule = if cli.shared_kv_pages {
+        trace_decode_topology_calls_with_projection_fusion(
+            &cli.model_path,
+            cli.batch_size,
+            cli.kv_len,
+            projection_fusion,
+        )
+    } else {
+        trace_decode_kernel_calls_with_projection_fusion(
+            &cli.model_path,
+            cli.batch_size,
+            cli.kv_len,
+            projection_fusion,
+        )
+    }?;
     reset_numeric_policy_counters();
     let catalog = measure_catalog(&schedule, cli.iters, policy)
         .with_context(|| "failed to build strict measured catalog")?;
@@ -226,13 +287,23 @@ fn main() -> Result<()> {
         policy,
         pin_served_count,
         per_token_served_count,
+        cli.qkv_fusion.label(),
+        cli.gate_up_fusion.label(),
+        cli.shared_kv_pages,
     )?;
     let out = cli.out.unwrap_or_else(|| {
         // Key the default path on the policy too: pin/tuned/per-token runs differ, so without it a
         // later run silently overwrites an earlier one's JSON/DOT.
+        let kv_mode = if cli.shared_kv_pages {
+            "shared-kv"
+        } else {
+            "independent-kv"
+        };
         PathBuf::from(format!(
-            "target/model_reports/{MODEL}/decode-{}-bs{}-kv{}.json",
+            "target/model_reports/{MODEL}/decode-{}-qkv-{}-gate-up-{}-{kv_mode}-bs{}-kv{}.json",
             policy_name(policy),
+            cli.qkv_fusion.label(),
+            cli.gate_up_fusion.label(),
             cli.batch_size,
             cli.kv_len
         ))
@@ -335,6 +406,9 @@ fn compose_report(
     policy: NumericPolicy,
     pin_served_count: u64,
     per_token_served_count: u64,
+    qkv_fusion: &str,
+    gate_up_fusion: &str,
+    shared_kv_pages: bool,
 ) -> Result<ModelReport> {
     let mut op_rows: BTreeMap<String, Accum> = BTreeMap::new();
     let mut site_rows: BTreeMap<String, (String, Accum)> = BTreeMap::new();
@@ -437,7 +511,7 @@ fn compose_report(
         .any(|entry| matches!(entry.measure, Measure::Excluded(_)));
 
     Ok(ModelReport {
-        schema: 3,
+        schema: 5,
         report_type: "model_operator_report".to_string(),
         model: MODEL.to_string(),
         phase: PHASE_DECODE.to_string(),
@@ -448,6 +522,9 @@ fn compose_report(
             tp_world_size: 1,
             iters,
             numeric_policy: policy_name(policy).to_string(),
+            qkv_fusion: qkv_fusion.to_string(),
+            gate_up_fusion: gate_up_fusion.to_string(),
+            shared_kv_pages,
         },
         schedule_source:
             "runtime trace: Qwen3Model::batch_decode eager DAG with CUDA Graph disabled".to_string(),
@@ -502,7 +579,9 @@ fn measure_call(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
         "qk_norm_rope_batch_decode" => measure_qk_norm_rope(call, iters),
         "gemm" => measure_gemm(call, iters),
         "fused_add_rms_norm_batch" => measure_fused_add_rms_norm(call, iters),
+        "silu_mul_batch" => measure_silu_mul(call, iters),
         "silu_mul_fused_batch" => measure_silu_mul_fused(call, iters),
+        "split_qkv" => measure_split_qkv(call, iters),
         other => bail!("no benchmark provider for op `{other}`"),
     }
 }
@@ -612,6 +691,54 @@ fn measure_silu_mul_fused(call: &KernelCall, iters: u64) -> Result<LatencyStats>
     })
 }
 
+fn measure_silu_mul(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let gate = input(call, "gate")?;
+    let up = input(call, "up")?;
+    let out = output(call, "out")?;
+    let inter = axis(out, "intermediate")?;
+    let batch = axis(out, "batch")?;
+    anyhow::ensure!(
+        axis(gate, "intermediate")? == inter && axis(up, "intermediate")? == inter,
+        "gate/up axes must match output intermediate"
+    );
+    anyhow::ensure!(
+        axis(gate, "batch")? == batch && axis(up, "batch")? == batch,
+        "gate/up batch axes must match output"
+    );
+    let ctx = DeviceContext::new()?;
+    let gate = HiddenStates::zeros(&ctx, inter, batch)?;
+    let up = HiddenStates::zeros(&ctx, inter, batch)?;
+    let mut out = HiddenStates::zeros(&ctx, inter, batch)?;
+    measure_loop(&ctx, iters, || {
+        ops::silu_mul_batch_into(&ctx, &gate, &up, &mut out)?;
+        Ok(())
+    })
+}
+
+fn measure_split_qkv(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
+    let qkv = input(call, "qkv")?;
+    let q = output(call, "q")?;
+    let k = output(call, "k")?;
+    let v = output(call, "v")?;
+    let q_dim = axis(q, "q_dim")?;
+    let kv_dim = axis(k, "kv_dim")?;
+    let batch = axis(qkv, "batch")?;
+    anyhow::ensure!(axis(v, "kv_dim")? == kv_dim, "K/V dimensions must match");
+    anyhow::ensure!(
+        axis(qkv, "out_total")? == q_dim + 2 * kv_dim,
+        "QKV dimension must equal Q + 2*KV"
+    );
+    let ctx = DeviceContext::new()?;
+    let qkv = HiddenStates::zeros(&ctx, q_dim + 2 * kv_dim, batch)?;
+    let mut q = HiddenStates::zeros(&ctx, q_dim, batch)?;
+    let mut k = HiddenStates::zeros(&ctx, kv_dim, batch)?;
+    let mut v = HiddenStates::zeros(&ctx, kv_dim, batch)?;
+    measure_loop(&ctx, iters, || {
+        ops::split_qkv_into(&ctx, &qkv, &mut q, &mut k, &mut v)?;
+        Ok(())
+    })
+}
+
 fn measure_qk_norm_rope(call: &KernelCall, iters: u64) -> Result<LatencyStats> {
     let q = input(call, "q")?;
     let k = input(call, "k")?;
@@ -668,7 +795,7 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
     let v = HiddenStates::zeros(&ctx, KV_DIM_VALUE, batch)?;
     let mut out = HiddenStates::zeros(&ctx, q_dim, batch)?;
     let kv_buffer: CudaSlice<bf16> = ctx.stream.alloc_zeros(total_pages * layout.page_stride)?;
-    let (page_indices, page_indptr) = page_tables(batch, pages_per_request);
+    let (page_indices, page_indptr) = page_tables(batch, pages_per_request, total_pages)?;
     let last_page_len_value = match kv_len % page_size {
         0 => page_size,
         rem => rem,
@@ -759,17 +886,27 @@ fn measure_paged_decode_attention(call: &KernelCall, iters: u64) -> Result<Laten
     }
 }
 
-fn page_tables(batch: usize, pages_per_request: usize) -> (Vec<i32>, Vec<i32>) {
+fn page_tables(
+    batch: usize,
+    pages_per_request: usize,
+    total_pages: usize,
+) -> Result<(Vec<i32>, Vec<i32>)> {
+    anyhow::ensure!(
+        total_pages >= pages_per_request,
+        "KV buffer has {total_pages} pages but one request needs {pages_per_request}"
+    );
+    let physical_requests = total_pages / pages_per_request;
     let mut page_indices = Vec::with_capacity(batch * pages_per_request);
     let mut page_indptr = Vec::with_capacity(batch + 1);
     page_indptr.push(0);
     for request_idx in 0..batch {
+        let physical_request = request_idx % physical_requests;
         for page_offset in 0..pages_per_request {
-            page_indices.push((request_idx * pages_per_request + page_offset) as i32);
+            page_indices.push((physical_request * pages_per_request + page_offset) as i32);
         }
         page_indptr.push(page_indices.len() as i32);
     }
-    (page_indices, page_indptr)
+    Ok((page_indices, page_indptr))
 }
 
 fn measure_loop(
@@ -863,13 +1000,16 @@ fn describe_call(call: &KernelCall) -> String {
 fn print_text_report(report: &ModelReport, out: &Path, dot_out: &Path) {
     println!("{MODEL} decode operator report");
     println!(
-        "config: bs={} kv_len={} layers={} tp={} iters={} policy={}",
+        "config: bs={} kv_len={} layers={} tp={} iters={} policy={} qkv={} gate_up={} shared_kv_pages={}",
         report.config.batch_size,
         report.config.kv_len,
         report.config.layers,
         report.config.tp_world_size,
         report.config.iters,
-        report.config.numeric_policy
+        report.config.numeric_policy,
+        report.config.qkv_fusion,
+        report.config.gate_up_fusion,
+        report.config.shared_kv_pages
     );
     println!("json: {}", out.display());
     println!("dot:  {}", dot_out.display());
@@ -1044,4 +1184,18 @@ fn dot_escape(value: &str) -> String {
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_tables;
+
+    #[test]
+    fn shared_page_tables_stay_within_the_physical_buffer() {
+        let (indices, indptr) = page_tables(64, 2, 3).expect("shared page table");
+        assert_eq!(indices.len(), 128);
+        assert_eq!(indptr.len(), 65);
+        assert!(indices.iter().all(|&page| page == 0 || page == 1));
+        assert_eq!(&indices[..4], &[0, 1, 0, 1]);
+    }
 }

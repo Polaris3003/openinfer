@@ -99,6 +99,7 @@ fn tp2_graph_dump_when_available_and_concurrent_decode_complete() {
         lora: None,
         decode_overlap: DecodeOverlap::Off,
         batch_invariant: false,
+        projection_fusion: openinfer_qwen3::Qwen3ProjectionFusionOptions::default(),
         dflash_draft_model_path: None,
         enable_kv_events: false,
     };
