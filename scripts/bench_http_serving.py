@@ -824,7 +824,7 @@ def failed_result(
     )
 
 
-TRACE_RE = re.compile(r"pegainfer_http_trace\s+(\{.*\})")
+TRACE_RE = re.compile(r"pegainfer_(?:basic_)?http_trace\s+(\{.*\})")
 STREAM_ERROR_RE = re.compile(r'request failed .*self\.request_id="([^"]+)"')
 TRACE_MATCH_SLOP_S = 5.0
 

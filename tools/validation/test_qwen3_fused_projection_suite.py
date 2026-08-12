@@ -92,6 +92,8 @@ class CommandScopeTests(unittest.TestCase):
                 "test",
                 "--release",
                 "-p",
+                "pegainfer-frontend",
+                "-p",
                 "pegainfer-kernels",
                 "-p",
                 "pegainfer-qwen3",
@@ -304,6 +306,12 @@ class EndToEndSummaryTests(unittest.TestCase):
                                             "timeouts": 0,
                                         },
                                         "metrics": metrics,
+                                        "server_trace": {
+                                            "coverage_ratio": 1.0,
+                                            "token_timing_coverage_ratio": 1.0,
+                                            "prompt_tokens": {"samples": 20},
+                                            "completion_tokens": {"samples": 20},
+                                        },
                                     },
                                 )
                                 entry = add_entry(

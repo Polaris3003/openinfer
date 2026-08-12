@@ -49,7 +49,7 @@ DECODE_SHAPES = (1, 2, 4, 8, 16, 32, 64)
 PREFILL_SHAPES = (128, 512, 1_024, 2_048, 4_096, 8_192, 10_000)
 SCHEMA = 3
 REQUIRED_LORA_TARGETS = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}
-QWEN3_UNIT_PACKAGES = ("pegainfer-kernels", "pegainfer-qwen3")
+QWEN3_UNIT_PACKAGES = ("pegainfer-frontend", "pegainfer-kernels", "pegainfer-qwen3")
 
 
 def fusion_decision(mode: str) -> dict[str, Any]:
@@ -339,8 +339,6 @@ def run_http_benchmark_cell(args: argparse.Namespace) -> int:
         "0",
         "--server-log",
         str(server_log_path),
-        "--required-trace-coverage",
-        "1.0",
         "--ignore-eos",
         "--timeout",
         str(args.request_timeout),
@@ -349,6 +347,7 @@ def run_http_benchmark_cell(args: argparse.Namespace) -> int:
     ]
     child_env = os.environ.copy()
     child_env["PYTHONHASHSEED"] = str(args.seed)
+    child_env["PEGAINFER_BASIC_HTTP_TRACE"] = "1"
     with server_log_path.open("w") as server_log:
         server_log.write(f"$ {command_text(server_command)}\n")
         server_log.flush()
@@ -1071,6 +1070,14 @@ def benchmark_index(
             input_tokens_total = nested_number(report["summary"], ("input_tokens_total",))
             if completed <= 0:
                 raise ValueError("HTTP benchmark completed no requests")
+            trace = report.get("server_trace") or {}
+            if trace.get("coverage_ratio") != 1.0:
+                raise ValueError("HTTP benchmark server trace coverage is not 100%")
+            if trace.get("token_timing_coverage_ratio") != 1.0:
+                raise ValueError("HTTP benchmark token timing coverage is not 100%")
+            for field in ("prompt_tokens", "completion_tokens"):
+                if (trace.get(field) or {}).get("samples") != completed:
+                    raise ValueError(f"HTTP benchmark {field} coverage is not 100%")
             gpu_during = entry.get("gpu_during") or {}
             if gpu_during.get("samples", 0) <= 0 or not gpu_during.get("gpus"):
                 raise ValueError("benchmark 缺少运行期间 GPU clocks/power/peak-memory 采样")

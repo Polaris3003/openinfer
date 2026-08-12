@@ -58,6 +58,18 @@ class DoneOnlyHandler(BaseHTTPRequestHandler):
 
 
 class BenchHttpServingTests(unittest.TestCase):
+    def test_basic_http_trace_log_is_loaded(self) -> None:
+        with tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8") as handle:
+            handle.write(
+                'INFO pegainfer_basic_http_trace {"request_id":"cmpl-basic",'
+                '"queued_at_unix_s":1.0,"terminal_unix_s":2.0,'
+                '"prompt_tokens":8,"completion_tokens":4}\n'
+            )
+            handle.flush()
+            traces = bench_http_serving.load_server_traces(Path(handle.name))
+
+        self.assertEqual(traces["cmpl-basic"]["completion_tokens"], 4)
+
     def setUp(self) -> None:
         DoneOnlyHandler.response_body = b"data: [DONE]\n\n"
         DoneOnlyHandler.response_chunks = None

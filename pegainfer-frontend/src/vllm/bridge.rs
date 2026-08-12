@@ -440,6 +440,7 @@ struct RequestStreamState {
     stop_sentinel_id: Option<u32>,
     abort_reason: Arc<AtomicU8>,
     has_emitted_tokens: bool,
+    basic_http_trace: BasicHttpTrace,
     /// Request-lifetime root span (submit → finish). The scheduler opens
     /// queue/prefill/decode as children of this via the `SpanContext` passed in
     /// `GenerateRequest.trace_parent`, so the host-side phase breakdown is timed
@@ -460,6 +461,7 @@ impl RequestStreamState {
             stop_sentinel_id,
             abort_reason,
             has_emitted_tokens: false,
+            basic_http_trace: BasicHttpTrace::default(),
             trace_root,
         }
     }
@@ -467,6 +469,44 @@ impl RequestStreamState {
     fn abort(&self, reason: RequestAbortReason) {
         reason.store(&self.abort_reason);
     }
+}
+
+/// Minimal request timing and token-count evidence for model lines that do not
+/// expose scheduler-native HTTP traces. It is intentionally opt-in: retained
+/// benchmark runs enable it with `PEGAINFER_BASIC_HTTP_TRACE=1`, while normal
+/// serving avoids one info log per request.
+#[derive(Default)]
+struct BasicHttpTrace {
+    queued_at_unix_s: Option<f64>,
+    scheduled_at_unix_s: Option<f64>,
+    first_token_emit_unix_s: Option<f64>,
+}
+
+fn basic_http_trace_enabled() -> bool {
+    std::env::var_os("PEGAINFER_BASIC_HTTP_TRACE").is_some_and(|value| value != "0")
+}
+
+fn log_basic_http_trace(
+    request_id: &str,
+    trace: &BasicHttpTrace,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    finish_reason: &str,
+) {
+    if !basic_http_trace_enabled() {
+        return;
+    }
+    let payload = serde_json::json!({
+        "request_id": request_id,
+        "queued_at_unix_s": trace.queued_at_unix_s,
+        "scheduled_at_unix_s": trace.scheduled_at_unix_s,
+        "first_token_emit_unix_s": trace.first_token_emit_unix_s,
+        "terminal_unix_s": now_secs_f64(),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "finish_reason": finish_reason,
+    });
+    info!("pegainfer_basic_http_trace {payload}");
 }
 
 /// Drain the ready burst from the shared token channel (the `first` event plus
@@ -563,6 +603,8 @@ fn reduce_request(
                 prompt_tokens,
                 cached_tokens,
             } => {
+                state.basic_http_trace.queued_at_unix_s = Some(queued_at_unix_s);
+                state.basic_http_trace.scheduled_at_unix_s = Some(scheduled_at_unix_s);
                 state.first_token_events = Some(vec![
                     EngineCoreEvent {
                         r#type: EngineCoreEventType::Queued,
@@ -585,6 +627,10 @@ fn reduce_request(
                 });
             }
             TokenEvent::Token { id, logprob } => {
+                state
+                    .basic_http_trace
+                    .first_token_emit_unix_s
+                    .get_or_insert_with(now_secs_f64);
                 token_ids.push(id);
                 if let Some(position) = to_wire_position_logprobs(id, logprob) {
                     has_logprobs = true;
@@ -602,7 +648,9 @@ fn reduce_request(
                 state.kv_transfer_params = Some(params);
             }
             TokenEvent::Finished {
-                finish_reason: fr, ..
+                finish_reason: fr,
+                prompt_tokens,
+                completion_tokens,
             } => {
                 // PegaInfer suppresses EOS before emitting TokenEvents, while
                 // vLLM's text decoder expects the terminal Stop output to
@@ -617,16 +665,50 @@ fn reduce_request(
                         entries: Vec::new(),
                     });
                 }
+                let finish_reason_label = match fr {
+                    FinishReason::Length => "length",
+                    FinishReason::Stop => "stop",
+                    FinishReason::Error => "error",
+                };
+                log_basic_http_trace(
+                    request_id,
+                    &state.basic_http_trace,
+                    prompt_tokens,
+                    completion_tokens,
+                    finish_reason_label,
+                );
                 finish_reason = Some(convert_finish_reason(fr));
                 terminated = true;
             }
-            TokenEvent::Error { message, .. } => {
+            TokenEvent::Error {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                log_basic_http_trace(
+                    request_id,
+                    &state.basic_http_trace,
+                    prompt_tokens,
+                    completion_tokens,
+                    "error",
+                );
                 warn!("request {request_id} failed: {message}");
                 finish_reason = Some(EngineCoreFinishReason::Error);
                 stop_reason = Some(StopReason::Text(message));
                 terminated = true;
             }
-            TokenEvent::Rejected { message, .. } => {
+            TokenEvent::Rejected {
+                message,
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                log_basic_http_trace(
+                    request_id,
+                    &state.basic_http_trace,
+                    prompt_tokens,
+                    completion_tokens,
+                    "error",
+                );
                 // Rejected means the request could not be admitted, not that it
                 // completed cleanly.
                 warn!("request {request_id} rejected: {message}");
