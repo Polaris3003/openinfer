@@ -269,23 +269,6 @@ pub struct Qwen3LaunchOptions {
     reason = "launch is a one-shot ownership boundary used by external worker threads"
 )]
 pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHandle> {
-    launch_with_seed(model_path, options, 42)
-}
-
-/// Start Qwen3 with an explicit sampling seed.
-///
-/// The serving entry keeps the historical seed `42` through [`launch`];
-/// in-process benchmarks use this variant so their `--seed` flag remains
-/// effective while sharing the same TP and projection-fusion startup policy.
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "launch is a one-shot ownership boundary used by external worker threads"
-)]
-pub fn launch_with_seed(
-    model_path: &Path,
-    options: Qwen3LaunchOptions,
-    seed: u64,
-) -> Result<EngineHandle> {
     let device_ordinals = if options.tp_size == 1 {
         vec![options.device_ordinal]
     } else {
@@ -317,7 +300,7 @@ pub fn launch_with_seed(
         device_ordinals,
         parallel_config: None,
         ep_backend: EpBackend::Nccl,
-        seed,
+        seed: 42,
     };
     if options.offload.enabled {
         info!(

@@ -16,6 +16,7 @@ import json
 import os
 import pathlib
 import platform
+import signal
 import shlex
 import shutil
 import statistics
@@ -320,6 +321,8 @@ def run_http_benchmark_cell(args: argparse.Namespace) -> int:
         command_text(server_command),
         "--contract-name",
         "qwen3-fused-projection-parity",
+        "--backend",
+        "pegainfer",
         "--claim-boundary",
         "Matched HTTP A/B evidence for issue #746; production qualification still requires the suite correctness and projection gates.",
         "--num-requests",
@@ -334,6 +337,10 @@ def run_http_benchmark_cell(args: argparse.Namespace) -> int:
         str(args.output_len),
         "--temperature",
         "0",
+        "--server-log",
+        str(server_log_path),
+        "--required-trace-coverage",
+        "1.0",
         "--ignore-eos",
         "--timeout",
         str(args.request_timeout),
@@ -352,6 +359,7 @@ def run_http_benchmark_cell(args: argparse.Namespace) -> int:
             text=True,
             stdout=server_log,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
         try:
             wait_for_server(base_url, server, args.ready_timeout)
@@ -373,11 +381,17 @@ def run_http_benchmark_cell(args: argparse.Namespace) -> int:
             return 2
         finally:
             if server.poll() is None:
-                server.terminate()
+                try:
+                    os.killpg(server.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
                 try:
                     server.wait(timeout=15.0)
                 except subprocess.TimeoutExpired:
-                    server.kill()
+                    try:
+                        os.killpg(server.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     server.wait(timeout=5.0)
 
 
@@ -1053,12 +1067,17 @@ def benchmark_index(
             throughput = nested_number(report["summary"], ("output_tokens_per_s",))
             if report["summary"].get("failed") != 0 or report["summary"].get("timeouts") != 0:
                 raise ValueError("HTTP benchmark contains failed or timed-out requests")
+            completed = nested_number(report["summary"], ("completed",))
+            input_tokens_total = nested_number(report["summary"], ("input_tokens_total",))
+            if completed <= 0:
+                raise ValueError("HTTP benchmark completed no requests")
             gpu_during = entry.get("gpu_during") or {}
             if gpu_during.get("samples", 0) <= 0 or not gpu_during.get("gpus"):
                 raise ValueError("benchmark 缺少运行期间 GPU clocks/power/peak-memory 采样")
             index[key] = {
                 "metric": metric,
                 "throughput": throughput,
+                "input_tokens_per_request": input_tokens_total / completed,
                 "path": entry["output"],
                 "report": report,
                 "gpu_during": gpu_during,
@@ -1100,6 +1119,11 @@ def performance_decisions(
                             / baseline["throughput"]
                             * 100.0
                         )
+                        if (
+                            baseline["input_tokens_per_request"]
+                            != candidate["input_tokens_per_request"]
+                        ):
+                            continue
                         comparisons.append(
                             {
                                 "concurrency": conc,
@@ -1402,6 +1426,19 @@ def normalize_run_args(args: argparse.Namespace) -> None:
 def main() -> int:
     args = build_parser().parse_args()
     if args.command == "benchmark-cell":
+        for name in (
+            "tp_size",
+            "port",
+            "prompt_words",
+            "output_len",
+            "concurrency",
+            "warmup",
+            "iters",
+            "ready_timeout",
+            "request_timeout",
+        ):
+            if getattr(args, name) <= 0:
+                raise SystemExit(f"--{name.replace('_', '-')} 必须 > 0")
         return run_http_benchmark_cell(args)
     if args.command == "check-fixture":
         try:

@@ -24,18 +24,22 @@ class DecisionTests(unittest.TestCase):
                     index[(1, profile, concurrency, "split", repeat)] = {
                         "metric": baseline,
                         "throughput": 100.0,
+                        "input_tokens_per_request": 1_024.0,
                     }
                     index[(1, profile, concurrency, "qkv", repeat)] = {
                         "metric": baseline * (1.0 - qkv_delta / 100.0),
                         "throughput": 100.0 * (1.0 + qkv_delta / 100.0),
+                        "input_tokens_per_request": 1_024.0,
                     }
                     index[(1, profile, concurrency, "gate-up", repeat)] = {
                         "metric": baseline * (1.0 - gate_delta / 100.0),
                         "throughput": 100.0 * (1.0 + gate_delta / 100.0),
+                        "input_tokens_per_request": 1_024.0,
                     }
                     index[(1, profile, concurrency, "both", repeat)] = {
                         "metric": baseline * 0.9,
                         "throughput": 110.0,
+                        "input_tokens_per_request": 1_024.0,
                     }
         return index
 
@@ -292,6 +296,10 @@ class EndToEndSummaryTests(unittest.TestCase):
                                         },
                                         "summary": {
                                             "output_tokens_per_s": throughput,
+                                            "completed": 20,
+                                            "input_tokens_total": (
+                                                20 * profile["prompt_words"]
+                                            ),
                                             "failed": 0,
                                             "timeouts": 0,
                                         },

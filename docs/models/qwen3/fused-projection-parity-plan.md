@@ -1,6 +1,6 @@
 # Qwen3 parity-safe fused projections（Issue #746）
 
-> **TL;DR:** QKV 与 gate/up 候选融合路径及验证套件已实现；SM86 TP1/TP2 实测完成且正确性门禁全绿，但按既定决策规则只有 TP1 decode QKV 达到性能资格。分支仍缺五投影 LoRA fixture 与原始 suite 产物，且 `Auto` 尚不区分 GPU 架构/工具链，因此默认继续 split，待补齐可复核证据后由维护者决定是否以及如何放行 fused。
+> **TL;DR:** QKV 与 gate/up 候选融合路径及验证套件已迁到最新 PegaInfer 主干；SM86 旧主干实测正确性全绿，但按既定规则只有 TP1 decode QKV 达到性能资格。主干 frontend 重构后性能门禁已改走真实 HTTP serving。分支仍缺五投影 LoRA fixture、原始 suite 产物与当前 HEAD 的 Linux CUDA 重跑，且 `Auto` 尚不区分 GPU 架构/工具链，因此默认继续 split。
 >
 > **Last touched:** 2026-08
 
@@ -360,10 +360,10 @@ candidate = split_copy(candidate_qkv)
   - `Auto/Split/ForceFused` resolution；
   - 生产白名单；
   - 明确错误消息和单元测试。
-- `pegainfer-server/src/main.rs`
-  - Qwen3-only CLI 接线。
-- `pegainfer-server/src/bin/bench_serving/{cli.rs,main.rs}`（以实际文件布局为准）
-  - Qwen3 TP size 与 fusion A/B 接线；修正当前 Qwen3 in-process bench 固定 `[0]` 的限制。
+- `pegainfer-qwen3/src/model_line.rs`
+  - Qwen3-only CLI 接线与 launch options 组装。
+- `tools/validation/qwen3_fused_projection_suite.py`
+  - 通过正式 server + HTTP client 运行 TP/fusion A/B，不恢复已删除的 in-process benchmark。
 
 完成条件：
 
@@ -659,12 +659,10 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   - 构造期解析为 decode、prefill/unified 四个不可变布尔值；
   - 强制模式仅接受 Qwen3-4B、TP1/TP2、`NumericPolicy::Tuned`、`DecodeOverlap::Off`；
   - 生产 `Auto` 白名单保持为空。
-- 配置已穿过 server、scheduler、executor 与 model loader。
+- 配置已穿过 Qwen3 ModelLine、scheduler、executor 与 model loader。
 - server 新增 `--qwen3-qkv-fusion`、`--qwen3-gate-up-fusion`。
-- in-process `bench_serving` 同样接入两个参数，并修正原 Qwen3 分支将
-  device 固定为 `[0]`、无法真正运行 `--tp-size=2` 的问题。
-- 新增 `launch_with_seed`，保证 benchmark 改走统一 launch policy 后原有
-  `--seed` 仍然生效。
+- 性能 suite 通过正式 server 运行真实 TP1/TP2；HTTP client 的随机种子独立记录，
+  不需要为已删除的 in-process benchmark 扩展模型 public API。
 
 ### Step 2 — checked QKV split operator（已实现，待 GPU 单测）
 
@@ -711,9 +709,9 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
   只能证明 topology/非 GEMM component，不能代替端到端性能资格。
 - report schema 记录两条 projection topology，默认产物路径包含 topology，
   避免不同模式互相覆盖。
-- `bench_serving` 已能以同一启动路径运行四种组合和真实 TP1/TP2，可用于
-  端到端 32-cell A/B；JSON/text run metadata 记录 TP size 与两条 requested
-  fusion mode，避免产物脱离实验组语义。
+- HTTP benchmark cell 以同一正式启动路径运行四种组合和真实 TP1/TP2，可用于
+  端到端 A/B；JSON 记录 TP size、requested/resolved fusion plan、server command
+  与 server log，避免产物脱离实验组语义。
 - 新增 `qwen3_projection_report`：用真实 rank-local 权重、同一 patterned
   BF16 输入和同一 CUDA stream，按 36 层比较 QKV raw projection、
   gate/up raw projection 与完整 SwiGLU aggregate；覆盖 TP1 与 TP2 两个
@@ -747,15 +745,13 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - `git diff --check`：通过。
 - `cargo metadata --no-deps --format-version 1`：通过。
 - LoRA fixture 生成脚本 Python AST parse：通过。
-- validation suite `--help` 与完整 `--dry-run`：通过；完整矩阵展开为
-  103 个命令（20 个正确性/预检、3 个 rank numerical report、16 个
-  topology report、64 个 E2E benchmark）。
-- validation suite Python 单测：7/7 通过，覆盖 Qwen3 unit package 精确作用域、
+- 原分支 validation suite `--help` 与完整 `--dry-run` 展开为 103 个命令；最新
+  主干增加独立 server CLI unit gate，schema-v3 dry-run 为 104 个命令。
+- validation suite Python 单测：8/8 通过，覆盖 Qwen3 unit target 精确作用域、
   projection report feature、topology shared-KV mode、phase-specific 2%/3%
   threshold、重复方向不一致 fail-closed、旧 q/v-only fixture fail-closed，
-  以及完整 synthetic 103-command 证据到最终 Markdown/decision table 的汇总。
-- 完整 dry-run 复核仍为 `103 = 20 correctness + 3 projection + 16
-  topology + 64 benchmark`，manifest 中没有任何 `--workspace` 参数。
+  真实 HTTP benchmark 路由，以及完整 synthetic 证据到最终 Markdown/decision
+  table 的汇总。manifest 中禁止 `--workspace`。
 - 当前 fixture 预检：按预期失败，明确缺少 `k_proj/gate_proj/up_proj`；
   这是待补产物，不是已通过 gate。
 - `PEGAINFER_CUDA_SM=120 cargo check --release -p pegainfer-qwen3 --lib`：
@@ -815,8 +811,9 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - AutoDL 单独编译 HF gate 时，Cargo 同时构建没有 `required-features` 的
   package binary；`qwen3_projection_report` 使用 optional `clap`，但默认
   feature 未启用它，因而报 unresolved import 和缺失 derive attributes。
-- 新增最小 `projection-report = ["dep:clap"]` feature，并将该 binary 标记
-  为 required feature；HF/LoRA/default lib 构建会跳过它。
+- 原分支新增最小 `projection-report = ["dep:clap"]` feature，并将该 binary
+  标记为 required feature；迁到最新主干后 `clap` 已因 `ModelLine` 成为常规
+  dependency，因此 feature 保留为空的 target gate，不再重复声明 `dep:clap`。
 - validation suite 的 projection rank 命令显式传
   `--features projection-report`；不复用会额外拉入 CUPTI/trace/report
   dependencies 的 `kernel-report` feature。
@@ -847,10 +844,10 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - 新增可序列化 `Qwen3ProjectionFusionPlan`：四个 projection/phase decision
   各自记录 fused bool 与 explicit/forced/Auto qualification reason；默认 Auto
   白名单仍为空。
-- `bench_serving` 在加载前调用模型 crate 的同一 resolver，并在 JSON 中同时记录
-  requested 与 resolved plan；validation summarizer 将 resolved plan 纳入 cell
-  完整性校验。artifact schema 升至 v2，旧 v1 结果需重跑而不是静默兼容。
-- 本地通过 `cargo fmt --all --check`、`cargo metadata --locked --no-deps`、
+- 旧主干 `bench_serving` 曾在 JSON 中记录 requested/resolved plan；该 binary 已被
+  最新主干明确删除，迁移后的 suite 改走真实 HTTP server/client cell 并记录同一
+  四项 plan。artifact schema 升至 v3，旧 v1/v2 结果需重跑而不是静默兼容。
+- 原分支本地通过 `cargo fmt --all --check`、`cargo metadata --locked --no-deps`、
   Python validation 单测 `7/7`、`py_compile` 和 `git diff --check`。
 - Rust release unit test 在 macOS 仍被 Linux-only `rdma-mummy-sys` headers 与无
   nvcc 环境挡住，未进入目标 crate type-check；fixture preflight 按预期失败，
@@ -860,11 +857,27 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - 结果：元数据和资格原因闭环；Auto 不变。剩余外部输入是 SM86 原始 suite 目录
   和实跑使用的五投影 LoRA fixture。
 
+### Step 16 — 最新主干迁移与真实 HTTP 性能门禁
+
+- 远端 `main@489bd55` 相对原分支基线领先 74 个提交，包含 OpenInfer→PegaInfer
+  重命名和 frontend/model-line 重构；原分支不能直接开 PR。
+- 在独立 worktree 建立 `feat/qwen3-fused-projection-parity-v2`，保持原工作区和
+  issue #780 未提交文件不变；算法/kernel/Qwen3 forward 补丁迁移无语义冲突。
+- 不恢复上游删除的 Dynamo backend、central server config 或 `bench_serving`。
+  两个 fusion flag 迁入 Qwen3 `ModelLine`，由模型 crate 独占并组装 launch options。
+- validation schema 升至 v3。每个 performance cell 独立启动正式 server，通过
+  `/v1/models` readiness 后运行 `scripts/bench_http_serving.py`，采集真实 HTTP
+  TTFT/TPOT/吞吐与 GPU 状态，随后关闭 server；旧 in-process 结果不可复用。
+- Qwen3 lib unit 与 server CLI unit 分开执行，匹配最新主干 binary-only server
+  的 package 边界。Python suite 单测增至 `8/8`。
+- 本机 Rust release test 仍在目标 crate 前被 macOS 缺 Linux RDMA headers 阻断；
+  Linux CUDA 当前 HEAD 重跑仍是开 PR 前硬门禁。
+
 ## Debrief
 
 - **Outcome**:
-  - 融合候选与 103-command fail-closed 验证套件已实现；生产白名单仍为空。
-  - Qwen3 unit 门禁已收敛到 kernel/model/server 三个相关 package，不再要求
+  - 融合候选与 fail-closed 验证套件已迁到最新主干；生产白名单仍为空。
+  - Qwen3 unit 门禁已收敛到 kernel/model/server 三个相关 target，不再要求
     为无关 GLM/Kimi DeepEP 安装 NCCL ≥ 2.30.4。
   - SM86 实测已完成；现有规则只支持 TP1 decode QKV 的局部 `ENABLE` 结论，
     但尚不能安全转化为跨 GPU Auto 白名单。
@@ -883,13 +896,15 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
     时失败。
   - topology/shape trace 不应继承 serving admission 的完整状态成本；可以
     共享无语义 payload，但必须把这种别名严格限制在非正确性、非性能 harness。
+  - 上游删除的 in-process benchmark 不应为旧补丁复活；性能资格必须跟随当前
+    项目的真实 HTTP serving 边界。
 - **Lessons learned**:
   - 专项验证的 preflight 必须与被验证产品面的 feature/package closure 一致；
     全 workspace 健康度可以是独立 CI，但不能成为 Qwen3 优化报告的隐藏前置条件。
   - 门禁作用域也需要结构化回归测试，不能只依赖文档约定。
 - **Follow-ups**:
-  - 从 AutoDL/SM86 主机取回原始 suite 目录和五投影 LoRA fixture；在当前 HEAD
-    重跑 metadata 受影响 cell 后再开 PR。
+  - 从 AutoDL/SM86 主机取回原始 suite 目录和五投影 LoRA fixture；在最新主干
+    当前 HEAD 重跑 schema-v3 全套 suite 后再开 PR。
   - 用户决定是否放行 TP1 decode QKV；未建立 SM/toolchain 资格边界前，默认
     Auto 保持 split。
   - 其他 Qwen3 size、TP>2、sm90/sm120、Pin/PerToken 和 Green Context 仍需独立证据。

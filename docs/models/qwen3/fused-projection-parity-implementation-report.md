@@ -1,6 +1,6 @@
 # Qwen3 fused projection 候选实现报告（Issue #746）
 
-> **TL;DR:** Qwen3 已具备彼此独立、构造期固定的 QKV 与 gate/up 融合候选路径及 fail-closed 验证套件。Issue 评论记录的 SM86/CUDA 12.6 实测完成 correctness `20/20`、projection `3/3`、topology `16/16`、E2E `64/64`；按既定规则仅 TP1 decode QKV 达到性能资格。默认 `Auto` 仍为空；原始 suite 目录和实跑使用的五投影 LoRA fixture 尚未进入分支，且 Auto 未按 GPU/工具链限定，因此当前可合入的是候选与证据链，不是跨硬件默认 fused。
+> **TL;DR:** Qwen3 已在最新 PegaInfer 主干上具备彼此独立、构造期固定的 QKV 与 gate/up 融合候选路径及 fail-closed 验证套件。Issue 评论记录的 SM86/CUDA 12.6 旧主干实测全部通过，且仅 TP1 decode QKV 达到性能资格；主干 frontend 重构后，CLI 已迁入 Qwen3 `ModelLine`，性能门禁已迁到真实 HTTP serving。默认 `Auto` 仍为空；原始 suite、五投影 LoRA fixture 和当前 HEAD 的 Linux CUDA 重跑尚未补齐，因此当前结论仍不是跨硬件默认 fused。
 >
 > **Last touched:** 2026-08
 
@@ -200,21 +200,20 @@ TP1 prefill gate/up: fused
 配置链路如下：
 
 ```text
-pegainfer-server Args
+Qwen3 ModelLine / Qwen3Cli
   → Qwen3LaunchOptions
-  → launch / launch_with_seed
+  → launch
   → scheduler::start_qwen3
   → Qwen3Executor::from_runtime_with_projection_fusion
   → ModelRuntimeConfig
   → Qwen3Model::from_safetensors_with_runtime
-  → ResolvedProjectionFusion::resolve
+  → Qwen3ProjectionFusionPlan::resolve
   → Qwen3Model.projection_fusion
 ```
 
 涉及文件：
 
-- `pegainfer-server/src/config.rs`
-- `pegainfer-server/src/main.rs`
+- `pegainfer-qwen3/src/model_line.rs`
 - `pegainfer-qwen3/src/lib.rs`
 - `pegainfer-qwen3/src/scheduler.rs`
 - `pegainfer-qwen3/src/executor.rs`
@@ -235,17 +234,8 @@ CLI 的 `fused` 映射为内部 `ForceFused`，名称差异是有意的：
 - 对用户表达“我要跑 fused A/B”。
 - 对代码表达“这是强制诊断模式，不是生产白名单”。
 
-参数被加入 Qwen3 consumed-args 列表；其他模型不能把这些参数误当作有效配置。
-
-### 4.2 `launch_with_seed`
-
-`pegainfer-qwen3/src/lib.rs` 新增 `launch_with_seed`。
-
-原因不是 projection 数学本身，而是 `bench_serving` 为了复用正式 `launch` 的 TP 与 fusion policy，不能丢掉原有 benchmark `--seed`。普通 server 的 `launch` 继续保持历史 seed `42`，benchmark 调用显式 seed 版本。
-
-### 4.3 Dynamo 兼容
-
-`pegainfer-dynamo-backend/src/engine.rs` 给新增字段填入默认 options，保证 Dynamo worker 仍保持原 split 行为，没有隐式打开候选路径。
+参数由 Qwen3 `ModelLine` 独占；其他模型不会注册这些参数。上游已删除旧 Dynamo
+backend 和 in-process benchmark，因此不再为已删除入口保留 seed 或默认字段 shim。
 
 ## 5. QKV CUDA split operator
 
@@ -685,42 +675,23 @@ report schema 记录两条 requested topology，默认输出文件名也包含 t
 
 真实 server 通过 `Qwen3LaunchOptions` 传入两个独立 control，因此 force A/B 使用的不是测试专用 forward。
 
-### 12.2 `bench_serving`
+### 12.2 真实 HTTP benchmark
 
-原 Qwen3 benchmark 构造：
+最新主干已删除绕过 serving stack 的 `bench_serving`，HTTP benchmarking 是唯一保留的服务性能入口。验证 suite 的每个 cell 现在：
 
-```text
-device_ordinals = [0]
-```
+1. 用 Qwen3 正式 server 和指定 TP/fusion 参数启动独立进程；
+2. 等待 `/v1/models` 就绪；
+3. 运行 `scripts/bench_http_serving.py`，采集 TTFT/TPOT/吞吐、失败率和 GPU 状态；
+4. 将 requested/resolved plan、server command 和 server log 写入 cell 产物；
+5. 终止该 server 后再进入下一个 matched A/B cell。
 
-即使用户传 `--tp-size=2`，Qwen3 也不会真实进入 TP2。
+这避免复活上游明确删除的旧 binary，也确保数字包含 frontend、bridge、scheduler 和真实 executor。
+每个 cell 强制 `100%` server-trace coverage；summarizer 还要求 matched A/B 的
+实际 input tokens/request 相同，避免把 prompt 生成或 tokenization 漂移误算成收益。
 
-现在改为调用 Qwen3 正式 `launch_with_seed`：
+### 12.3 CLI 所有权
 
-- TP1：使用 `device_ordinal`
-- TP2：使用 devices `0..tp_size`
-- 同时传入两个 fusion control
-- 保留 benchmark sampling seed
-
-### 12.3 Benchmark 产物自描述
-
-`RunInfo` 新增：
-
-- `tp_size`
-- `qwen3_projection_fusion`
-
-text 和 JSON 都会记录，例如：
-
-```text
-tp_size=2
-projection_fusion=qkv=fused,gate_up=split
-```
-
-这是 requested mode。真正 resolved 状态仍以模型启动日志为准；当前空白名单下 `auto` 一定解析为 split。
-
-### 12.4 非 Qwen3 防误用
-
-在其他 model type 上显式传非 auto 的 Qwen3 fusion 参数会报错，不会接受一个实际无效的 benchmark 标签。
+两个 fusion flag 属于 `pegainfer-qwen3/src/model_line.rs::Qwen3Cli`，由 Qwen3 自己解析并组装 `Qwen3LaunchOptions`。其他模型不会注册这些参数，因此不存在“接受标签但未执行”的静默路径。
 
 ## 13. 测试改动
 
@@ -862,7 +833,7 @@ cell、GPU clock/power/memory 或 selected-algo 细节。
 
 ### 15.5 2026-08-12 本地续作验证
 
-- Python validation 单测：`7/7` 通过。
+- 原分支 Python validation 单测：`7/7` 通过；最新主干 HTTP 迁移后为 `8/8`。
 - `cargo fmt --all --check`、`cargo metadata --locked --no-deps`、
   `py_compile`、`git diff --check`：通过。
 - fixture preflight：按预期失败，缺 `k_proj/gate_proj/up_proj`。
@@ -931,7 +902,7 @@ patterned BF16 输入，按 layer、shape、TP rank 输出：
 分别运行 rank 0/rank 1，不能以 local shape 模拟真实 shard weight。
 
 Issue 评论证明 Linux CUDA JSON 曾成功生成并汇总；当前缺口是把该 raw 目录导入
-可复核位置，并在 schema v2/current HEAD 上重跑，而不是继续补 reporter 代码。
+可复核位置，并在 schema v3/current HEAD 上重跑，而不是继续补 reporter 代码。
 
 ### 16.4 Prefill fused GEMM 没有独立显式 startup tuning 证据
 
@@ -943,13 +914,13 @@ Issue 评论证明 Linux CUDA JSON 曾成功生成并汇总；当前缺口是把
 - 是否需要与 decode 分开的 prefill tuning。
 - 10k prompt 的 scratch 是否压缩 KV admission。
 
-### 16.5 Benchmark 同时记录 requested 与完整 resolved plan（已补齐）
+### 16.5 HTTP cell 同时记录 requested 与完整 resolved plan（已补齐）
 
-保留 `qwen3_projection_fusion` requested 字符串用于向后兼容；新增
-`qwen3_projection_fusion_resolved`，逐项记录 decode/prefill-unified 的 QKV、
-gate/up fused bool 与 reason。benchmark 在加载权重前调用模型 crate 的同一
-resolver，validation summarizer 要求该结构与实验 mode 精确一致，缺失或漂移
-直接使 cell 失败。
+每个强制 A/B cell 在 JSON 中记录 TP、QKV/gate-up requested mode 和四项
+resolved decision。`split` 对应 `explicit_split`，`fused` 只有在 production
+resolver 接受后 server 才能就绪，对应 `forced_fused`；不支持的组合在 readiness
+之前失败。summarizer 要求该结构与实验 mode 精确一致，缺失或漂移直接使 cell
+失败。Auto 资格仍以模型启动日志和 resolver 单测为准，不能由强制 A/B 外推。
 
 ## 17. 合入前建议门禁
 
@@ -979,7 +950,6 @@ resolver，validation summarizer 要求该结构与实验 mode 精确一致，�
 | --- | --- |
 | fusion policy | `pegainfer-qwen3/src/projection_fusion.rs` |
 | public launch options | `pegainfer-qwen3/src/lib.rs::Qwen3LaunchOptions` |
-| seed-preserving launch | `pegainfer-qwen3/src/lib.rs::launch_with_seed` |
 | executor constructor | `pegainfer-qwen3/src/executor.rs::from_runtime_with_projection_fusion` |
 | model-load resolution | `pegainfer-qwen3/src/weights/load.rs::from_safetensors_with_runtime` |
 | resolved model state | `pegainfer-qwen3/src/weights.rs::Qwen3Model::projection_fusion` |
@@ -992,11 +962,9 @@ resolver，validation summarizer 要求该结构与实验 mode 精确一致，�
 | prefill scratch/forward | `pegainfer-qwen3/src/prefill.rs::PrefillBuffers` |
 | unified forward | `pegainfer-qwen3/src/unified_forward.rs` |
 | verify fixed buffers | `pegainfer-qwen3/src/verify_graph.rs` |
-| server CLI | `pegainfer-server/src/config.rs::CliProjectionFusion` |
-| server wiring | `pegainfer-server/src/main.rs::load_engine` |
-| benchmark CLI | `pegainfer-server/src/bin/bench_serving/cli.rs` |
-| benchmark launch | `pegainfer-server/src/bin/bench_serving/main.rs` |
-| benchmark metadata | `pegainfer-server/src/bin/bench_serving/{report,runners,render}.rs` |
+| server CLI/wiring | `pegainfer-qwen3/src/model_line.rs::{Qwen3Cli,Qwen3Line::launch}` |
+| HTTP benchmark client | `scripts/bench_http_serving.py` |
+| benchmark cell lifecycle/metadata | `tools/validation/qwen3_fused_projection_suite.py::run_http_benchmark_cell` |
 | model operator report | `pegainfer-qwen3/src/bin/qwen3_model_report.rs` |
 | real-weight projection report | `pegainfer-qwen3/src/{projection_report.rs,bin/qwen3_projection_report.rs}` |
 | cuBLASLt selected algorithm query | `pegainfer-kernels/{csrc/shared/linear.cu,src/ops/linear.rs}` |
@@ -1079,7 +1047,7 @@ resolver，validation summarizer 要求该结构与实验 mode 精确一致，�
 - 将 resolved topology 提升为可序列化 `Qwen3ProjectionFusionPlan`；每个
   decision 带 qualification reason，启动日志和 benchmark JSON 不再只有
   requested mode。
-- validation summarizer 强制校验 resolved metadata；Python 单测 `7/7`、
+- validation summarizer 强制校验 resolved metadata；原分支 Python 单测 `7/7`、
   format、metadata、语法和 diff 门禁通过。
 - suite artifact schema 升至 v2；旧 v1 产物会明确拒绝汇总，避免在缺少
   resolved topology 时复用旧性能结论。
@@ -1090,13 +1058,24 @@ resolver，validation summarizer 要求该结构与实验 mode 精确一致，�
 - 结果：评审元数据闭环完成；Auto 继续空白名单，原始 suite 目录和五投影 fixture
   仍是 PR 自包含证据的缺口。
 
+### Step 7 — 迁移到最新 PegaInfer frontend 边界
+
+- 从远端 `main@489bd55` 建立独立迁移分支，保留原分支和用户工作区不变。
+- 核心 projection policy、kernel、buffer、decode/prefill/unified、LoRA 与 TP gate
+  均迁入 `pegainfer-*` crate；唯一 facade 偏移是补回 `split_qkv_into` re-export。
+- 上游已删除 central server config、Dynamo backend 与 `bench_serving`；不恢复这些
+  旧边界。fusion CLI 进入 Qwen3 `ModelLine`，性能 suite 改为真实 HTTP A/B。
+- artifact schema 升至 v3，强制拒绝旧主干的 v1/v2 benchmark 产物。
+- 本地通过 format、metadata、Python `8/8`、py_compile 和 diff gate；Rust GPU
+  编译/执行仍需 Linux CUDA 主机。
+
 ## Debrief
 
 - **Outcome**:
   - 形成了从背景、策略、kernel、buffer、forward、TP、LoRA、Graph、trace、benchmark 到验证状态的完整实现报告。
   - 明确区分 SM86 已执行结果、当前工作区可复核证据和跨架构生产资格。
-  - benchmark 现在记录实际 resolved plan 与 reason，不会在未来 Auto 部分命中时
-    把 requested mode 冒充执行拓扑。
+  - HTTP cell 记录强制 A/B 的实际 resolved plan 与 reason；Auto 部分命中仍由
+    production resolver 和启动日志独立证明，避免把 requested mode 冒充执行拓扑。
 - **Pitfalls encountered**:
   - diff 规模较大，仅按文件罗列会掩盖配置、buffer 和 graph 之间的依赖，因此报告改按请求执行链组织。
   - “默认仍 split”不等于资源行为绝对不变；新实现会省掉旧 baseline 未使用的 decode `qkv_out`。
@@ -1105,8 +1084,8 @@ resolver，validation summarizer 要求该结构与实验 mode 精确一致，�
   - 对 CUDA Graph 路径，policy、buffer variant 和 tuning shape 必须是同一个构造期事实。
   - 实验配置必须进入真实 server/benchmark 路径，否则测到的结果不能作为生产证据。
 - **Follow-ups**:
-  - 从 SM86 执行主机取回原始 suite 目录和五投影 LoRA fixture，并在当前 HEAD
-    重跑受 resolved-metadata 改动影响的 benchmark/summarizer cell。
+  - 从 SM86 执行主机取回原始 suite 目录和五投影 LoRA fixture，并在最新主干
+    当前 HEAD 重跑 schema-v3 全套 suite；旧 `bench_serving` 数据只作历史参考。
   - 用户决定是否只放行 TP1 decode QKV；若放行，必须先解决 SM86 证据如何限制
     到 GPU/工具链的问题，否则 Auto 继续 split。
   - 其他 Qwen3 size、TP>2、sm90/sm120、Pin/PerToken 和 Green Context 仍需独立证据。
