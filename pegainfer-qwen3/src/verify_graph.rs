@@ -106,6 +106,8 @@ impl VerifyGraphBuffers {
                 kv_dim,
                 inter_dim,
                 max_total_rows,
+                model.fused_qkv(crate::projection_fusion::ProjectionPhase::PrefillUnified),
+                model.fused_gate_up(crate::projection_fusion::ProjectionPhase::PrefillUnified),
             )?,
             hidden: HiddenStates::zeros(ctx, hidden_dim, max_total_rows)?,
             captured_hidden: HiddenStates::zeros(

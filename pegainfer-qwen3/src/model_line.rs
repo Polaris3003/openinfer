@@ -16,11 +16,13 @@ use pegainfer_frontend::vllm::LoraModule;
 use pegainfer_frontend::vllm::parse_lora_modules_arg;
 
 use crate::DecodeOverlap;
+use crate::ProjectionFusionControl;
 use crate::Qwen3LaunchOptions;
 use crate::Qwen3LoraOptions;
 use crate::Qwen3MemoryOptions;
 use crate::Qwen3OffloadOptions;
 use crate::Qwen3P2pOptions;
+use crate::Qwen3ProjectionFusionOptions;
 use crate::Qwen3VllmCompatOptions;
 
 pub static MODEL_LINE: Qwen3Line = Qwen3Line;
@@ -116,6 +118,17 @@ struct Qwen3Cli {
     /// incompatible with `--kv-offload`, which keeps prefix matching on regardless.
     #[arg(long, default_value_t = false)]
     batch_invariant: bool,
+
+    /// QKV projection fusion control. `auto` is fail-closed and enables only
+    /// qualified production entries; `fused` is a diagnostic A/B override
+    /// that rejects unsupported geometry, TP, or runtime modes.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    qwen3_qkv_fusion: CliProjectionFusion,
+
+    /// Gate/up projection fusion control; semantics match
+    /// `--qwen3-qkv-fusion`.
+    #[arg(long, value_enum, default_value_t = CliProjectionFusion::Auto)]
+    qwen3_gate_up_fusion: CliProjectionFusion,
 }
 
 /// CLI selector for prefill/decode overlap. Mapped to [`DecodeOverlap`]
@@ -139,6 +152,24 @@ impl CliDecodeOverlap {
             Self::GreenCtx => DecodeOverlap::GreenCtx {
                 decode_pct: decode_sm_pct,
             },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, clap::ValueEnum)]
+enum CliProjectionFusion {
+    #[default]
+    Auto,
+    Split,
+    Fused,
+}
+
+impl CliProjectionFusion {
+    const fn resolve(self) -> ProjectionFusionControl {
+        match self {
+            Self::Auto => ProjectionFusionControl::Auto,
+            Self::Split => ProjectionFusionControl::Split,
+            Self::Fused => ProjectionFusionControl::ForceFused,
         }
     }
 }
@@ -357,6 +388,10 @@ impl ModelLine for Qwen3Line {
                 lora,
                 decode_overlap: cli.decode_overlap.resolve(cli.decode_sm_pct),
                 batch_invariant: cli.batch_invariant,
+                projection_fusion: Qwen3ProjectionFusionOptions {
+                    qkv: cli.qwen3_qkv_fusion.resolve(),
+                    gate_up: cli.qwen3_gate_up_fusion.resolve(),
+                },
                 dflash_draft_model_path: shared.dflash_draft_model_path.clone(),
                 // KV block events are a Dynamo-backend concern; the plain
                 // server never publishes them.
@@ -504,5 +539,39 @@ mod tests {
     #[test]
     fn lora_default_rank_is_64() {
         assert_eq!(Qwen3LoraOptions::default().max_lora_rank, 64);
+    }
+
+    #[test]
+    fn parses_projection_fusion_controls() {
+        let (shared, matches, provided) = parse_for_line(
+            &MODEL_LINE,
+            &[
+                "pegainfer",
+                "--qwen3-qkv-fusion",
+                "fused",
+                "--qwen3-gate-up-fusion",
+                "split",
+            ],
+        )
+        .expect("projection fusion flags should parse");
+        let config = serde_json::json!({});
+        let ctx = LaunchContext {
+            model_path: std::path::Path::new("unused"),
+            config: &config,
+            shared: &shared,
+            matches: &matches,
+        };
+        MODEL_LINE
+            .validate(&ctx, &provided)
+            .expect("projection fusion flags should be owned by Qwen3");
+        let parsed = cli(&ctx);
+        assert_eq!(
+            parsed.qwen3_qkv_fusion.resolve(),
+            ProjectionFusionControl::ForceFused
+        );
+        assert_eq!(
+            parsed.qwen3_gate_up_fusion.resolve(),
+            ProjectionFusionControl::Split
+        );
     }
 }

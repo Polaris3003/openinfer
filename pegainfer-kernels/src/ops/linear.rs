@@ -198,6 +198,59 @@ pub fn gemm_lt_tune(
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GemmLtAlgorithmMetadata {
+    pub algo_id: i32,
+    pub tile_id: i32,
+    pub stages_id: i32,
+    pub splitk: i32,
+    pub reduction_scheme: i32,
+    pub swizzling: i32,
+    pub custom_option: i32,
+}
+
+/// Return the exact cuBLASLt winner cached for `(M,N,K)` on this thread.
+///
+/// This is report-only state inspection. `None` means the shape is not tuned
+/// (for example production prefill `N > GEMM_LT_MAX_N`); launches do not depend
+/// on this query.
+pub fn gemm_lt_algorithm_metadata(
+    num_rows: usize,
+    n: usize,
+    cols: usize,
+) -> Result<Option<GemmLtAlgorithmMetadata>> {
+    let mut metadata = GemmLtAlgorithmMetadata {
+        algo_id: 0,
+        tile_id: 0,
+        stages_id: 0,
+        splitk: 0,
+        reduction_scheme: 0,
+        swizzling: 0,
+        custom_option: 0,
+    };
+    let status = unsafe {
+        ffi::gemm_lt_algo_metadata_cuda(
+            num_rows as i32,
+            n as i32,
+            cols as i32,
+            &mut metadata.algo_id,
+            &mut metadata.tile_id,
+            &mut metadata.stages_id,
+            &mut metadata.splitk,
+            &mut metadata.reduction_scheme,
+            &mut metadata.swizzling,
+            &mut metadata.custom_option,
+        )
+    };
+    match status {
+        0 => Ok(Some(metadata)),
+        GEMM_LT_UNTUNED => Ok(None),
+        other => bail!(
+            "cublasLt algorithm metadata query failed: status={other}, m={num_rows}, n={n}, k={cols}"
+        ),
+    }
+}
+
 /// Mirrors the GEMM_LT_PIN_* sentinels in csrc/shared/linear.cu.
 const GEMM_LT_PIN_UNTUNED: i32 = -1;
 const GEMM_LT_PIN_UNSUPPORTED: i32 = -2;

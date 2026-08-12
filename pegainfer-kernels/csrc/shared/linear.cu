@@ -448,6 +448,66 @@ int gemm_lt_cuda(const __nv_bfloat16 *W, const __nv_bfloat16 *X, __nv_bfloat16 *
   return static_cast<int>(cudaPeekAtLastError());
 }
 
+// Report-only query for the exact tuned winner held by this thread. Production
+// launch never parses logs or consults this API; diagnostics call it after
+// gemm_lt_tune_cuda so TP1/TP2 shape-dependent algorithm choices are explicit.
+int gemm_lt_algo_metadata_cuda(int M, int N, int K, int *out_algo_id, int *out_tile_id,
+                               int *out_stages_id, int *out_splitk,
+                               int *out_reduction_scheme, int *out_swizzling,
+                               int *out_custom_option) {
+  auto it = g_lt_plans.find(std::array<int, 3>{M, N, K});
+  if (it == g_lt_plans.end()) {
+    return GEMM_LT_UNTUNED;
+  }
+  if (out_algo_id == nullptr || out_tile_id == nullptr || out_stages_id == nullptr ||
+      out_splitk == nullptr || out_reduction_scheme == nullptr || out_swizzling == nullptr ||
+      out_custom_option == nullptr) {
+    return static_cast<int>(cudaErrorInvalidValue);
+  }
+  const cublasLtMatmulAlgo_t &algo = it->second.algo;
+  int32_t algo_id = 0;
+  uint32_t tile_id = 0;
+  uint32_t stages_id = 0;
+  uint32_t splitk = 0;
+  uint32_t reduction_scheme = 0;
+  uint32_t swizzling = 0;
+  uint32_t custom_option = 0;
+  size_t written = 0;
+  cublasStatus_t status = cublasLtMatmulAlgoConfigGetAttribute(
+      &algo, CUBLASLT_ALGO_CONFIG_ID, &algo_id, sizeof(algo_id), &written);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoConfigGetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_TILE_ID, &tile_id, sizeof(tile_id), &written);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoConfigGetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages_id, sizeof(stages_id), &written);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoConfigGetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &splitk, sizeof(splitk), &written);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoConfigGetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &reduction_scheme,
+        sizeof(reduction_scheme), &written);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoConfigGetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_CTA_SWIZZLING, &swizzling, sizeof(swizzling), &written);
+  if (status == CUBLAS_STATUS_SUCCESS)
+    status = cublasLtMatmulAlgoConfigGetAttribute(
+        &algo, CUBLASLT_ALGO_CONFIG_CUSTOM_OPTION, &custom_option, sizeof(custom_option),
+        &written);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cublas_status_to_error(status);
+  }
+  *out_algo_id = static_cast<int>(algo_id);
+  *out_tile_id = static_cast<int>(tile_id);
+  *out_stages_id = static_cast<int>(stages_id);
+  *out_splitk = static_cast<int>(splitk);
+  *out_reduction_scheme = static_cast<int>(reduction_scheme);
+  *out_swizzling = static_cast<int>(swizzling);
+  *out_custom_option = static_cast<int>(custom_option);
+  return static_cast<int>(cudaSuccess);
+}
+
 // Time every heuristic candidate for (M, N, K) and cache the winner for
 // gemm_lt_cuda. `Ws` holds several same-shaped weight pointers (different
 // layers); rotating them keeps the timing loop out of L2 so the ranking

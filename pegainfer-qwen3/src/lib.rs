@@ -14,6 +14,8 @@ pub mod model_line;
 #[cfg(any(test, feature = "test-fixtures"))]
 pub use lora::fixtures as lora_fixtures;
 mod prefill;
+mod projection_fusion;
+pub mod projection_report;
 mod scheduler;
 mod speculative;
 mod split_kv;
@@ -83,6 +85,12 @@ impl Default for Qwen3LoraOptions {
 /// Prefill/decode GPU-sharing mode (`--decode-overlap`). Defined alongside the
 /// stream plumbing in [`green_ctx`].
 pub use green_ctx::DecodeOverlap;
+pub use projection_fusion::ProjectionFusionControl;
+pub use projection_fusion::ProjectionFusionDecision;
+pub use projection_fusion::ProjectionFusionResolutionReason;
+pub use projection_fusion::Qwen3ProjectionFusionOptions;
+pub use projection_fusion::Qwen3ProjectionFusionPlan;
+pub use projection_fusion::resolve_projection_fusion_plan;
 
 /// KV-offload (pegaflow) opt-in for the single-GPU Qwen3 path.
 ///
@@ -243,6 +251,9 @@ pub struct Qwen3LaunchOptions {
     /// How prefill and decode share the GPU (`--decode-overlap`).
     pub decode_overlap: DecodeOverlap,
     pub batch_invariant: bool,
+    /// Independent QKV and gate/up fusion controls. `Auto` enables only
+    /// measured production-whitelist entries.
+    pub projection_fusion: Qwen3ProjectionFusionOptions,
     /// `Some` enables DFlash speculative decoding with this drafter model.
     /// Single-GPU only and mutually exclusive with LoRA and KV offload.
     pub dflash_draft_model_path: Option<PathBuf>,
@@ -258,6 +269,23 @@ pub struct Qwen3LaunchOptions {
     reason = "launch is a one-shot ownership boundary used by external worker threads"
 )]
 pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHandle> {
+    launch_with_seed(model_path, options, 42)
+}
+
+/// Start Qwen3 with an explicit sampling seed.
+///
+/// The serving entry keeps the historical seed `42` through [`launch`];
+/// in-process benchmarks use this variant so their `--seed` flag remains
+/// effective while sharing the same TP and projection-fusion startup policy.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "launch is a one-shot ownership boundary used by external worker threads"
+)]
+pub fn launch_with_seed(
+    model_path: &Path,
+    options: Qwen3LaunchOptions,
+    seed: u64,
+) -> Result<EngineHandle> {
     let device_ordinals = if options.tp_size == 1 {
         vec![options.device_ordinal]
     } else {
@@ -289,7 +317,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
         device_ordinals,
         parallel_config: None,
         ep_backend: EpBackend::Nccl,
-        seed: 42,
+        seed,
     };
     if options.offload.enabled {
         info!(
@@ -324,7 +352,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
                 "Starting Qwen3 engine with LoRA control; max_loras={}, max_lora_rank={}",
                 lora.max_loras, lora.max_lora_rank
             );
-            start_engine_with_lora_control(
+            start_engine_with_lora_control_inner(
                 model_path,
                 engine,
                 lora,
@@ -334,6 +362,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
                 options.memory,
                 options.decode_overlap,
                 options.batch_invariant,
+                options.projection_fusion,
             )
         }
         None => start_engine_with_offload_inner(
@@ -348,6 +377,7 @@ pub fn launch(model_path: &Path, options: Qwen3LaunchOptions) -> Result<EngineHa
             options.dflash_draft_model_path.as_deref(),
             options.enable_kv_events,
             options.dump_graph_png.as_deref(),
+            options.projection_fusion,
         ),
     }
 }
@@ -404,6 +434,7 @@ pub fn start_engine_with_offload(
         dflash_draft_model_path,
         enable_kv_events,
         None,
+        Qwen3ProjectionFusionOptions::default(),
     )
 }
 
@@ -420,6 +451,7 @@ fn start_engine_with_offload_inner(
     dflash_draft_model_path: Option<&Path>,
     enable_kv_events: bool,
     dump_graph_png: Option<&Path>,
+    projection_fusion: Qwen3ProjectionFusionOptions,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -459,6 +491,7 @@ fn start_engine_with_offload_inner(
         dflash_draft_model_path,
         enable_kv_events,
         dump_graph_png,
+        projection_fusion,
     )
 }
 
@@ -472,6 +505,33 @@ pub fn start_engine_with_lora_control(
     memory_options: Qwen3MemoryOptions,
     decode_overlap: DecodeOverlap,
     batch_invariant: bool,
+) -> Result<EngineHandle> {
+    start_engine_with_lora_control_inner(
+        model_path,
+        options,
+        lora_options,
+        offload_options,
+        no_prefix_cache,
+        max_prefill_tokens,
+        memory_options,
+        decode_overlap,
+        batch_invariant,
+        Qwen3ProjectionFusionOptions::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_engine_with_lora_control_inner(
+    model_path: &Path,
+    options: EngineLoadOptions,
+    lora_options: Qwen3LoraOptions,
+    offload_options: Qwen3OffloadOptions,
+    no_prefix_cache: bool,
+    max_prefill_tokens: usize,
+    memory_options: Qwen3MemoryOptions,
+    decode_overlap: DecodeOverlap,
+    batch_invariant: bool,
+    projection_fusion: Qwen3ProjectionFusionOptions,
 ) -> Result<EngineHandle> {
     let EngineLoadOptions {
         enable_cuda_graph,
@@ -504,6 +564,7 @@ pub fn start_engine_with_lora_control(
         no_prefix_cache,
         max_prefill_tokens,
         memory_options,
+        projection_fusion,
     )
 }
 
