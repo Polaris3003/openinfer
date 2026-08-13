@@ -123,6 +123,40 @@ class CommandScopeTests(unittest.TestCase):
         )
         self.assertNotIn("--workspace", command)
 
+    def test_correctness_uses_explicit_lora_fixture_for_check_and_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = pathlib.Path(directory) / "fixture.safetensors"
+            args = types.SimpleNamespace(
+                output_dir=directory,
+                model_path="models/Qwen3-4B",
+                lora_fixture=str(fixture),
+                tp_sizes=[1],
+                fail_fast=False,
+                dry_run=True,
+            )
+            suite = SUITE.Suite(args)
+            suite.logs_dir.mkdir()
+            suite.raw_dir.mkdir()
+
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertTrue(suite.correctness())
+
+            fixture_check = suite.manifest["commands"][0]
+            self.assertEqual(fixture_check["command"][-1], str(fixture.resolve()))
+            lora_gates = [
+                entry
+                for entry in suite.manifest["commands"]
+                if entry["metadata"].get("gate") == "lora_golden_gate"
+            ]
+            self.assertTrue(lora_gates)
+            self.assertTrue(
+                all(
+                    entry["env"]["PEGAINFER_LORA_GOLDEN_PATH"]
+                    == str(fixture.resolve())
+                    for entry in lora_gates
+                )
+            )
+
     def test_projection_report_command_enables_its_cli_feature(self):
         with tempfile.TemporaryDirectory() as directory:
             args = types.SimpleNamespace(

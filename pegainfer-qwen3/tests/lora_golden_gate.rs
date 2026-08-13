@@ -17,6 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::path::PathBuf;
 
 use pegainfer_frontend::engine::LoadLoraAdapterRequest;
 use pegainfer_frontend::engine::TokenLogprob;
@@ -39,6 +40,7 @@ const GOLDEN: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../test_data/qwen3-4b-lora-golden.safetensors"
 );
+const GOLDEN_ENV: &str = "PEGAINFER_LORA_GOLDEN_PATH";
 
 const ADAPTER_NAME: &str = "golden-lora";
 const LOGPROBS: usize = 64;
@@ -242,7 +244,10 @@ struct Golden {
 
 impl Golden {
     fn load() -> Golden {
-        let bytes = std::fs::read(GOLDEN).unwrap_or_else(|e| panic!("read {GOLDEN}: {e}"));
+        let golden =
+            std::env::var_os(GOLDEN_ENV).map_or_else(|| PathBuf::from(GOLDEN), PathBuf::from);
+        let bytes =
+            std::fs::read(&golden).unwrap_or_else(|e| panic!("read {}: {e}", golden.display()));
         let (_, meta) =
             SafeTensors::read_metadata(&bytes).expect("read golden safetensors metadata");
         let md = meta

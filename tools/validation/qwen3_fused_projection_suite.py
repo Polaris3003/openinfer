@@ -592,6 +592,7 @@ class Suite:
         return returncode == 0
 
     def correctness(self) -> bool:
+        lora_fixture = str(pathlib.Path(self.args.lora_fixture).resolve())
         commands = [
             (
                 "lora-fixture-targets",
@@ -600,7 +601,7 @@ class Suite:
                     str(pathlib.Path(__file__).resolve()),
                     "check-fixture",
                     "--path",
-                    str(ROOT / "test_data/qwen3-4b-lora-golden.safetensors"),
+                    lora_fixture,
                 ],
                 {"kind": "correctness", "gate": "lora-fixture-targets"},
             ),
@@ -666,6 +667,8 @@ class Suite:
                         "PEGAINFER_GOLDEN_TP_SIZE": str(tp),
                         "PEGAINFER_QWEN3_PROJECTION_FUSION": mode,
                     }
+                    if test_name == "lora_golden_gate":
+                        env["PEGAINFER_LORA_GOLDEN_PATH"] = lora_fixture
                     metadata = {
                         "kind": "correctness",
                         "gate": test_name,
@@ -1400,6 +1403,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = subparsers.add_parser("run", help="运行验证并落盘所有原始产物")
     run.add_argument("--model-path", default="models/Qwen3-4B")
+    run.add_argument(
+        "--lora-fixture",
+        default=str(ROOT / "test_data/qwen3-4b-lora-golden.safetensors"),
+        help="五 projection LoRA golden fixture；默认使用仓库 test_data 文件",
+    )
     run.add_argument("--output-dir", required=True)
     run.add_argument(
         "--sections",

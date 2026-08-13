@@ -7,7 +7,9 @@
 #   bash scripts/run_qwen3_fused_746_gpu.sh --shutdown-after
 #
 # The runner is intentionally non-destructive: it never cleans the worktree,
-# overwrites the tracked LoRA fixture, or reuses an old artifact directory.
+# overwrites the tracked LoRA fixture, or reuses an old artifact directory. If
+# the tracked fixture is stale, a replacement is generated inside RUN_ROOT and
+# passed explicitly to the suite/Rust gate.
 
 set -Eeuo pipefail
 
@@ -200,7 +202,15 @@ echo "RUN_ROOT=${RUN_ROOT}"
 } > "${RUN_ROOT}/environment.txt" 2>&1
 
 echo "===== validating model and fixture ====="
-python3 - "${MODEL_PATH}/config.json" "${FIXTURE_PATH}" <<'PY'
+cp "${FIXTURE_PATH}" "${RUN_ROOT}/qwen3-4b-lora-golden.before.safetensors"
+sha256sum "${RUN_ROOT}/qwen3-4b-lora-golden.before.safetensors" \
+    | tee "${RUN_ROOT}/fixture-before.sha256"
+
+validate_fixture() {
+    local fixture=$1
+    python3 tools/validation/qwen3_fused_projection_suite.py check-fixture \
+        --path "${fixture}" && \
+    python3 - "${MODEL_PATH}/config.json" "${fixture}" <<'PY'
 import json
 import re
 import sys
@@ -217,7 +227,11 @@ with fixture.open("rb") as handle:
     header = json.loads(handle.read(header_len))
 metadata = header.get("__metadata__", {})
 targets = {"q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"}
-assert set(json.loads(metadata["target_modules"])) == targets
+actual_targets = set(json.loads(metadata["target_modules"]))
+assert actual_targets == targets, {
+    "actual_targets": sorted(actual_targets),
+    "expected_targets": sorted(targets),
+}
 assert metadata.get("model") == "Qwen3-4B", metadata.get("model")
 effect = float(metadata["mean_effect_nat"])
 assert 0.1 <= effect <= 2.0, effect
@@ -241,15 +255,47 @@ expected = {
     for target in targets
     for side in ("A", "B")
 }
-assert set(coverage) == expected
+assert set(coverage) == expected, {
+    "missing": sorted(expected - set(coverage))[:20],
+    "extra": sorted(set(coverage) - expected)[:20],
+}
 assert all(count == 1 for count in coverage.values())
 print(f"fixture=PASS effect={effect} adapter_tensors={len(coverage)}")
 PY
+}
 
-python3 tools/validation/qwen3_fused_projection_suite.py check-fixture \
-    --path "${FIXTURE_PATH}"
-cp "${FIXTURE_PATH}" "${RUN_ROOT}/qwen3-4b-lora-golden.safetensors"
-sha256sum "${RUN_ROOT}/qwen3-4b-lora-golden.safetensors" \
+ACTIVE_FIXTURE=${RUN_ROOT}/qwen3-4b-lora-golden.safetensors
+if validate_fixture "${FIXTURE_PATH}"; then
+    echo "tracked fixture is valid; copying it into the isolated run directory"
+    cp "${FIXTURE_PATH}" "${ACTIVE_FIXTURE}"
+    FIXTURE_SOURCE=tracked-valid
+else
+    echo "tracked fixture is stale or incomplete; generating an isolated five-target fixture"
+    python3 - <<'PY'
+import torch
+import transformers
+import peft
+import safetensors
+
+print("torch=", torch.__version__)
+print("transformers=", transformers.__version__)
+print("peft=", peft.__version__)
+print("safetensors=", safetensors.__version__)
+assert torch.cuda.is_available(), "PyTorch cannot see CUDA"
+PY
+    CUDA_VISIBLE_DEVICES=0 timeout --signal=INT --kill-after=30s 45m \
+        python3 tools/accuracy/dump_qwen3_4b_lora_golden.py \
+            --model-path "${MODEL_PATH}" \
+            --out "${ACTIVE_FIXTURE}" 2>&1 \
+        | tee "${RUN_ROOT}/fixture-generation.log"
+    validate_fixture "${ACTIVE_FIXTURE}"
+    FIXTURE_SOURCE=generated-isolated
+fi
+
+printf 'fixture_source=%s\nfixture_path=%s\n' \
+    "${FIXTURE_SOURCE}" "${ACTIVE_FIXTURE}" \
+    | tee "${RUN_ROOT}/fixture-source.txt"
+sha256sum "${ACTIVE_FIXTURE}" \
     | tee "${RUN_ROOT}/fixture.sha256"
 
 echo "===== CPU-side preflight ====="
@@ -335,6 +381,7 @@ echo "===== schema-v3 dry run ====="
 DRY_RUN_DIR=${RUN_ROOT}/dry-run
 python3 tools/validation/qwen3_fused_projection_suite.py run \
     --model-path "${MODEL_PATH}" \
+    --lora-fixture "${ACTIVE_FIXTURE}" \
     --output-dir "${DRY_RUN_DIR}" \
     --tp-sizes 1,2 \
     --concurrency 1,8 \
@@ -357,6 +404,7 @@ echo "This is a long run. Each command prints its index; server startup prints h
 set +e
 python3 tools/validation/qwen3_fused_projection_suite.py run \
     --model-path "${MODEL_PATH}" \
+    --lora-fixture "${ACTIVE_FIXTURE}" \
     --output-dir "${SUITE_DIR}" \
     --sections correctness,projection,topology,benchmark \
     --tp-sizes 1,2 \
