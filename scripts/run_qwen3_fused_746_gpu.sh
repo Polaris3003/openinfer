@@ -4,6 +4,7 @@
 # Usage:
 #   bash scripts/run_qwen3_fused_746_gpu.sh          # smoke + full 104-command suite
 #   bash scripts/run_qwen3_fused_746_gpu.sh --smoke-only
+#   bash scripts/run_qwen3_fused_746_gpu.sh --shutdown-after
 #
 # The runner is intentionally non-destructive: it never cleans the worktree,
 # overwrites the tracked LoRA fixture, or reuses an old artifact directory.
@@ -17,11 +18,26 @@ FIXTURE_PATH=${REPO_ROOT}/test_data/qwen3-4b-lora-golden.safetensors
 MINIMUM_COMMIT=df0027dd3d27527b0b1f650d7b263412df3015f8
 EXPECTED_BRANCH=feat/qwen3-fused-projection-parity-v2
 MODE=all
+SHUTDOWN_AFTER=0
 
-if [[ ${1:-} == "--smoke-only" ]]; then
-    MODE=smoke
-elif [[ $# -ne 0 ]]; then
-    echo "usage: $0 [--smoke-only]" >&2
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --smoke-only)
+            MODE=smoke
+            ;;
+        --shutdown-after)
+            SHUTDOWN_AFTER=1
+            ;;
+        *)
+            echo "usage: $0 [--smoke-only] [--shutdown-after]" >&2
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+if [[ ${SHUTDOWN_AFTER} -eq 1 && ! -x /usr/bin/shutdown ]]; then
+    echo "--shutdown-after requested, but /usr/bin/shutdown is unavailable" >&2
     exit 2
 fi
 
@@ -110,15 +126,36 @@ archive_results() {
     echo "STATUS=${status}"
 }
 
+shutdown_machine() {
+    if [[ ${SHUTDOWN_AFTER} -ne 1 ]]; then
+        return
+    fi
+    echo "Evidence is archived; shutting down immediately with /usr/bin/shutdown -h now"
+    sync
+    /usr/bin/shutdown -h now
+}
+
 on_error() {
     local rc=$?
     local line=${BASH_LINENO[0]:-unknown}
     trap - ERR INT TERM
     echo "runner failed: rc=${rc} line=${line}" >&2
     archive_results "FAILED rc=${rc} line=${line}"
+    shutdown_machine
     exit "${rc}"
 }
-trap on_error ERR INT TERM
+
+on_interrupt() {
+    local signal=${1:-INT}
+    trap - ERR INT TERM
+    echo "runner interrupted by ${signal}; archiving without shutdown" >&2
+    archive_results "INTERRUPTED signal=${signal}"
+    exit 130
+}
+
+trap on_error ERR
+trap 'on_interrupt INT' INT
+trap 'on_interrupt TERM' TERM
 
 printf '%s\n' \
     "export REPO_ROOT=${REPO_ROOT}" \
@@ -135,6 +172,7 @@ exec > >(tee -a "${RUN_ROOT}/runner.console.log") 2>&1
 
 echo "===== issue #746 GPU runner ====="
 echo "mode=${MODE}"
+echo "shutdown_after=${SHUTDOWN_AFTER}"
 echo "repo=${REPO_ROOT}"
 echo "model=${MODEL_PATH}"
 echo "branch=${branch}"
@@ -283,6 +321,7 @@ PY
 if [[ ${MODE} == smoke ]]; then
     trap - ERR INT TERM
     archive_results "SMOKE_PASS"
+    shutdown_machine
     exit 0
 fi
 
@@ -379,7 +418,9 @@ PY
 trap - ERR INT TERM
 if [[ ${SUITE_RC} -eq 0 && ${SUMMARIZE_RC} -eq 0 ]]; then
     archive_results "FULL_PASS"
+    shutdown_machine
     exit 0
 fi
 archive_results "FULL_INCOMPLETE suite_rc=${SUITE_RC} summarize_rc=${SUMMARIZE_RC}"
+shutdown_machine
 exit 1
