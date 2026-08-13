@@ -78,10 +78,16 @@ git merge-base --is-ancestor "${MINIMUM_COMMIT}" HEAD || {
     exit 2
 }
 
-tracked_dirty=$(git status --short --untracked-files=no)
-if [[ ${tracked_dirty} != " M test_data/qwen3-4b-lora-golden.safetensors" ]]; then
-    echo "unexpected tracked changes; refusing to mix them into evidence:" >&2
-    printf '%s\n' "${tracked_dirty}" >&2
+tracked_dirty=$(git status --porcelain=v1 --untracked-files=no)
+unexpected_tracked=$(printf '%s\n' "${tracked_dirty}" | awk '
+    NF == 0 { next }
+    substr($0, 4) == "test_data/qwen3-4b-lora-golden.safetensors" { next }
+    { print }
+')
+if [[ -n ${unexpected_tracked} ]]; then
+    echo "unexpected tracked changes outside the LoRA fixture; refusing to mix them into evidence:" >&2
+    printf 'all tracked status: %q\n' "${tracked_dirty}" >&2
+    printf 'unexpected status: %q\n' "${unexpected_tracked}" >&2
     exit 2
 fi
 
