@@ -5,6 +5,7 @@ import pathlib
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("qwen3_fused_projection_suite.py")
@@ -83,6 +84,26 @@ class FixtureTests(unittest.TestCase):
 
 
 class CommandScopeTests(unittest.TestCase):
+    def test_last_log_line_reports_latest_nonempty_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "server.log"
+            path.write_text("first\n\nlatest\n")
+            self.assertEqual(SUITE.last_log_line(path), "latest")
+
+    def test_wait_for_server_failure_includes_last_log(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "server.log"
+            path.write_text("model load failed\n")
+            process = mock.Mock()
+            process.poll.return_value = 17
+            with self.assertRaisesRegex(RuntimeError, "model load failed"):
+                SUITE.wait_for_server(
+                    "http://127.0.0.1:18080",
+                    process,
+                    1.0,
+                    server_log_path=path,
+                )
+
     def test_qwen3_unit_gate_does_not_build_unrelated_model_crates(self):
         command = SUITE.qwen3_unit_test_command()
         self.assertEqual(

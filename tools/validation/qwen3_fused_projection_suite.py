@@ -265,20 +265,66 @@ def monitor_gpus(stop: threading.Event, result: dict[str, Any]) -> None:
     result.update({"samples": samples, "gpus": per_gpu})
 
 
-def wait_for_server(base_url: str, process: subprocess.Popen[str], timeout_s: float) -> None:
+def last_log_line(path: pathlib.Path | None) -> str:
+    if path is None or not path.is_file():
+        return "server log not created yet"
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            if end == 0:
+                return "server log is empty"
+            start = max(0, end - 16_384)
+            handle.seek(start)
+            lines = handle.read().decode("utf-8", errors="replace").splitlines()
+    except OSError as error:
+        return f"cannot read server log: {error}"
+    return next((line.strip() for line in reversed(lines) if line.strip()), "server log is empty")
+
+
+def wait_for_server(
+    base_url: str,
+    process: subprocess.Popen[str],
+    timeout_s: float,
+    *,
+    server_log_path: pathlib.Path | None = None,
+    heartbeat_s: float = 15.0,
+) -> None:
+    started = time.monotonic()
     deadline = time.monotonic() + timeout_s
+    next_heartbeat = started
     url = f"{base_url}/v1/models"
     while time.monotonic() < deadline:
         returncode = process.poll()
         if returncode is not None:
-            raise RuntimeError(f"server exited before readiness with code {returncode}")
+            raise RuntimeError(
+                f"server exited before readiness with code {returncode}; "
+                f"last log: {last_log_line(server_log_path)}"
+            )
         try:
             with urllib.request.urlopen(url, timeout=1.0) as response:
                 if response.status == 200:
+                    print(
+                        f"[server-ready] pid={process.pid} "
+                        f"elapsed_s={time.monotonic() - started:.1f} url={url}",
+                        flush=True,
+                    )
                     return
         except (OSError, urllib.error.URLError):
-            time.sleep(0.5)
-    raise TimeoutError(f"server was not ready within {timeout_s:.0f}s: {url}")
+            pass
+        now = time.monotonic()
+        if now >= next_heartbeat:
+            print(
+                f"[server-wait] pid={process.pid} elapsed_s={now - started:.1f} "
+                f"last_log={last_log_line(server_log_path)}",
+                flush=True,
+            )
+            next_heartbeat = now + heartbeat_s
+        time.sleep(0.5)
+    raise TimeoutError(
+        f"server was not ready within {timeout_s:.0f}s: {url}; "
+        f"last log: {last_log_line(server_log_path)}"
+    )
 
 
 def run_http_benchmark_cell(args: argparse.Namespace) -> int:
@@ -361,8 +407,15 @@ def run_http_benchmark_cell(args: argparse.Namespace) -> int:
             start_new_session=True,
         )
         try:
-            wait_for_server(base_url, server, args.ready_timeout)
+            wait_for_server(
+                base_url,
+                server,
+                args.ready_timeout,
+                server_log_path=server_log_path,
+            )
+            print(f"[client-start] {' '.join(client_command)}", flush=True)
             completed = subprocess.run(client_command, cwd=ROOT, env=child_env, check=False)
+            print(f"[client-finish] returncode={completed.returncode}", flush=True)
             if completed.returncode != 0:
                 return completed.returncode
             report = read_json(output)
