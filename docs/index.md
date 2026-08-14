@@ -209,6 +209,7 @@ Organized by domain (model line / subsystem / playbook / lesson) instead of by l
 
 | Path | TL;DR |
 | --- | --- |
+| `benchmarks/qwen3-fused-projection-rtx4090-2026-08.md` | Issue #746 fused QKV and gate/up passed correctness; their combined TP1 decode path improves TPOT 2.35% and throughput 2.30%, while unmeasured or inconsistent cases fail closed to split. |
 | `benchmarks/qwen3-4b-serving-vllm-rtx5090.md` | **Deleted** — superseded by `models/qwen3/serving-performance.md`. |
 | `benchmarks/deepseek-v2-lite-vllm-tp2-ep2.md` | DeepSeek-V2-Lite EP2 2026-06-28 snapshot: PegaInfer host-staged/NCCL passed correctness, direct diagnostics, HTTP pressure, and trace rows; stock vLLM TP2/TP2+EP2 are retained as FlashInfer SM120/CUDA 12.8 setup failures, with a separate FlashInfer-fixed vLLM validation and no parity claim. |
 | `benchmarks/qwen35-4b-serving-vllm-rtx5090-2026-07.md` | Qwen3.5-4B vs vLLM 0.25.1 on 1x RTX 5090 for #469: correctness gates and retained HTTP matrix completed with zero failed requests, but PegaInfer does not reach vLLM parity; requested 1024/256 c16 is `17.36ms` / `807 tok/s` vs vLLM `9.34ms` / `1425 tok/s`, while direct c16 TPOT `9.14ms` points first to HTTP/frontend/scheduler attribution. |

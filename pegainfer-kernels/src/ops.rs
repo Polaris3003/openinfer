@@ -98,6 +98,7 @@ pub use elementwise::scaled_add_rows_token_range_into;
 pub use elementwise::silu_mul_batch;
 pub use elementwise::silu_mul_batch_into;
 pub use elementwise::silu_mul_fused_batch_into;
+pub use elementwise::split_qkv_into;
 pub use elementwise::write_vec_into;
 pub use embedding::embedding_batch;
 pub use embedding::embedding_batch_vocab_shard;

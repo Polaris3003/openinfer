@@ -1,8 +1,9 @@
 //! PEFT-LoRA logits gate for Qwen3-4B. The zero-adapter `lora_smoke` test only
 //! proves the route runs; this gate replays teacher-forced sequences with a non-zero
-//! rank-1 q/v adapter against a PEFT reference, so a transposed, missing, or mis-scaled
-//! delta fails. The fixture (from `tools/accuracy/dump_qwen3_4b_lora_golden.py`) embeds
-//! the adapter tensors themselves — nothing reproduces PEFT or RNG at test time.
+//! rank-1 q/k/v/gate/up adapter against a PEFT reference, so a transposed, missing, or
+//! mis-scaled delta fails. The fixture (from
+//! `tools/accuracy/dump_qwen3_4b_lora_golden.py`) embeds the adapter tensors themselves —
+//! nothing reproduces PEFT or RNG at test time.
 //!
 //! Replay framework and tolerances are copied from `hf_golden_gate.rs` (tests cannot
 //! share modules); see that header for the rationale.
@@ -51,6 +52,7 @@ const HEAD_K: usize = 8;
 /// The LoRA replay must differ from the base replay by more than this (mean |top-1
 /// logprob| difference) — a silently ignored adapter fails here.
 const CROSS_CHECK_FLOOR: f32 = 0.05;
+const REQUIRED_TARGETS: &[&str] = &["q_proj", "k_proj", "v_proj", "gate_proj", "up_proj"];
 
 fn model_path_or_skip() -> Option<String> {
     match std::env::var("PEGAINFER_TEST_MODEL_PATH") {
@@ -228,6 +230,15 @@ impl Golden {
 }}"#,
             md["target_modules"]
         );
+        let target_modules: Vec<String> =
+            serde_json::from_str(&md["target_modules"]).expect("target_modules metadata");
+        for required in REQUIRED_TARGETS {
+            assert!(
+                target_modules.iter().any(|target| target == required),
+                "fixture target_modules is missing required projection `{required}`; regenerate \
+                 it with tools/accuracy/dump_qwen3_4b_lora_golden.py"
+            );
+        }
 
         let st = SafeTensors::deserialize(&bytes).expect("parse golden safetensors");
         let (prompt_tokens, _) = as_i32(&st, "prompt_tokens");
@@ -250,6 +261,26 @@ impl Golden {
                         data: t.data().to_vec(),
                     },
                 );
+            }
+        }
+        for target in &target_modules {
+            for side in ["lora_A", "lora_B"] {
+                let needle = format!(".{target}.{side}.weight");
+                let tensors: Vec<_> = adapter_tensors
+                    .iter()
+                    .filter(|(name, _)| name.ends_with(&needle))
+                    .collect();
+                assert_eq!(
+                    tensors.len(),
+                    36,
+                    "fixture must contain one {target}.{side} tensor per Qwen3-4B layer"
+                );
+                for (name, tensor) in tensors {
+                    assert!(
+                        tensor.data.iter().any(|&byte| byte != 0),
+                        "fixture tensor {name} is all-zero; target engagement would be unobservable"
+                    );
+                }
             }
         }
 
