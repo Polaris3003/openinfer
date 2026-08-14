@@ -1,6 +1,6 @@
 # Qwen3 parity-safe fused projections（Issue #746）
 
-> **TL;DR:** QKV 与 gate/up 候选融合路径及验证套件已迁到最新 PegaInfer 主干；SM86 旧主干实测正确性全绿，但按既定规则只有 TP1 decode QKV 达到性能资格。主干 frontend 重构后性能门禁已改走真实 HTTP serving。分支仍缺五投影 LoRA fixture、原始 suite 产物与当前 HEAD 的 Linux CUDA 重跑，且 `Auto` 尚不区分 GPU 架构/工具链，因此默认继续 split。
+> **TL;DR:** QKV 与 gate/up 候选融合路径已在 current HEAD `a8ef928` 的 2×RTX 4090（SM89）完成 schema-v3 104-command 验证，正确性、projection、topology 和 64 个真实 HTTP cell 全绿；八个预注册独立决策全部 `KEEP_SPLIT`，所以 `Auto` 不改。TP1 decode both 的 `+2.35%` TPOT 只作为新组合策略候选；tracked 五 target fixture 与硬件适用边界仍需闭环。
 >
 > **Last touched:** 2026-08
 
@@ -873,14 +873,33 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
 - 本机 Rust release test 仍在目标 crate 前被 macOS 缺 Linux RDMA headers 阻断；
   Linux CUDA 当前 HEAD 重跑仍是开 PR 前硬门禁。
 
+### Step 17 — SM89 current-head 全量验证与发布判断
+
+- GPU 主机在 `a8ef9286eb329b8106157d2ca36956ad87f48d10`、2×RTX 4090
+  （SM89）、driver `580.105.08`、CUDA toolkit `12.6.85` 上完成一键 runner。
+- 证据归档 `qwen3-fused-746-jFnKoj.tar.gz` 的 SHA256 为
+  `be9955ae412cee92a3405d119719bec29f6c54ad17cb222b92340d45c1fe277c`；
+  tar 成员无重复、无越界路径或链接/设备节点。
+- 正式 manifest 为 schema v3：104/104 命令 return code 0；correctness `21/21`、
+  projection `3/3`、topology `16/16`、HTTP benchmark `64/64`，missing/errors 均为 0。
+- 8 个 HF 与 8 个五 target LoRA gate 均实际执行而非被过滤；64 个 HTTP report
+  的 server/token timing coverage 均为 100%，requested/resolved fusion 完全一致。
+- 八个独立资格项全部 `KEEP_SPLIT`。TP1 decode QKV/gate-up 分别稳定改善
+  `1.38%/1.12%`，但低于预注册 `2%` 门槛；TP2 与 prefill 存在方向翻转或回退。
+- TP1 decode both 的四个 matched A/B 全部改善，TPOT 平均 `+2.35%`、output
+  throughput `+1.84%..+2.76%`。本轮规则预先限定为独立归因，因此不事后将 both
+  升格为资格项；如继续追求该收益，建立新组合策略并用新数据放行。
+- runner 隔离生成的五 target fixture SHA256 为 `f8b76cb4...`，通过全部 LoRA
+  gate；tracked fixture 仍是旧 q/v-only 文件，fresh-checkout 自包含 gate 尚未闭环。
+
 ## Debrief
 
 - **Outcome**:
   - 融合候选与 fail-closed 验证套件已迁到最新主干；生产白名单仍为空。
   - Qwen3 unit 门禁已收敛到 kernel/model/server 三个相关 target，不再要求
     为无关 GLM/Kimi DeepEP 安装 NCCL ≥ 2.30.4。
-  - SM86 实测已完成；现有规则只支持 TP1 decode QKV 的局部 `ENABLE` 结论，
-    但尚不能安全转化为跨 GPU Auto 白名单。
+  - SM89 current-head 实测与原始 artifact 已完成；所有独立行保持 split。
+  - SM86 与 SM89 的性能资格结果不同，进一步证明不能建立跨硬件全局 Auto 白名单。
 - **Pitfalls encountered**:
   - `cargo test --workspace` 不只是“多跑一些测试”；Cargo feature union 会让
     无关 workspace member 激活共享 `pegainfer-kernels/moe`，改变构建依赖边界。
@@ -903,8 +922,8 @@ PEGAINFER_TEST_MODEL_PATH=models/Qwen3-4B \
     全 workspace 健康度可以是独立 CI，但不能成为 Qwen3 优化报告的隐藏前置条件。
   - 门禁作用域也需要结构化回归测试，不能只依赖文档约定。
 - **Follow-ups**:
-  - 从 AutoDL/SM86 主机取回原始 suite 目录和五投影 LoRA fixture；在最新主干
-    当前 HEAD 重跑 schema-v3 全套 suite 后再开 PR。
-  - 用户决定是否放行 TP1 decode QKV；未建立 SM/toolchain 资格边界前，默认
-    Auto 保持 split。
+  - 将本轮实际通过的五 target LoRA fixture 提交到 tracked test data，并在无
+    override 环境变量的 fresh checkout 跑 LoRA gate。
+  - 是否追求 TP1 decode both 的 `2.35%`，作为预注册的新组合策略实验决定；
+    未建立 SM/toolchain 资格边界前，Auto 保持 split。
   - 其他 Qwen3 size、TP>2、sm90/sm120、Pin/PerToken 和 Green Context 仍需独立证据。

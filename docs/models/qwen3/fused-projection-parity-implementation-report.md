@@ -1,6 +1,6 @@
 # Qwen3 fused projection 候选实现报告（Issue #746）
 
-> **TL;DR:** Qwen3 已在最新 PegaInfer 主干上具备彼此独立、构造期固定的 QKV 与 gate/up 融合候选路径及 fail-closed 验证套件。Issue 评论记录的 SM86/CUDA 12.6 旧主干实测全部通过，且仅 TP1 decode QKV 达到性能资格；主干 frontend 重构后，CLI 已迁入 Qwen3 `ModelLine`，性能门禁已迁到真实 HTTP serving。默认 `Auto` 仍为空；原始 suite、五投影 LoRA fixture 和当前 HEAD 的 Linux CUDA 重跑尚未补齐，因此当前结论仍不是跨硬件默认 fused。
+> **TL;DR:** Qwen3 已具备构造期固定、彼此独立的 QKV 与 gate/up 融合候选及 fail-closed schema-v3 套件；current HEAD `a8ef928` 在 2×RTX 4090（SM89）完成 104/104 命令，数值、LoRA、TP、graph/topology 与真实 HTTP 全绿，但八个独立性能决策全部 `KEEP_SPLIT`。默认 `Auto` 继续为空；本轮五 target fixture 尚未提交到 tracked test data。
 >
 > **Last touched:** 2026-08
 
@@ -65,18 +65,19 @@ Qwen3ProjectionFusionPlan
 当前不能声称 Issue #746 已经完成跨硬件生产放行，原因是：
 
 - `Auto` 白名单为空，没有任何 `(projection, phase, TP)` 默认启用。
-- SM86 correctness/projection/topology/E2E 结果已汇总到 issue 评论，但原始
-  `raw/log/manifest/summary/decision-table/report` 目录未进入当前工作区。
-- 实跑 LoRA gate 必然使用过五 projection fixture，但 committed fixture 仍是
-  旧 q/v-only 文件，新 checkout 会在 fixture preflight 失败。
-- 只有 TP1 decode QKV 达到既定性能规则；其余七个组合应继续 split。
+- current-head SM89 原始 `raw/log/manifest/summary/decision-table/report` 已取回并
+  校验完整，但八个独立项都没有达到既定性能规则。
+- runner 隔离生成并实测了五 projection fixture，但 committed fixture 仍是旧
+  q/v-only 文件，新 checkout 会在 fixture preflight 失败。
+- TP1 decode both 有 `+2.35%` 交互收益，但本轮预注册规则只允许独立归因；
+  不能看完结果后修改标准直接放行。
 - `ProjectionFusionEnvironment` 不包含 GPU SM、CUDA/cuBLAS 或 selected algo，
-  不能把 SM86 结论安全外推到 sm90/sm120。
+  且 SM86 与 SM89 的最优项不同，不能建立跨硬件全局白名单。
 
 正确的状态描述是：
 
-> SM86 候选路径已跑通且只有 TP1 decode QKV 具备局部性能资格；默认路径保持
-> split，待原始证据、fixture 和硬件资格边界闭环后再决定生产白名单。
+> SM89 current-head 候选路径与证据均完整，但没有独立 fused 行获得生产资格；
+> 默认路径保持 split。TP1 decode both 只进入新实验候选，不能成为本轮事后结论。
 
 ## 2. 为什么 QKV 与 gate/up 必须独立
 
@@ -749,7 +750,9 @@ LoRA gate使用同一个 fusion 环境变量，并继续覆盖：
 - mixed base/LoRA batch
 - TP1/TP2
 
-但在五 projection fixture 重生成前，这部分只能证明旧 q/v adapter 在新拓扑下的兼容性，不能证明 K/gate/up 全部真正参与。
+本轮 runner 已隔离生成五 projection fixture，并在 TP1/TP2 × 四种 fusion mode
+中全部通过；K/gate/up 的 row offset 已进入真实 LoRA 数值门禁。剩余问题是将该
+fixture 提交到 tracked test data，使 fresh checkout 不依赖 override 路径。
 
 ### 13.5 LaunchOptions 调用点
 
@@ -759,14 +762,14 @@ DFlash 测试、TP concurrent 测试和 Dynamo backend 均补上默认 fusion op
 
 | 不变量 | 实现方式 | 当前证据状态 |
 | --- | --- | --- |
-| 权重顺序 `[Q;K;V]` | split kernel按固定 row range copy | 代码 + 待跑 GPU bitwise test |
-| 权重顺序 `[gate;up]` | gate offset 0，up offset I | 代码 + 五 target fixture 待生成 |
-| QKV split 不产生舍入 | 直接复制 `__nv_bfloat16` | 代码 + 待跑 GPU test |
-| SwiGLU BF16 边界不变 | fused kernel物化 BF16 SiLU 后再乘 up | 既有 test + 待跑 |
-| TP 不新增 collective | 只替换 all-reduce 前的 local projection | 静态核对 + issue 报告 TP2 correctness 通过，raw 待导入 |
-| Graph pointer 稳定 | 构造期分配，capture 前 tune | issue 报告 topology/HF graph 通过，raw 待导入 |
-| LoRA 保持逻辑 projection | Q/K/V split 后写；gate/up row offset 写 | issue 报告 LoRA gate 通过，五 target fixture 待提交 |
-| unsupported force 不 fallback | `validate_force_supported` 返回错误 | AutoDL/suite 运行曾通过，当前 HEAD Linux 重跑待完成 |
+| 权重顺序 `[Q;K;V]` | split kernel按固定 row range copy | current-head SM89 GPU bitwise test 通过 |
+| 权重顺序 `[gate;up]` | gate offset 0，up offset I | 五 target LoRA gate 8/8 通过 |
+| QKV split 不产生舍入 | 直接复制 `__nv_bfloat16` | current-head GPU test 通过 |
+| SwiGLU BF16 边界不变 | fused kernel物化 BF16 SiLU 后再乘 up | current-head GPU test 通过 |
+| TP 不新增 collective | 只替换 all-reduce 前的 local projection | TP2 HF/LoRA/projection/HTTP 全部通过 |
+| Graph pointer 稳定 | 构造期分配，capture 前 tune | topology 16/16 + HF graph 通过 |
+| LoRA 保持逻辑 projection | Q/K/V split 后写；gate/up row offset 写 | 五 target fixture 实跑通过，tracked 文件待提交 |
+| unsupported force 不 fallback | `validate_force_supported` 返回错误 | unit + suite resolved-plan 审计通过 |
 | 默认不启用未验证优化 | 空 `auto_whitelisted` | 代码事实 |
 
 ## 15. 本地验证结果
@@ -841,6 +844,19 @@ cell、GPU clock/power/memory 或 selected-algo 细节。
   projection_fusion --no-default-features`：macOS 先后被 Linux-only
   `rdma-mummy-sys` headers 与无 nvcc 阻塞，未进入目标 Rust type-check。
 
+### 15.6 2026-08-13 SM89 current-head 全量验证
+
+`a8ef928` 在 2×RTX 4090 上完成 schema-v3 runner：
+
+- 104/104 command passed；21/21 correctness、3/3 projection、16/16 topology、
+  64/64 HTTP benchmark 全部完整。
+- HF/LoRA 每个 integration gate 都实际运行 1 个测试，无 filtered-out 冒充；
+  五 target fixture SHA256 为 `f8b76cb4...`。
+- 64 个 HTTP report 均为 failed/timeouts=0、trace/token timing coverage=100%，
+  requested/resolved fusion plan 完全一致。
+- 八个独立项全部 `KEEP_SPLIT`；完整表和 both 交互分析见
+  `fused-projection-release-runbook.md`。
+
 ## 16. 实现与原计划的偏差
 
 ### 16.1 Buffer 使用多个 Option，而不是 enum
@@ -885,7 +901,7 @@ gate_up_out: Option<_>
 另外还区分 explicit split、forced fused 和未来的 Auto whitelist hit。rank 0
 启动日志打印完整 plan，benchmark JSON 也保存同一结构。
 
-### 16.3 Projection 数值数据已在 SM86 生成，raw 待导入
+### 16.3 Projection 数值数据已在 SM89 current HEAD 重跑
 
 `qwen3_projection_report` 现在使用真实 rank-local Qwen3-4B 权重和相同
 patterned BF16 输入，按 layer、shape、TP rank 输出：
@@ -901,18 +917,18 @@ patterned BF16 输入，按 layer、shape、TP rank 输出：
 小 N tuning 使用与 executor 相同的 all-layer cold-weight rotation。TP2 必须
 分别运行 rank 0/rank 1，不能以 local shape 模拟真实 shard weight。
 
-Issue 评论证明 Linux CUDA JSON 曾成功生成并汇总；当前缺口是把该 raw 目录导入
-可复核位置，并在 schema v3/current HEAD 上重跑，而不是继续补 reporter 代码。
+本轮 schema-v3 artifact 已包含 TP1 rank0、TP2 rank0/rank1 三份 current-head raw
+report，projection gate 3/3 通过。SM86 旧报告只保留为历史对照，不再承担当前
+代码的证明责任。
 
-### 16.4 Prefill fused GEMM 没有独立显式 startup tuning 证据
+### 16.4 Prefill fused GEMM 不进入白名单
 
 当前新增的显式 topology-aware tuning 位于 decode bucket。prefill 大 N 继续依赖现有 GEMM 路由/缓存行为。
 
-在决定 prefill/unified 白名单前，需要确认：
-
-- 实际 large-N backend 和算法。
-- 是否需要与 decode 分开的 prefill tuning。
-- 10k prompt 的 scratch 是否压缩 KV admission。
+SM89 projection report 与 10k prompt HTTP 数据已给出一致的否定结论：TP1/TP2
+prefill QKV 不同向或回退，gate/up E2E 也没有达到 3% 且方向要求不满足。因此当前
+不继续为 prefill 增加 startup tuning 或扩大实现面；只有新的 kernel/algorithm
+方案出现时，才重新建立 prefill 资格实验。
 
 ### 16.5 HTTP cell 同时记录 requested 与完整 resolved plan（已补齐）
 
@@ -926,16 +942,14 @@ resolver 接受后 server 才能就绪，对应 `forced_fused`；不支持的组
 
 ### P0：必须完成
 
-1. Linux CUDA release type-check。
-2. QKV split GPU bitwise test。
-3. 四 fusion mode × TP1/TP2 HF gate。
-4. eager + CUDA Graph bucket-straddle。
-5. 重生成五 projection LoRA fixture并跑 TP1/TP2。
-6. unified mixed-step 与 verify graph gate。
-7. TP1/rank0 与 TP2/rank0+rank1 projection report 无 NaN/Inf，kernel
-   aggregate 与 E2E 同方向。
-8. 32-cell benchmark，每个关键 cell两次对称交错复测（64 runs）。
-9. 保持 `Auto` 白名单为空，直到上述证据完成。
+1. 将本轮已验证的五 projection LoRA fixture 提交到
+   `test_data/qwen3-4b-lora-golden.safetensors`。
+2. 在不设置 `PEGAINFER_LORA_GOLDEN_PATH` 的 fresh checkout 跑 LoRA gate，证明
+   默认 test data 自包含。
+3. 保持 `Auto` 白名单为空；本轮八个独立项全部 `KEEP_SPLIT`。
+
+Linux CUDA type-check、QKV bitwise、四 mode × TP1/TP2 HF/LoRA、eager/graph、
+unified/verify topology、三 rank projection report 和 64-run HTTP 矩阵均已完成。
 
 ### P1：建议合入前完成
 
@@ -943,6 +957,8 @@ resolver 接受后 server 才能就绪，对应 `forced_fused`；不支持的组
    构造器赋值，未发现非法状态入口，缺 Linux type-check 时扩大纯类型重排得不偿失。
 2. 增加 Auto resolution reason：完成。
 3. benchmark 记录完整 resolved plan：完成。
+4. TP1 decode both 若进入生产候选，先建立组合级预注册门禁并增加硬件适用 key；
+   不在本轮结果上事后放行。
 
 ## 18. 代码位置索引
 
@@ -1069,11 +1085,24 @@ resolver 接受后 server 才能就绪，对应 `forced_fused`；不支持的组
 - 本地通过 format、metadata、Python `8/8`、py_compile 和 diff gate；Rust GPU
   编译/执行仍需 Linux CUDA 主机。
 
+### Step 8 — SM89 current-head 证据闭环
+
+- `a8ef928` 在 2×RTX 4090/SM89 完成 104-command schema-v3 runner；所有命令、
+  correctness、projection、topology 与 64 个 HTTP cell 全部通过。
+- 审计确认测试没有被过滤、fixture 确为五 target、所有 HTTP cell 的 fused
+  requested/resolved plan 一致，原始输出和 manifest 引用完整。
+- 八个独立资格项全部 `KEEP_SPLIT`；TP1 decode QKV/gate-up 虽然分别稳定改善
+  `1.38%/1.12%`，但低于 `2%` 预注册门槛。
+- TP1 decode both 平均 `+2.35%`，保留为新的组合候选；不用于事后修改本轮独立
+  决策规则。SM86/SM89 的性能资格差异也否定了无硬件 key 的全局 Auto。
+- 本轮有效 fixture 只存在于证据归档；tracked q/v-only fixture 是 PR 剩余的唯一
+  correctness 自包含缺口。
+
 ## Debrief
 
 - **Outcome**:
   - 形成了从背景、策略、kernel、buffer、forward、TP、LoRA、Graph、trace、benchmark 到验证状态的完整实现报告。
-  - 明确区分 SM86 已执行结果、当前工作区可复核证据和跨架构生产资格。
+  - current-head SM89 原始证据已完整取回；八个独立项全部保持 split。
   - HTTP cell 记录强制 A/B 的实际 resolved plan 与 reason；Auto 部分命中仍由
     production resolver 和启动日志独立证明，避免把 requested mode 冒充执行拓扑。
 - **Pitfalls encountered**:
@@ -1083,9 +1112,10 @@ resolver 接受后 server 才能就绪，对应 `forced_fused`；不支持的组
   - fused projection 的核心风险不是数学公式，而是 GEMM 分组改变后的 BF16 reduction path。
   - 对 CUDA Graph 路径，policy、buffer variant 和 tuning shape 必须是同一个构造期事实。
   - 实验配置必须进入真实 server/benchmark 路径，否则测到的结果不能作为生产证据。
+  - 组合协同收益可以成为新候选，但不能在看完数据后改变独立资格规则；SM86/SM89
+    结论不同，Auto 必须具备硬件适用边界。
 - **Follow-ups**:
-  - 从 SM86 执行主机取回原始 suite 目录和五投影 LoRA fixture，并在最新主干
-    当前 HEAD 重跑 schema-v3 全套 suite；旧 `bench_serving` 数据只作历史参考。
-  - 用户决定是否只放行 TP1 decode QKV；若放行，必须先解决 SM86 证据如何限制
-    到 GPU/工具链的问题，否则 Auto 继续 split。
+  - 提交本轮五 target LoRA fixture，并在无 override 的 fresh checkout 跑默认 LoRA gate。
+  - 是否追求 TP1 decode both 的 `2.35%`，作为独立、预注册的组合策略实验决定；
+    在此之前 Auto 继续 split。
   - 其他 Qwen3 size、TP>2、sm90/sm120、Pin/PerToken 和 Green Context 仍需独立证据。
