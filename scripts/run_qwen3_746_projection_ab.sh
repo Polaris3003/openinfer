@@ -104,8 +104,24 @@ done
 }
 
 cd "${REPO_ROOT}"
-git diff --quiet || { echo "tracked unstaged changes are not allowed" >&2; exit 2; }
-git diff --cached --quiet || { echo "staged changes are not allowed" >&2; exit 2; }
+git status --short > "${RUN_ROOT}/meta/git-status.txt"
+{
+    git diff --name-only
+    git diff --cached --name-only
+} | sort -u > "${RUN_ROOT}/meta/tracked-dirty-paths.txt"
+UNEXPECTED_DIRTY=$(
+    grep -v '^test_data/qwen3-4b-lora-golden\.safetensors$' \
+        "${RUN_ROOT}/meta/tracked-dirty-paths.txt" || true
+)
+if [[ -n ${UNEXPECTED_DIRTY} ]]; then
+    echo "unexpected tracked changes; refusing to benchmark modified code:" >&2
+    printf '%s\n' "${UNEXPECTED_DIRTY}" >&2
+    exit 2
+fi
+if [[ -f test_data/qwen3-4b-lora-golden.safetensors ]]; then
+    sha256sum test_data/qwen3-4b-lora-golden.safetensors \
+        > "${RUN_ROOT}/meta/lora-fixture.sha256"
+fi
 
 GPU_COUNT=$(nvidia-smi --query-gpu=index --format=csv,noheader | wc -l)
 (( GPU_COUNT >= 2 )) || { echo "two GPUs are required for TP2 gates" >&2; exit 2; }
