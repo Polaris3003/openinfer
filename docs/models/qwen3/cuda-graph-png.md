@@ -3,10 +3,13 @@
 > **TL;DR:** `--dump-graph-png PATH` now exports the live Qwen3 rank-0,
 > batch-1 SplitKv decode graph during startup: an unfolded detailed `.dot` for
 > LLM/script inspection and a 192-DPI Cairo PNG that folds repeated physical
-> layers for human browsing. Qwen3-4B produced 507 kernel nodes and 506 edges;
-> kernel naming sets the repository driver floor at CUDA Driver API 12.3.
+> layers for human browsing. The recorded `507 kernels / 506 edges / 14-kernel
+> layer` belongs specifically to the historical SM86 split-projection topology;
+> projection-qualified devices must export their live graph instead of reusing
+> those counts. Kernel naming sets the repository driver floor at CUDA Driver
+> API 12.3.
 >
-> **Last touched:** 2026-07
+> **Last touched:** 2026-08
 
 ## Preparation
 
@@ -90,6 +93,17 @@
 - Added the missing CLI test for rejecting graph export with LoRA.
 - Rebuilt and reran the real single-GPU Qwen3-4B export into `/tmp`; the server reached HTTP readiness and the detailed DOT retained 507 nodes/506 edges with the corrected dynamic-shared-memory field.
 - `cargo test --release --workspace --lib` first exposed the documented missing `PEGAINFER_NCCL_ROOT`; after rerunning with `/data/opt/nccl-2.30.4`, the all-model build completed and tests advanced through 493 `kvbm-logical` cases before the unrelated `pegainfer-comm-cuda-lib::test_gdr::gdr_copy_flag_GPU` failed because this host cannot create a GDRCopy handle. All Qwen3/core/server tests in this change's scope passed.
+
+### Step 7: Projection-topology qualification
+
+- Issue #746 makes decode projection topology conditional on measured device SM
+  and model geometry. The existing 507/506/14 record came from an RTX 5070 Ti
+  (SM86), which remains on split projections and therefore stays useful as a
+  historical, environment-scoped measurement.
+- Devices qualified for fused QKV have a different repeated-layer topology.
+  Until a real GPU export is retained, this document intentionally does not
+  claim a replacement kernel/edge count; `--dump-graph-png` remains the source
+  of truth.
 
 ## Debrief
 

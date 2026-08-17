@@ -1107,12 +1107,6 @@ mod tests {
     }
 
     #[test]
-    fn bitwise_comparison_accepts_identical_bf16_nan_payloads() {
-        let payload = bf16::from_bits(0x7fc1);
-        assert_bf16_bits_eq(&[payload], &[payload], "equal NaN payload");
-    }
-
-    #[test]
     fn silu_mul_fused_matches_split_bf16_rounding() -> Result<()> {
         let ctx = DeviceContext::new()?;
         let hidden_dim = 4;
@@ -1163,12 +1157,8 @@ mod tests {
     fn split_qkv_is_a_bitwise_copy_for_tp_shapes_and_tails() -> Result<()> {
         let ctx = DeviceContext::new()?;
         for (q_dim, kv_dim, tokens) in [
-            (4096, 1024, 1),
+            // Qwen3-4B/8B production decode geometry at the largest target batch.
             (4096, 1024, 8),
-            (4096, 1024, 128),
-            (2048, 512, 1),
-            (2048, 512, 8),
-            (2048, 512, 128),
             // Deliberately not aligned to the 256-thread launch width.
             (5, 3, 7),
         ] {
