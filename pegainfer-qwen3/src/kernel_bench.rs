@@ -1489,6 +1489,313 @@ impl DenseCase {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionModel {
+    Qwen3FourB,
+    Qwen3EightB,
+}
+
+impl ProjectionModel {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "qwen3-4b" | "4b" => Some(Self::Qwen3FourB),
+            "qwen3-8b" | "8b" => Some(Self::Qwen3EightB),
+            _ => None,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Qwen3FourB => "qwen3-4b",
+            Self::Qwen3EightB => "qwen3-8b",
+        }
+    }
+
+    pub const fn geometry(self) -> ProjectionGeometry {
+        match self {
+            Self::Qwen3FourB => ProjectionGeometry {
+                hidden_size: 2560,
+                q_dim: 4096,
+                kv_dim: 1024,
+                intermediate_size: 9728,
+                num_hidden_layers: 36,
+            },
+            Self::Qwen3EightB => ProjectionGeometry {
+                hidden_size: 4096,
+                q_dim: 4096,
+                kv_dim: 1024,
+                intermediate_size: 12_288,
+                num_hidden_layers: 36,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct ProjectionGeometry {
+    pub hidden_size: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+    pub intermediate_size: usize,
+    pub num_hidden_layers: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectionTopology {
+    QkvSplitGemm,
+    QkvPackedGemm,
+    SplitQkv,
+    QkvPackedWithSplit,
+    GateUpSplitGemm,
+    GateUpMergedGemm,
+    MlpSplit,
+    MlpMerged,
+}
+
+impl ProjectionTopology {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::QkvSplitGemm => "qkv_split_gemm",
+            Self::QkvPackedGemm => "qkv_packed_gemm",
+            Self::SplitQkv => "split_qkv",
+            Self::QkvPackedWithSplit => "qkv_packed_with_split",
+            Self::GateUpSplitGemm => "gate_up_split_gemm",
+            Self::GateUpMergedGemm => "gate_up_merged_gemm",
+            Self::MlpSplit => "mlp_split",
+            Self::MlpMerged => "mlp_merged",
+        }
+    }
+}
+
+/// Tune one row-range shape against a cold rotation of the same packed weight.
+/// Production tunes across layer weights; the synthetic report uses disposable
+/// copies to preserve the same cache state without loading a checkpoint.
+fn tune_weight_rows(
+    ctx: &DeviceContext,
+    weight: &DeviceMatrix,
+    offsets: &[usize],
+    out_dim: usize,
+    batch_size: usize,
+) -> Result<()> {
+    if batch_size > pegainfer_kernels::ops::GEMM_LT_MAX_N {
+        return Ok(());
+    }
+    let weight_bytes = weight.rows * weight.cols * size_of::<bf16>();
+    let l2_bytes = ctx
+        .ctx
+        .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?
+        as usize;
+    let cold_copies = cache_clear_bytes(l2_bytes).div_ceil(weight_bytes).max(1);
+    let budget_copies = (TUNE_ROTATION_BUDGET_BYTES / weight_bytes).max(1);
+    let extra_copies = cold_copies.min(budget_copies) - 1;
+    let rotation: Vec<DeviceMatrix> = (0..extra_copies)
+        .map(|_| zeros_matrix(ctx, weight.rows, weight.cols))
+        .collect::<Result<_>>()?;
+    let samples: Vec<(&DeviceMatrix, usize)> = std::iter::once(weight)
+        .chain(rotation.iter())
+        .flat_map(|weight| offsets.iter().map(move |&offset| (weight, offset)))
+        .collect();
+    pegainfer_kernels::ops::gemm_lt_tune(ctx, &samples, out_dim, batch_size)
+}
+
+/// One process-local projection A/B case. All alternatives share inputs,
+/// outputs, stream, tuned cuBLASLt state, and cache-clear protocol so the only
+/// changed variable inside each CUDA Event span is the projection topology.
+pub struct ProjectionAbCase {
+    pub ctx: DeviceContext,
+    geometry: ProjectionGeometry,
+    batch_size: usize,
+    qkv_weight: DeviceMatrix,
+    gate_up_weight: DeviceMatrix,
+    x: HiddenStates,
+    q: HiddenStates,
+    k: HiddenStates,
+    v: HiddenStates,
+    qkv: HiddenStates,
+    gate: HiddenStates,
+    up: HiddenStates,
+    gate_up: HiddenStates,
+    mlp: HiddenStates,
+    start: CudaEvent,
+    end: CudaEvent,
+}
+
+impl ProjectionAbCase {
+    pub fn new(model: ProjectionModel, batch_size: usize) -> Result<Self> {
+        anyhow::ensure!(batch_size > 0, "projection A/B batch size must be positive");
+        let geometry = model.geometry();
+        let ctx = DeviceContext::new()?;
+        let qkv_dim = geometry.q_dim + 2 * geometry.kv_dim;
+        let qkv_weight = zeros_matrix(&ctx, qkv_dim, geometry.hidden_size)?;
+        let gate_up_weight =
+            zeros_matrix(&ctx, 2 * geometry.intermediate_size, geometry.hidden_size)?;
+
+        tune_weight_rows(&ctx, &qkv_weight, &[0], geometry.q_dim, batch_size)?;
+        tune_weight_rows(
+            &ctx,
+            &qkv_weight,
+            &[geometry.q_dim, geometry.q_dim + geometry.kv_dim],
+            geometry.kv_dim,
+            batch_size,
+        )?;
+        tune_weight_rows(&ctx, &qkv_weight, &[0], qkv_dim, batch_size)?;
+        tune_weight_rows(
+            &ctx,
+            &gate_up_weight,
+            &[0, geometry.intermediate_size],
+            geometry.intermediate_size,
+            batch_size,
+        )?;
+        tune_weight_rows(
+            &ctx,
+            &gate_up_weight,
+            &[0],
+            2 * geometry.intermediate_size,
+            batch_size,
+        )?;
+
+        let start = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let end = ctx
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))?;
+        let case = Self {
+            x: hidden_of(&ctx, geometry.hidden_size, batch_size, 0.01)?,
+            q: HiddenStates::zeros(&ctx, geometry.q_dim, batch_size)?,
+            k: HiddenStates::zeros(&ctx, geometry.kv_dim, batch_size)?,
+            v: HiddenStates::zeros(&ctx, geometry.kv_dim, batch_size)?,
+            qkv: HiddenStates::zeros(&ctx, qkv_dim, batch_size)?,
+            gate: HiddenStates::zeros(&ctx, geometry.intermediate_size, batch_size)?,
+            up: HiddenStates::zeros(&ctx, geometry.intermediate_size, batch_size)?,
+            gate_up: HiddenStates::zeros(&ctx, 2 * geometry.intermediate_size, batch_size)?,
+            mlp: HiddenStates::zeros(&ctx, geometry.intermediate_size, batch_size)?,
+            ctx,
+            geometry,
+            batch_size,
+            qkv_weight,
+            gate_up_weight,
+            start,
+            end,
+        };
+        case.ctx.sync()?;
+        Ok(case)
+    }
+
+    pub const fn geometry(&self) -> ProjectionGeometry {
+        self.geometry
+    }
+
+    pub const fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    pub fn pre_measure(&mut self) -> Result<()> {
+        for topology in [
+            ProjectionTopology::QkvSplitGemm,
+            ProjectionTopology::QkvPackedGemm,
+            ProjectionTopology::SplitQkv,
+            ProjectionTopology::QkvPackedWithSplit,
+            ProjectionTopology::GateUpSplitGemm,
+            ProjectionTopology::GateUpMergedGemm,
+            ProjectionTopology::MlpSplit,
+            ProjectionTopology::MlpMerged,
+        ] {
+            self.launch(topology)?;
+        }
+        self.ctx.sync()
+    }
+
+    pub fn launch(&mut self, topology: ProjectionTopology) -> Result<()> {
+        use pegainfer_kernels::ops as kops;
+        match topology {
+            ProjectionTopology::QkvSplitGemm => {
+                kops::gemm_rows_into(
+                    &self.ctx,
+                    &self.qkv_weight,
+                    0,
+                    self.geometry.q_dim,
+                    &self.x,
+                    &mut self.q,
+                );
+                kops::gemm_rows_into(
+                    &self.ctx,
+                    &self.qkv_weight,
+                    self.geometry.q_dim,
+                    self.geometry.kv_dim,
+                    &self.x,
+                    &mut self.k,
+                );
+                kops::gemm_rows_into(
+                    &self.ctx,
+                    &self.qkv_weight,
+                    self.geometry.q_dim + self.geometry.kv_dim,
+                    self.geometry.kv_dim,
+                    &self.x,
+                    &mut self.v,
+                );
+                Ok(())
+            }
+            ProjectionTopology::QkvPackedGemm => {
+                kops::gemm_into(&self.ctx, &self.qkv_weight, &self.x, &mut self.qkv);
+                Ok(())
+            }
+            ProjectionTopology::SplitQkv => {
+                kops::split_qkv_into(&self.ctx, &self.qkv, &mut self.q, &mut self.k, &mut self.v)
+            }
+            ProjectionTopology::QkvPackedWithSplit => {
+                kops::gemm_into(&self.ctx, &self.qkv_weight, &self.x, &mut self.qkv);
+                kops::split_qkv_into(&self.ctx, &self.qkv, &mut self.q, &mut self.k, &mut self.v)
+            }
+            ProjectionTopology::GateUpSplitGemm => {
+                kops::gemm_rows_into(
+                    &self.ctx,
+                    &self.gate_up_weight,
+                    0,
+                    self.geometry.intermediate_size,
+                    &self.x,
+                    &mut self.gate,
+                );
+                kops::gemm_rows_into(
+                    &self.ctx,
+                    &self.gate_up_weight,
+                    self.geometry.intermediate_size,
+                    self.geometry.intermediate_size,
+                    &self.x,
+                    &mut self.up,
+                );
+                Ok(())
+            }
+            ProjectionTopology::GateUpMergedGemm => {
+                kops::gemm_into(&self.ctx, &self.gate_up_weight, &self.x, &mut self.gate_up);
+                Ok(())
+            }
+            ProjectionTopology::MlpSplit => {
+                self.launch(ProjectionTopology::GateUpSplitGemm)?;
+                kops::silu_mul_batch_into(&self.ctx, &self.gate, &self.up, &mut self.mlp)
+            }
+            ProjectionTopology::MlpMerged => {
+                self.launch(ProjectionTopology::GateUpMergedGemm)?;
+                kops::silu_mul_fused_batch_into(&self.ctx, &self.gate_up, &mut self.mlp)
+            }
+        }
+    }
+
+    pub fn measure_once(
+        &mut self,
+        topology: ProjectionTopology,
+        cache_clear: &mut L2CacheClear,
+    ) -> Result<f64> {
+        cache_clear.clear(&self.ctx)?;
+        self.start.record(&self.ctx.stream)?;
+        self.launch(topology)?;
+        self.end.record(&self.ctx.stream)?;
+        Ok(f64::from(self.start.elapsed_ms(&self.end)?) * 1_000.0)
+    }
+}
+
 fn hidden_of(ctx: &DeviceContext, dim: usize, rows: usize, scale: f32) -> Result<HiddenStates> {
     Ok(HiddenStates {
         data: ctx.stream.clone_htod(&patterned_bf16(dim * rows, scale))?,

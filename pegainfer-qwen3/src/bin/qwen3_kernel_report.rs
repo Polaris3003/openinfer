@@ -6,6 +6,7 @@ use std::fs::{self};
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::process::Command as ProcessCommand;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -40,6 +41,10 @@ use pegainfer_qwen3::kernel_bench::PrefillAttentionShape;
 use pegainfer_qwen3::kernel_bench::PrefillAttentionSpec;
 use pegainfer_qwen3::kernel_bench::PrefillAttentionVariant;
 use pegainfer_qwen3::kernel_bench::PrefillStage;
+use pegainfer_qwen3::kernel_bench::ProjectionAbCase;
+use pegainfer_qwen3::kernel_bench::ProjectionGeometry;
+use pegainfer_qwen3::kernel_bench::ProjectionModel;
+use pegainfer_qwen3::kernel_bench::ProjectionTopology;
 use pegainfer_qwen3::kernel_bench::REPORT_ITERS;
 use pegainfer_qwen3::kernel_bench::SinglePrefillCase;
 use pegainfer_qwen3::kernel_bench::SplitKvConfig;
@@ -183,6 +188,9 @@ enum Command {
     /// tensor-pipe columns for diagnosis. Interpretation lives here, not in
     /// `run` — snapshots stay raw.
     Rank(RankArgs),
+    /// Run current-head, order-balanced CUDA Event A/B for decode projection
+    /// topologies. Raw repetitions and paired summaries are emitted as JSON.
+    ProjectionAb(ProjectionAbArgs),
 }
 
 #[derive(Args)]
@@ -229,6 +237,19 @@ struct CompareArgs {
     base: PathBuf,
     #[arg(long)]
     new: PathBuf,
+}
+
+#[derive(Args)]
+struct ProjectionAbArgs {
+    #[arg(long)]
+    out: Option<PathBuf>,
+    #[arg(long, value_delimiter = ',', default_value = "qwen3-4b,qwen3-8b")]
+    models: Vec<String>,
+    #[arg(long = "batch-sizes", value_delimiter = ',', default_value = "1,8")]
+    batch_sizes: Vec<usize>,
+    /// Number of ABBA/BAAB paired blocks. Ten is the minimum accepted value.
+    #[arg(long, default_value_t = 10)]
+    blocks: usize,
 }
 
 #[derive(Args)]
@@ -389,6 +410,90 @@ struct HardwareProvenance {
     peak_gb_s: f64,
     l2_bytes: usize,
     cache_clear_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct ProjectionAbReport {
+    schema: u32,
+    report_type: &'static str,
+    created_at_unix_secs: u64,
+    git: GitProvenance,
+    hardware: HardwareProvenance,
+    measurement: ProjectionMeasurementConfig,
+    cases: Vec<ProjectionAbCaseReport>,
+}
+
+#[derive(Serialize)]
+struct ProjectionMeasurementConfig {
+    cache_state: &'static str,
+    event_scope: &'static str,
+    order_patterns: [&'static str; 2],
+    blocks: usize,
+    repetitions_per_topology_per_block: usize,
+    bootstrap_resamples: usize,
+}
+
+#[derive(Serialize)]
+struct ProjectionAbCaseReport {
+    model: &'static str,
+    geometry: ProjectionGeometry,
+    batch_size: usize,
+    comparisons: Vec<ProjectionComparisonReport>,
+    split_qkv: ProjectionStandaloneReport,
+}
+
+#[derive(Serialize)]
+struct ProjectionComparisonReport {
+    name: &'static str,
+    a: ProjectionTopology,
+    b: ProjectionTopology,
+    raw: Vec<ProjectionRawSample>,
+    telemetry: Vec<ProjectionBlockTelemetry>,
+    summary: ProjectionComparisonSummary,
+}
+
+#[derive(Serialize)]
+struct ProjectionStandaloneReport {
+    topology: ProjectionTopology,
+    raw: Vec<ProjectionRawSample>,
+    telemetry: Vec<ProjectionBlockTelemetry>,
+    summary: DistributionSummary,
+}
+
+#[derive(Serialize)]
+struct ProjectionRawSample {
+    block: usize,
+    pattern: &'static str,
+    position: usize,
+    topology: ProjectionTopology,
+    elapsed_us: f64,
+}
+
+#[derive(Serialize)]
+struct ProjectionBlockTelemetry {
+    block: usize,
+    temperature_c: Option<f64>,
+    sm_clock_mhz: Option<f64>,
+    memory_clock_mhz: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct ProjectionComparisonSummary {
+    a: DistributionSummary,
+    b: DistributionSummary,
+    paired_improvement_pct_mean: f64,
+    paired_improvement_pct_median: f64,
+    paired_improvement_pct_bootstrap_ci95: [f64; 2],
+}
+
+#[derive(Serialize)]
+struct DistributionSummary {
+    count: usize,
+    mean_us: f64,
+    p50_us: f64,
+    p95_us: f64,
+    p99_us: f64,
+    stddev_us: f64,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -2048,6 +2153,323 @@ fn sha256_short(bytes: &[u8]) -> String {
     hex::encode(&digest[..16])
 }
 
+fn run_projection_ab(args: &ProjectionAbArgs) -> Result<ProjectionAbReport> {
+    anyhow::ensure!(
+        args.blocks >= 10,
+        "projection A/B requires at least 10 order-balanced blocks"
+    );
+    anyhow::ensure!(!args.models.is_empty(), "at least one model is required");
+    anyhow::ensure!(
+        !args.batch_sizes.is_empty() && args.batch_sizes.iter().all(|&batch| batch > 0),
+        "projection A/B batch sizes must be positive"
+    );
+
+    let models = args
+        .models
+        .iter()
+        .map(|raw| {
+            ProjectionModel::parse(raw).ok_or_else(|| {
+                anyhow!("unknown projection A/B model `{raw}`; use qwen3-4b or qwen3-8b")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let comparisons = [
+        (
+            "qkv_full",
+            ProjectionTopology::QkvSplitGemm,
+            ProjectionTopology::QkvPackedWithSplit,
+        ),
+        (
+            "qkv_gemm_only",
+            ProjectionTopology::QkvSplitGemm,
+            ProjectionTopology::QkvPackedGemm,
+        ),
+        (
+            "split_qkv_incremental",
+            ProjectionTopology::QkvPackedGemm,
+            ProjectionTopology::QkvPackedWithSplit,
+        ),
+        (
+            "gate_up_gemm_only",
+            ProjectionTopology::GateUpSplitGemm,
+            ProjectionTopology::GateUpMergedGemm,
+        ),
+        (
+            "mlp_full",
+            ProjectionTopology::MlpSplit,
+            ProjectionTopology::MlpMerged,
+        ),
+    ];
+
+    let mut cases = Vec::new();
+    for model in models {
+        for &batch_size in &args.batch_sizes {
+            eprintln!(
+                "projection A/B model={} batch_size={} blocks={}",
+                model.label(),
+                batch_size,
+                args.blocks
+            );
+            let mut case = ProjectionAbCase::new(model, batch_size)?;
+            case.pre_measure()?;
+            let mut cache_clear = L2CacheClear::new(&case.ctx)?;
+            let mut case_comparisons = Vec::with_capacity(comparisons.len());
+            for (name, a, b) in comparisons {
+                case_comparisons.push(measure_projection_comparison(
+                    &mut case,
+                    &mut cache_clear,
+                    args.blocks,
+                    name,
+                    a,
+                    b,
+                )?);
+            }
+            let split_qkv = measure_projection_standalone(
+                &mut case,
+                &mut cache_clear,
+                args.blocks,
+                ProjectionTopology::SplitQkv,
+            )?;
+            cases.push(ProjectionAbCaseReport {
+                model: model.label(),
+                geometry: case.geometry(),
+                batch_size: case.batch_size(),
+                comparisons: case_comparisons,
+                split_qkv,
+            });
+        }
+    }
+
+    let probe = DeviceContext::new()?;
+    let peak = DevicePeakBandwidth::query(&probe)?;
+    let driver_version = query_command_line(
+        "nvidia-smi",
+        &[
+            "--query-gpu=driver_version",
+            "--format=csv,noheader",
+            "-i",
+            "0",
+        ],
+    );
+    let cuda_toolkit = query_command_line("nvcc", &["--version"]);
+    let hardware = query_hardware(&probe, &peak, driver_version, cuda_toolkit)?;
+    let git_commit = query_command_line("git", &["rev-parse", "HEAD"]);
+    let git_dirty = query_command_raw("git", &["status", "--porcelain"])
+        .map(|status| !status.trim().is_empty());
+
+    Ok(ProjectionAbReport {
+        schema: 1,
+        report_type: "qwen3_projection_ab",
+        created_at_unix_secs: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        git: GitProvenance {
+            commit: git_commit,
+            dirty: git_dirty,
+        },
+        hardware,
+        measurement: ProjectionMeasurementConfig {
+            cache_state: "l2_cleared_before_every_cuda_event",
+            event_scope: "one_production_topology_launch",
+            order_patterns: ["ABBA", "BAAB"],
+            blocks: args.blocks,
+            repetitions_per_topology_per_block: 2,
+            bootstrap_resamples: 10_000,
+        },
+        cases,
+    })
+}
+
+fn measure_projection_comparison(
+    case: &mut ProjectionAbCase,
+    cache_clear: &mut L2CacheClear,
+    blocks: usize,
+    name: &'static str,
+    a: ProjectionTopology,
+    b: ProjectionTopology,
+) -> Result<ProjectionComparisonReport> {
+    let mut raw = Vec::with_capacity(blocks * 4);
+    let mut telemetry = Vec::with_capacity(blocks);
+    let mut paired_improvements = Vec::with_capacity(blocks);
+    for block in 0..blocks {
+        telemetry.push(query_projection_telemetry(case.ctx.device_ordinal, block));
+        let (pattern, order) = if block % 2 == 0 {
+            ("ABBA", [a, b, b, a])
+        } else {
+            ("BAAB", [b, a, a, b])
+        };
+        let mut a_values = Vec::with_capacity(2);
+        let mut b_values = Vec::with_capacity(2);
+        for (position, topology) in order.into_iter().enumerate() {
+            let elapsed_us = case.measure_once(topology, cache_clear)?;
+            if topology == a {
+                a_values.push(elapsed_us);
+            } else {
+                b_values.push(elapsed_us);
+            }
+            raw.push(ProjectionRawSample {
+                block,
+                pattern,
+                position,
+                topology,
+                elapsed_us,
+            });
+        }
+        let a_mean = mean(&a_values);
+        let b_mean = mean(&b_values);
+        paired_improvements.push((a_mean - b_mean) / a_mean * 100.0);
+    }
+
+    let a_values = raw
+        .iter()
+        .filter(|sample| sample.topology == a)
+        .map(|sample| sample.elapsed_us)
+        .collect::<Vec<_>>();
+    let b_values = raw
+        .iter()
+        .filter(|sample| sample.topology == b)
+        .map(|sample| sample.elapsed_us)
+        .collect::<Vec<_>>();
+    let summary = ProjectionComparisonSummary {
+        a: distribution_summary(&a_values),
+        b: distribution_summary(&b_values),
+        paired_improvement_pct_mean: mean(&paired_improvements),
+        paired_improvement_pct_median: percentile(&paired_improvements, 0.50),
+        paired_improvement_pct_bootstrap_ci95: bootstrap_mean_ci95(&paired_improvements),
+    };
+    Ok(ProjectionComparisonReport {
+        name,
+        a,
+        b,
+        raw,
+        telemetry,
+        summary,
+    })
+}
+
+fn measure_projection_standalone(
+    case: &mut ProjectionAbCase,
+    cache_clear: &mut L2CacheClear,
+    blocks: usize,
+    topology: ProjectionTopology,
+) -> Result<ProjectionStandaloneReport> {
+    let mut raw = Vec::with_capacity(blocks * 4);
+    let mut telemetry = Vec::with_capacity(blocks);
+    for block in 0..blocks {
+        telemetry.push(query_projection_telemetry(case.ctx.device_ordinal, block));
+        for position in 0..4 {
+            raw.push(ProjectionRawSample {
+                block,
+                pattern: "standalone",
+                position,
+                topology,
+                elapsed_us: case.measure_once(topology, cache_clear)?,
+            });
+        }
+    }
+    let values = raw
+        .iter()
+        .map(|sample| sample.elapsed_us)
+        .collect::<Vec<_>>();
+    Ok(ProjectionStandaloneReport {
+        topology,
+        raw,
+        telemetry,
+        summary: distribution_summary(&values),
+    })
+}
+
+fn query_projection_telemetry(device_ordinal: usize, block: usize) -> ProjectionBlockTelemetry {
+    let device = device_ordinal.to_string();
+    let output = ProcessCommand::new("nvidia-smi")
+        .args([
+            "--query-gpu=temperature.gpu,clocks.current.sm,clocks.current.memory",
+            "--format=csv,noheader,nounits",
+            "-i",
+            &device,
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok());
+    let values = output
+        .as_deref()
+        .and_then(|line| line.lines().next())
+        .map(|line| {
+            line.split(',')
+                .map(|value| value.trim().parse::<f64>().ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    ProjectionBlockTelemetry {
+        block,
+        temperature_c: values.first().copied().flatten(),
+        sm_clock_mhz: values.get(1).copied().flatten(),
+        memory_clock_mhz: values.get(2).copied().flatten(),
+    }
+}
+
+fn query_command_raw(program: &str, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new(program).args(args).output().ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn query_command_line(program: &str, args: &[&str]) -> Option<String> {
+    query_command_raw(program, args)
+        .map(|output| output.trim().replace('\n', " | "))
+        .filter(|output| !output.is_empty())
+}
+
+fn mean(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn percentile(values: &[f64], quantile: f64) -> f64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let position = quantile * (sorted.len() - 1) as f64;
+    let lower = position.floor() as usize;
+    let upper = position.ceil() as usize;
+    let fraction = position - lower as f64;
+    sorted[lower] * (1.0 - fraction) + sorted[upper] * fraction
+}
+
+fn distribution_summary(values: &[f64]) -> DistributionSummary {
+    let mean_us = mean(values);
+    let variance = values
+        .iter()
+        .map(|value| (value - mean_us).powi(2))
+        .sum::<f64>()
+        / values.len() as f64;
+    DistributionSummary {
+        count: values.len(),
+        mean_us,
+        p50_us: percentile(values, 0.50),
+        p95_us: percentile(values, 0.95),
+        p99_us: percentile(values, 0.99),
+        stddev_us: variance.sqrt(),
+    }
+}
+
+fn bootstrap_mean_ci95(values: &[f64]) -> [f64; 2] {
+    const RESAMPLES: usize = 10_000;
+    let mut state = 0x7465_89ab_cdef_0123u64;
+    let mut means = Vec::with_capacity(RESAMPLES);
+    for _ in 0..RESAMPLES {
+        let mut total = 0.0;
+        for _ in 0..values.len() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            total += values[(state as usize) % values.len()];
+        }
+        means.push(total / values.len() as f64);
+    }
+    [percentile(&means, 0.025), percentile(&means, 0.975)]
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let loaded = load_manifest(&cli.manifest)?;
@@ -2075,6 +2497,10 @@ fn main() -> Result<()> {
             if args.out.is_some() {
                 write_json(&report, args.out.as_deref())?;
             }
+        }
+        Command::ProjectionAb(args) => {
+            let report = run_projection_ab(&args)?;
+            write_json(&report, args.out.as_deref())?;
         }
     }
     Ok(())
