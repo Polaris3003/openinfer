@@ -383,6 +383,17 @@ report code进入仓库。
   `KvView`/`RequestKv` 的两个方法调用闭包改为方法指针。本机复跑仍只到既有
   macOS-only `rdma-mummy-sys`/GPU detection 阻断，未得到 Linux CUDA 编译结论。
 
+### Step 4: 准备 current-head direct/HTTP A/B runner
+
+- 新增 `scripts/run_qwen3_746_e2e_ab.sh`；baseline 固定为原始 projection-fusion
+  之前的 `1c596322717dc7e3a8f0dbfb41774f12f7a36074`，candidate 使用当前 HEAD；
+- 两个 revision 均在数据盘 clean worktree 中构建，避免用户工作区的 untracked
+  文件进入证据；
+- 覆盖 Qwen3-4B/8B、TP1、eager/graph、direct batch 1/8，以及 HTTP
+  prefill/decode、concurrency 1/8；HTTP 使用 `ABBA` 顺序并保存原始 JSON；
+- 结果：脚本已通过 `bash -n`、`git diff --check` 和 `--help` smoke，待 Linux
+  GPU 主机执行。
+
 ## Next action
 
 在 Linux GPU 主机运行 release check、correctness gates 与 projection A/B。拿到
