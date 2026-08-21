@@ -128,7 +128,7 @@ impl Qwen3Model {
         let attention_path =
             BatchDecodeBuffers::attention_path(padded_bs, bufs.policy_at_construction);
         #[cfg(feature = "kernel-call-trace")]
-        let trace_kv_len = kv_views.iter().map(|v| v.seq_len()).max().unwrap_or(0);
+        let trace_kv_len = kv_views.iter().map(KvView::seq_len).max().unwrap_or(0);
         if use_cuda_graph {
             let bucket_idx = BATCH_BUCKETS.iter().position(|&b| b == padded_bs).unwrap();
             let graph_idx = BatchDecodeBuffers::graph_index(bucket_idx, attention_path);

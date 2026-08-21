@@ -8,6 +8,8 @@ use pegainfer_kernels::ops::NumericPolicy;
 use pegainfer_kernels::ops::numeric_policy;
 #[cfg(feature = "kernel-call-trace")]
 use pegainfer_kernels::tensor::KernelCall;
+#[cfg(feature = "kernel-call-trace")]
+use pegainfer_kv_cache::RequestKv;
 
 #[cfg(feature = "kernel-call-trace")]
 use crate::batch_decode_buffers::BatchDecodeBuffers;
@@ -107,7 +109,7 @@ pub fn trace_decode_kernel_calls(
         )?;
     }
     let token_ids = vec![0_u32; batch_size];
-    let views: Vec<_> = rkvs.iter().map(|r| r.decode_view()).collect();
+    let views: Vec<_> = rkvs.iter().map(RequestKv::decode_view).collect();
     let ((), calls) = call_trace::collect_result(|| {
         model.batch_decode(
             &token_ids,

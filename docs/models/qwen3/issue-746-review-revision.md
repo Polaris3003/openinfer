@@ -379,6 +379,9 @@ report code进入仓库。
 - macOS 本机 `cargo check` 在进入本 PR Rust type-check 前被既有 Linux-only
   `rdma-mummy-sys`（缺少 `endian.h`/`linux/types.h`）和 CUDA GPU detection 阻断；
   这不是代码编译结论。GPU Linux 主机必须运行 release check/Clippy 与新 reporter。
+- Linux runner 首次执行被 Clippy 的 `redundant_closure_for_method_calls` 阻断；已将
+  `KvView`/`RequestKv` 的两个方法调用闭包改为方法指针。本机复跑仍只到既有
+  macOS-only `rdma-mummy-sys`/GPU detection 阻断，未得到 Linux CUDA 编译结论。
 
 ## Next action
 
